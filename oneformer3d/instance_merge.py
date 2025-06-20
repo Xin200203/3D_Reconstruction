@@ -6,6 +6,8 @@ from mmdet3d.structures import AxisAlignedBboxOverlaps3D
 import pdb
 from sklearn.cluster import AgglomerativeClustering
 import networkx as nx
+from mmdet3d.registry import MODELS
+from .time_divided_transformer import TimeDividedTransformer
 
 # This function is deprecated by OnlineMerge. No update anymore.
 def ins_merge_mat(masks, labels, scores, queries, query_feats, sem_preds, xyz_list, inscat_topk_insts):
@@ -178,13 +180,18 @@ class GTMerge():
 
 
 class OnlineMerge():
-    def __init__(self, inscat_topk_insts, use_bbox=False, merge_type="count"):
+    def __init__(self, inscat_topk_insts, use_bbox=False, merge_type="count", tformer_cfg=None):
         assert merge_type in ['count', 'frame']
         self.merge_type = merge_type
         self.inscat_topk_insts = inscat_topk_insts
         self.use_bbox = use_bbox
         if self.use_bbox:
             self.iou_calculator = AxisAlignedBboxOverlaps3D()
+        # 初始化跨帧 Transformer
+        if tformer_cfg is not None:
+            self.tformer = MODELS.build(tformer_cfg)
+        else:
+            self.tformer = None
         self.cur_masks = None
         self.cur_labels = None
         self.cur_scores = None
@@ -192,6 +199,7 @@ class OnlineMerge():
         self.cur_query_feats = None
         self.cur_sem_preds = None
         self.cur_xyz = None
+        self.cur_bboxes = None
         self.fi = 0
         self.merge_counts = None
     
@@ -203,6 +211,7 @@ class OnlineMerge():
         self.cur_query_feats = None
         self.cur_sem_preds = None
         self.cur_xyz = None
+        self.cur_bboxes = None
         self.merge_counts = None
     
     def merge(self, masks, labels, scores, queries, query_feats, sem_preds, xyz_list, bboxes):
@@ -217,21 +226,45 @@ class OnlineMerge():
             self.cur_query_feats = query_feats
             self.cur_sem_preds = sem_preds
             self.cur_xyz = self._bbox_pred_to_bbox(xyz_list, bboxes) if self.use_bbox else xyz_list
+            if self.use_bbox:
+                self.cur_bboxes = bboxes
             self.merge_counts = torch.zeros_like(scores).long()
         else:
             self.fi += 1
             next_masks, next_labels, next_scores, next_queries, next_query_feats, next_sem_preds, next_xyz = \
                 masks, labels, scores, queries, query_feats, sem_preds, \
                 self._bbox_pred_to_bbox(xyz_list, bboxes) if self.use_bbox else xyz_list
-            query_feat_scores = (self.cur_query_feats.unsqueeze(1) * next_query_feats.unsqueeze(0)).sum(2)
-            sem_pred_scores = F.cosine_similarity(self.cur_sem_preds.unsqueeze(1), next_sem_preds.unsqueeze(0), dim=2)
-            if self.use_bbox:
-                xyz_scores = self.iou_calculator(self.cur_xyz, next_xyz, is_aligned=False)
+            if self.tformer is not None and self.cur_queries is not None:
+                # 构造几何向量 p_c / p_m
+                def build_geom(xyz, bbox):
+                    if bbox is None:
+                        size = torch.zeros_like(xyz)
+                    else:
+                        size = bbox[:, 3:]
+                    geom = torch.cat([xyz, torch.sin(xyz), size], dim=-1)
+                    return geom
+
+                p_m = build_geom(self.cur_xyz, self.cur_bboxes) if self.cur_xyz is not None else None
+                p_c = build_geom(next_xyz, bboxes) if next_xyz is not None else None
+                if p_m is None or p_c is None:
+                    # fallback to zeros
+                    p_m = torch.zeros(self.cur_queries.shape[0], 9, device=self.cur_queries.device)
+                    p_c = torch.zeros(next_queries.shape[0], 9, device=next_queries.device)
+
+                attn_mat, _ = self.tformer(next_queries.unsqueeze(0), self.cur_queries.unsqueeze(0),
+                                           p_c.unsqueeze(0), p_m.unsqueeze(0),
+                                           mask_mem=torch.ones(1, self.cur_queries.shape[0], dtype=torch.bool, device=next_queries.device))
+                mix_scores = attn_mat.squeeze(0)  # Nc x Nm
             else:
-                xyz_dists = torch.cdist(self.cur_xyz, next_xyz, p=2)
-                xyz_scores = 1 / (xyz_dists + 1e-6)
-                        
-            mix_scores = query_feat_scores * xyz_scores
+                query_feat_scores = (self.cur_query_feats.unsqueeze(1) * next_query_feats.unsqueeze(0)).sum(2)
+                sem_pred_scores = F.cosine_similarity(self.cur_sem_preds.unsqueeze(1), next_sem_preds.unsqueeze(0), dim=2)
+                if self.use_bbox:
+                    xyz_scores = self.iou_calculator(self.cur_xyz, next_xyz, is_aligned=False)
+                else:
+                    xyz_dists = torch.cdist(self.cur_xyz, next_xyz, p=2)
+                    xyz_scores = 1 / (xyz_dists + 1e-6)
+                mix_scores = query_feat_scores * xyz_scores
+            
             inst_label_scores = torch.where(self.cur_labels.unsqueeze(1) == next_labels.unsqueeze(0), torch.ones((self.cur_labels.shape[0], next_labels.shape[0])).to(self.cur_labels.device), torch.zeros((self.cur_labels.shape[0], next_labels.shape[0])).to(self.cur_labels.device))
             
             mix_scores = torch.where(mix_scores > 0, mix_scores, torch.zeros_like(mix_scores))
