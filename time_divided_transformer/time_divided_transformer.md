@@ -16,3 +16,12 @@
 3. 记录 `self.cur_bboxes` 以便构造 Memory 几何向量。
 
 > commit: step-3 完成，OnlineMerge 已可选择使用跨帧 Transformer 进行匹配。
+
+### Step-4  Cross-Frame Loss (`CrossFrameCriterion`)
+1. 新建 `oneformer3d/tdt_loss.py` 并注册 `CrossFrameCriterion`：
+   • `loss_match` —— 与 GT affinity 二元交叉熵；
+   • `loss_cons`  —— InfoNCE 保持跨帧特征一致。
+2. 接口保持 `__call__(attn, gt_affinity, queries)`，方便在训练循环中独立调用。
+3. 暂未插入训练主干；后续可在 `mixformer3d.py` 的 `merge_criterion` 调用处拼接该 loss dict。
+
+> commit: step-4 增加 loss 模块，未破坏现有接口。
