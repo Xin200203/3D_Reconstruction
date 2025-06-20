@@ -26,6 +26,8 @@ data/
 # Python
 *.py[cod]
 __pycache__/
+**/__pycache__/
+**/*.py[cod]
 
 # Build / C-extensions
 *.so
