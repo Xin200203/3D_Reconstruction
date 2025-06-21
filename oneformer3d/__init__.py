@@ -23,3 +23,5 @@ from .data_preprocessor import Det3DDataPreprocessor_
 from .unified_metric import UnifiedSegMetric
 from .scannet_dataset import ScanNetSegDataset_, ScanNet200SegDataset_, ScanNet200SegMVDataset_
 from .time_divided_transformer import TimeDividedTransformer
+from .bi_fusion_encoder import BiFusionEncoder
+from .bife_clip_loss import ClipConsCriterion

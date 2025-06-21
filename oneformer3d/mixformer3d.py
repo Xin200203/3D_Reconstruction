@@ -46,7 +46,10 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                  voxel_size,
                  num_classes,
                  query_thr,
+                 img_backbone=None,
                  backbone=None,
+                 bi_encoder=None,
+                 clip_criterion=None,
                  neck=None,
                  pool=None,
                  decoder=None,
@@ -58,12 +61,21 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
+        self.img_backbone = MODELS.build(img_backbone) if img_backbone is not None else None
         self.backbone = MODELS.build(backbone)
+        if bi_encoder is not None:
+            self.bi_encoder = MODELS.build(bi_encoder)
+        else:
+            self.bi_encoder = None
         if neck is not None:
             self.neck = MODELS.build(neck)
         self.pool = MODELS.build(pool)
         self.decoder = MODELS.build(decoder)
         self.criterion = MODELS.build(criterion)
+        if clip_criterion is not None:
+            self.clip_criterion = MODELS.build(clip_criterion)
+        else:
+            self.clip_criterion = None
         self.voxel_size = voxel_size
         self.num_classes = num_classes
         self.query_thr = query_thr
@@ -87,6 +99,46 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 List[Tensor]: of len batch_size,
                     each of shape (n_points_i, n_classes + 1).
         """
+        if self.bi_encoder is not None:
+            # === BiFusion path ===
+            encoder_out = self.bi_encoder(
+                batch_inputs_dict['points'],
+                batch_inputs_dict['imgs'],
+                batch_inputs_dict['cam_info']
+            )
+            self._encoder_out = encoder_out  # cache for loss
+            fused_list = encoder_out['feat_fusion']
+            all_xyz = [pts[:, :3] for pts in batch_inputs_dict['points']]
+
+            # concatenate all fused features
+            x = torch.cat(fused_list, dim=0)
+
+            # superpoint pooling
+            sp_pts_masks, n_super_points = [], []
+            for data_sample in batch_data_samples:
+                sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask
+                sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
+                n_super_points.append(sp_pts_mask.max() + 1)
+            sp_idx = torch.cat(sp_pts_masks)
+
+            x, all_xyz_w = self.pool(x, sp_idx, all_xyz)
+
+            # split per sample features
+            features = []
+            for i in range(len(n_super_points)):
+                begin = sum(n_super_points[:i])
+                end = sum(n_super_points[:i + 1])
+                features.append(x[begin: end])
+
+            point_features = [torch.cat([c, f], dim=-1) for c, f in zip(all_xyz, fused_list)]
+
+            return features, point_features, all_xyz_w
+
+        # === Original path ===
+        with torch.no_grad():
+            img_features = self.img_backbone(batch_inputs_dict['img_path'])
+        img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
+        
         # construct tensor field
         coordinates, features = [], []
         for i in range(len(batch_inputs_dict['points'])):
@@ -165,7 +217,11 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         super_points = ([bds.gt_pts_seg.sp_pts_mask for bds in batch_data_samples], all_xyz_w)
         x = self.decoder(x, point_features, queries, super_points)
         ## Loss
-        return self.criterion(x, gt_instances, gt_point_instances, None, self.decoder.mask_pred_mode)
+        losses = self.criterion(x, gt_instances, gt_point_instances, None, self.decoder.mask_pred_mode)
+        if self.clip_criterion is not None and hasattr(self, '_encoder_out'):
+            loss_clip = self.clip_criterion(self._encoder_out['feat_fusion'], self._encoder_out['clip_global'])
+            losses.update(dict(loss_clip=loss_clip))
+        return losses
 
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
         """Predict results from a batch of inputs and data samples with post-
@@ -1161,7 +1217,7 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         x = self.backbone(field.sparse(), memory=self.memory if hasattr(self,'memory') else None)
         map_index = None; x_voxel = None
         x = x.slice(field)
-        point_features = [torch.cat([c,f], dim=-1) for c,f in zip(all_xyz, x.decomposed_features)]
+        point_features = [torch.cat([c, f], dim=-1) for c, f in zip(all_xyz, x.decomposed_features)]
         x = x.features
 
         # apply scatter_mean
