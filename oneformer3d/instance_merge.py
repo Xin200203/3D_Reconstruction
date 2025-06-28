@@ -263,8 +263,8 @@ class OnlineMerge():
                 else:
                     xyz_dists = torch.cdist(self.cur_xyz, next_xyz, p=2)
                     xyz_scores = 1 / (xyz_dists + 1e-6)
-                mix_scores = query_feat_scores * xyz_scores
-            
+                    mix_scores = query_feat_scores * xyz_scores
+                        
             inst_label_scores = torch.where(self.cur_labels.unsqueeze(1) == next_labels.unsqueeze(0), torch.ones((self.cur_labels.shape[0], next_labels.shape[0])).to(self.cur_labels.device), torch.zeros((self.cur_labels.shape[0], next_labels.shape[0])).to(self.cur_labels.device))
             
             mix_scores = torch.where(mix_scores > 0, mix_scores, torch.zeros_like(mix_scores))

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import open_clip
 import math
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import MinkowskiEngine as ME
 from mmdet3d.registry import MODELS
@@ -14,6 +14,7 @@ from .clip_utils import (
     build_uv_index as _build_uv_index,
     sample_img_feat as _sample_img_feat
 )
+from types import SimpleNamespace
 
 
 def build_geo_pe(xyz_world: torch.Tensor, bbox_size: torch.Tensor,
@@ -54,22 +55,43 @@ class FusionGate(nn.Module):
 
 
 class TinySANeck(nn.Module):
-    """Two-layer self-attention neck for lowest res point features."""
+    """Two-layer Tiny Self-Attention neck implemented by stacking TinySAModule.
 
-    def __init__(self, dim: int = 128, num_heads: int = 4):
+    Args:
+        dim (int): feature dimension.
+        num_heads (int): number of attention heads for each TinySA layer.
+        radius (float): ball query radius.
+        max_k (int): max neighbours per center.
+        sample_ratio (float): ratio of sampled center points.
+        num_layers (int): number of TinySA layers to stack. Default 2 as in paper spec.
+    """
+    def __init__(self,
+                 dim: int = 128,
+                 num_heads: int = 4,
+                 radius: float = 0.3,
+                 max_k: int = 32,
+                 sample_ratio: float = 0.25,
+                 num_layers: int = 2):
         super().__init__()
-        self.sa1 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.sa2 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.ReLU(), nn.Linear(dim * 4, dim))
-        self.norm = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList([
+            TinySAModule(dim=dim,
+                          num_heads=num_heads,
+                          radius=radius,
+                          max_k=max_k,
+                          sample_ratio=sample_ratio)
+            for _ in range(num_layers)
+        ])
 
-    def forward(self, x):
-        out, _ = self.sa1(x, x, x)
-        x = self.norm(out + x)
-        out, _ = self.sa2(x, x, x)
-        x = self.norm(out + x)
-        x = self.norm(self.ffn(x) + x)
-        return x
+    def forward(self, xyz: torch.Tensor, feats: torch.Tensor):
+        """Args:
+            xyz (Tensor): (N,3) coordinates in camera/world frame.
+            feats (Tensor): (N,C) input features.
+        Returns:
+            Tensor: (N,C) features after two TinySA layers.
+        """
+        for sa in self.layers:
+            feats = sa(xyz, feats)
+        return feats
 
 
 @MODELS.register_module()
@@ -96,9 +118,11 @@ class BiFusionEncoder(nn.Module):
             self.tiny_sa_2d = TinySA2D(dim=256, num_heads=4)
 
         # 3D encoder without memory
-        self.backbone3d = Res16UNet34C(in_channels=3, out_channels=128, config=dict(dilations=[1,1,1,1]), D=3)
-        self.tiny_sa = TinySAModule(dim=128, num_heads=4, radius=0.3, max_k=32, sample_ratio=0.25)
-        self.lin3d = nn.Sequential(nn.Linear(128, 128), nn.ReLU())
+        cfg_backbone = SimpleNamespace(dilations=[1, 1, 1, 1], bn_momentum=0.02, conv1_kernel_size=5)
+        self.backbone3d = Res16UNet34C(in_channels=3, out_channels=128, config=cfg_backbone, D=3)
+        backbone_out_dim = self.backbone3d.__class__.PLANES[-1]
+        self.tiny_sa_neck = TinySANeck(dim=backbone_out_dim, num_heads=4, radius=0.3, max_k=32, sample_ratio=0.25, num_layers=2)
+        self.lin3d = nn.Sequential(nn.Linear(backbone_out_dim, 128), nn.ReLU())
 
         # pe mapping
         self.pe_mlp = nn.Sequential(nn.Linear(64, 32), nn.ReLU())
@@ -116,7 +140,9 @@ class BiFusionEncoder(nn.Module):
     def sample_img_feat(self, feat_map, uv):
         return _sample_img_feat(feat_map, uv)
 
-    def _process_single(self, points: torch.Tensor, img: torch.Tensor, cam_meta: Dict):
+    def _process_single(self, points: torch.Tensor, img: torch.Tensor, cam_meta: Dict,
+                        feat2d_map: Optional[torch.Tensor] = None,
+                        clip_global: Optional[torch.Tensor] = None):
         """处理单帧/单批数据，返回融合特征结果。"""
         # ==== 提取基础信息 ====
         xyz_cam = points[:, :3]
@@ -140,25 +166,32 @@ class BiFusionEncoder(nn.Module):
         pe = self.pe_mlp(build_geo_pe(xyz_world, bbox_size, pose_delta, height))  # (N,32)
 
         # ===== 3D branch =====
-        coords = torch.round(xyz_cam / self.voxel_size)
-        feats = points[:, 3:6]
+        # === 构造 SparseTensor 坐标 ===
+        # MinkowskiEngine 坐标格式 (N, 1 + D)，首列为 batch_id
+        coords_int = torch.round(xyz_cam / self.voxel_size).to(torch.int32)
+        coords = torch.cat([torch.zeros(coords_int.size(0), 1, dtype=torch.int32, device=coords_int.device),
+                             coords_int], dim=1)  # (N,4)
+        feats = points[:, 3:6].contiguous()  # (N,3)
         field = ME.TensorField(coordinates=coords, features=feats)
         sparse_tensor = field.sparse()
         feat3d = self.backbone3d(sparse_tensor).slice(field).features  # (N,128)
-        feat3d = self.tiny_sa(xyz_cam, feat3d)
+        feat3d = self.tiny_sa_neck(xyz_cam, feat3d)
         feat3d = self.lin3d(feat3d)
 
         # ===== 2D branch =====
-        with torch.no_grad():
-            amp_ctx = torch.cuda.amp.autocast(enabled=self.use_amp and img.is_cuda)
-            with amp_ctx:
-                clip_feat = self.clip_visual(img.unsqueeze(0))  # (1,768,h/16,w/16)
-                up = F.pixel_shuffle(clip_feat, 2)            # (1,192,h/8,w/8)
-                feat2d_map = self.conv_reduce(up)              # (1,256,h/8,w/8)
-                if self.use_tiny_sa_2d:
-                    feat2d_map = self.tiny_sa_2d(feat2d_map)
-        clip_global = clip_feat.mean(dim=[2, 3]).squeeze(0)  # (768,)
+        if feat2d_map is None or clip_global is None:
+            with torch.no_grad():
+                amp_ctx = torch.cuda.amp.autocast(enabled=self.use_amp and img.is_cuda)
+                with amp_ctx:
+                    # 直接提取 conv1 patch 特征，避免 vi-transformer 位置编码分辨率限制
+                    clip_feat = self.clip_visual.conv1(img.unsqueeze(0))  # (1,768,h/16,w/16)
+                    up = F.pixel_shuffle(clip_feat, 2)            # (1,192,h/8,w/8)
+                    feat2d_map = self.conv_reduce(up)              # (1,256,h/8,w/8)
+                    if self.use_tiny_sa_2d:
+                        feat2d_map = self.tiny_sa_2d(feat2d_map)
+            clip_global = clip_feat.mean(dim=[2, 3]).squeeze(0)  # (768,)
 
+        assert feat2d_map is not None, 'feat2d_map should be computed.'
         intr = cam_meta['intrinsics']  # fx,fy,cx,cy tensor / list
         if not torch.is_tensor(intr):
             intr = torch.as_tensor(intr, dtype=xyz_cam.dtype, device=xyz_cam.device)
@@ -187,9 +220,29 @@ class BiFusionEncoder(nn.Module):
         if isinstance(cam_info, dict):    # 单 dict → 复制 B 份
             cam_info = [cam_info for _ in range(len(points_list))]
 
+        # === 批量 CLIP 提取（若图像尺寸一致） ===
+        feat2d_maps, clip_globals = None, None
+        try:
+            if all(img.shape == imgs[0].shape for img in imgs):
+                imgs_batch = torch.stack(imgs, dim=0)  # (B,3,H,W)
+                with torch.no_grad():
+                    amp_ctx = torch.cuda.amp.autocast(enabled=self.use_amp and imgs_batch.is_cuda)
+                    with amp_ctx:
+                        # 直接提取 conv1 patch 特征，避免 vi-transformer 位置编码分辨率限制
+                        clip_feat_b = self.clip_visual.conv1(imgs_batch)  # (B,768,h/16,w/16)
+                        up = F.pixel_shuffle(clip_feat_b, 2)       # (B,192,h/8,w/8)
+                        feat2d_maps = self.conv_reduce(up)         # (B,256,h/8,w/8)
+                        if self.use_tiny_sa_2d:
+                            feat2d_maps = self.tiny_sa_2d(feat2d_maps)
+                clip_globals = clip_feat_b.mean(dim=[2, 3])  # (B,768)
+        except Exception:
+            feat2d_maps = clip_globals = None  # fallback
+
         feat_fusion_list, conf_list, pe_list, clip_global_list = [], [], [], []
-        for pts, img, meta in zip(points_list, imgs, cam_info):
-            fused, conf, pe, clip_global = self._process_single(pts, img, meta)
+        for idx, (pts, img, meta) in enumerate(zip(points_list, imgs, cam_info)):
+            fmap = feat2d_maps[idx:idx+1] if feat2d_maps is not None else None
+            cglb = clip_globals[idx] if clip_globals is not None else None
+            fused, conf, pe, clip_global = self._process_single(pts, img, meta, fmap, cglb)
             feat_fusion_list.append(fused)
             conf_list.append(conf)
             pe_list.append(pe)

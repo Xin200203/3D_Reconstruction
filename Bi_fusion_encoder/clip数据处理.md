@@ -90,7 +90,7 @@ configs/
 4. **缓存策略**：按 `scene/frame` 为键，将 `upsampled feat` 保存在 LMDB，以减少重复前向；若 GPU RAM < 8GB 可启用 **CPU Offload**。
 5. **多 GPU/DataLoader**：后续用 `torch.distributed` 切分场景级 batch，通过 `torch.save` 聚合结果。
 6. **与 Bi-Fusion Encoder 集成**：若 `offline_clip_feat=True`，直接从磁盘读取，否则在线缓存。
-7. **通用函数抽离**：`clip_utils.py` 提供 freeze_clip/UV 投影/采样；新增 `build_uv_index_batch` 支持 (B,N,3) 批量投影，并将在后续批量化 Encoder 中使用。
+7. **通用函数抽离**：`clip_utils.py` 提供 freeze_clip/UV 投影/采样；新增 `build_uv_index_batch` & `build_world_xyz_batch` 支持批量投影与外参变换，Encoder 即将使用。
 8. **混合精度**：在 `BiFusionEncoder` 新增 `use_amp` 开关（默认 True），2D 分支推理包裹 `torch.cuda.amp.autocast`，减少显存。
 
 ---
