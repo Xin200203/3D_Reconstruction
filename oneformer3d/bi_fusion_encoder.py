@@ -8,20 +8,12 @@ from typing import List, Dict
 import MinkowskiEngine as ME
 from mmdet3d.registry import MODELS
 from .mink_unet import Res16UNet34C
-from .tiny_sa import TinySAModule
-
-
-def _freeze_clip_except_last_blocks(model, num_train_blocks: int = 2):
-    """Freeze CLIP visual encoder except last *num_train_blocks* blocks."""
-    total = len(model.blocks)
-    train_ids = {str(total - i - 1) for i in range(num_train_blocks)}
-    for name, p in model.named_parameters():
-        # name pattern: blocks.X.*
-        flag = False
-        parts = name.split('.')
-        if len(parts) > 1 and parts[0] == 'blocks' and parts[1] in train_ids:
-            flag = True
-        p.requires_grad = flag
+from .tiny_sa import TinySAModule, TinySA2D
+from .clip_utils import (
+    freeze_clip_except_last_blocks as _freeze_clip_except_last_blocks,
+    build_uv_index as _build_uv_index,
+    sample_img_feat as _sample_img_feat
+)
 
 
 def build_geo_pe(xyz_world: torch.Tensor, bbox_size: torch.Tensor,
@@ -87,7 +79,9 @@ class BiFusionEncoder(nn.Module):
     def __init__(self,
                  clip_pretrained: str = 'openai',
                  voxel_size: float = 0.02,
-                 freeze_blocks: int = 2):
+                 freeze_blocks: int = 0,  # 默认完全冻结 CLIP
+                 use_amp: bool = True,
+                 use_tiny_sa_2d: bool = False):
         super().__init__()
         # 2D ViT
         clip_model, _, _ = open_clip.create_model_and_transforms('ViT-B-16', pretrained=clip_pretrained)
@@ -97,6 +91,9 @@ class BiFusionEncoder(nn.Module):
         self.conv_reduce = nn.Conv2d(768 // 4, 256, kernel_size=1)
         # 2D linear to 128
         self.lin2d = nn.Sequential(nn.Linear(256, 128), nn.ReLU())
+        self.use_tiny_sa_2d = use_tiny_sa_2d
+        if use_tiny_sa_2d:
+            self.tiny_sa_2d = TinySA2D(dim=256, num_heads=4)
 
         # 3D encoder without memory
         self.backbone3d = Res16UNet34C(in_channels=3, out_channels=128, config=dict(dilations=[1,1,1,1]), D=3)
@@ -111,27 +108,13 @@ class BiFusionEncoder(nn.Module):
         # fusion gate
         self.fuse_gate = FusionGate()
         self.voxel_size = voxel_size
+        self.use_amp = use_amp
 
     def build_uv_index(self, xyz_cam, intr, img_shape):
-        """Project camera xyz to pixel uv; return valid mask & uv float."""
-        fx, fy, cx, cy = intr  # assume tensor scalar
-        x, y, z = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
-        u = fx * x / z + cx
-        v = fy * y / z + cy
-        H, W = img_shape
-        valid = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (z > 0)
-        return valid, torch.stack([u, v], dim=-1)
+        return _build_uv_index(xyz_cam, intr, img_shape)
 
     def sample_img_feat(self, feat_map, uv):
-        """bilinear sample; feat_map (1,C,H,W); uv (N,2) in pixel coords"""
-        H, W = feat_map.shape[-2:]
-        # normalize to [-1,1]
-        uv_norm = uv.clone()
-        uv_norm[:, 0] = uv[:, 0] / (W - 1) * 2 - 1
-        uv_norm[:, 1] = uv[:, 1] / (H - 1) * 2 - 1
-        grid = uv_norm.unsqueeze(0).unsqueeze(2)  # 1,N,1,2
-        sampled = F.grid_sample(feat_map, grid, align_corners=True).squeeze(3).squeeze(0).T  # N,C
-        return sampled
+        return _sample_img_feat(feat_map, uv)
 
     def _process_single(self, points: torch.Tensor, img: torch.Tensor, cam_meta: Dict):
         """处理单帧/单批数据，返回融合特征结果。"""
@@ -167,10 +150,14 @@ class BiFusionEncoder(nn.Module):
 
         # ===== 2D branch =====
         with torch.no_grad():
-            clip_feat = self.clip_visual(img.unsqueeze(0))  # (1,768,h/16,w/16)
+            amp_ctx = torch.cuda.amp.autocast(enabled=self.use_amp and img.is_cuda)
+            with amp_ctx:
+                clip_feat = self.clip_visual(img.unsqueeze(0))  # (1,768,h/16,w/16)
+                up = F.pixel_shuffle(clip_feat, 2)            # (1,192,h/8,w/8)
+                feat2d_map = self.conv_reduce(up)              # (1,256,h/8,w/8)
+                if self.use_tiny_sa_2d:
+                    feat2d_map = self.tiny_sa_2d(feat2d_map)
         clip_global = clip_feat.mean(dim=[2, 3]).squeeze(0)  # (768,)
-        up = F.pixel_shuffle(clip_feat, 2)  # (1,192,h/8,w/8)
-        feat2d_map = self.conv_reduce(up)   # (1,256,h/8,w/8)
 
         intr = cam_meta['intrinsics']  # fx,fy,cx,cy tensor / list
         if not torch.is_tensor(intr):
@@ -190,8 +177,16 @@ class BiFusionEncoder(nn.Module):
         fused, conf = self.fuse_gate(f2d96, f3d96)
         return fused, conf, pe, clip_global
 
-    def forward(self, points_list: List[torch.Tensor], imgs: List[torch.Tensor], cam_info: List[Dict]):
-        """支持任意 batch 大小，返回 List 形式的输出。"""
+    def forward(self, points_list, imgs, cam_info):
+        """支持 List 或 batched Tensor 输入，统一返回 List 结果。"""
+        # --- 兼容性处理 ---
+        if torch.is_tensor(points_list):  # (B,N,6)
+            points_list = list(points_list)
+        if torch.is_tensor(imgs):         # (B,3,H,W)
+            imgs = list(imgs)
+        if isinstance(cam_info, dict):    # 单 dict → 复制 B 份
+            cam_info = [cam_info for _ in range(len(points_list))]
+
         feat_fusion_list, conf_list, pe_list, clip_global_list = [], [], [], []
         for pts, img, meta in zip(points_list, imgs, cam_info):
             fused, conf, pe, clip_global = self._process_single(pts, img, meta)

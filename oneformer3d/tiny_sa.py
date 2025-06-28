@@ -76,3 +76,27 @@ class TinySAModule(nn.Module):
         output_feats = center_feat[nearest_center_idx]  # (N,C)
         # residual connection
         return feats + output_feats 
+
+class TinySA2D(nn.Module):
+    """Tiny Self-Attention for 2D feature map (flatten–MHSA–reshape).
+
+    Args:
+        dim (int): channel dimension.
+        num_heads (int): attention heads.
+    """
+    def __init__(self, dim: int = 256, num_heads: int = 4):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.ReLU(), nn.Linear(dim * 4, dim))
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor):
+        """x: (B,C,H,W)"""
+        B, C, H, W = x.shape
+        tokens = x.flatten(2).permute(0, 2, 1)  # (B,HW,C)
+        out, _ = self.mha(tokens, tokens, tokens)
+        tokens = self.norm1(tokens + out)
+        tokens = self.norm2(tokens + self.ffn(tokens))
+        x = tokens.permute(0, 2, 1).view(B, C, H, W)
+        return x 

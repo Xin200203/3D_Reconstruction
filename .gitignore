@@ -5,8 +5,10 @@ logs/
 tensorboard/
 vis_demo/results/
 output/
+outputs/
 pose_centered/
 scannet*_instance_data/
+*.lmdb
 
 ####################################
 # Data

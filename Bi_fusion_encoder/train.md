@@ -39,6 +39,15 @@ test_cfg = dict(
 ```
 若 **bi_encoder / tformer_cfg** 设为 `None` 即退化为原始 ESAM。
 
+## 2.3 代码版本依赖检查
+在真正训练前，请确认以下文件已 **merge 到当前分支**：
+1. `oneformer3d/bi_fusion_encoder.py`（≥ Step-3，支持 batch & extrinsics）
+2. `oneformer3d/bife_clip_loss.py`
+3. `oneformer3d/time_divided_transformer.py` & `instance_merge.py` 中 `tformer_cfg` 分支
+4. `oneformer3d/__init__.py` 已 `import BiFusionEncoder, ClipConsCriterion, TimeDividedTransformer`
+
+若任一缺失，应先在 Bi_fusion_encoder 分支 rebase/merge 后再进入训练。
+
 ---
 
 ## 3. 启用 Bi-Fusion Encoder
@@ -57,7 +66,11 @@ clip_criterion = dict(
     loss_weight=0.05,              # λ_clip
 )
 ```
-⚠️ 同时移除 `img_backbone`（Bi-Fusion 内部已带 CLIP-ViT），否则会冲突。
+❶ **删掉** 原有 `img_backbone` 字段；若后续实验仍需 2D 纯图像特征，可将其迁移到 `bi_encoder` 内部或另加 `aux_img_backbone`。
+
+❷ 若想冻结 CLIP 完全不训练，可把 `freeze_blocks=-1`；若只微调 ViT 最后一层，保持 `freeze_blocks=1`。
+
+❸ `clip_criterion` 只需要在 *阶段-I* 预训练阶段用，若直接端到端训练可将 `loss_weight` 调低至 `0.01` 或干脆置空。
 
 ### 3.2 修改数据管线
 Bi-Fusion 需要 RGB 及相机内、外参：
@@ -106,6 +119,8 @@ test_cfg = dict(
 1. 确认 `oneformer3d/instance_criterion.py` 中已集成该 loss；
 2. 在 `model.criterion` 对应 loss 权重里加入 `L_match`, `L_cons`。
 
+训练监督 (`CrossFrameCriterion`) 对显存敏感，可让 `L_match=0.2, L_cons=0.05` 起步。
+
 ---
 
 ## 5. 示例配置集
@@ -115,6 +130,12 @@ test_cfg = dict(
 | ScanNet200-MV (Bi-Fusion + T-former Online) | `configs/ESAM_CA/ESAM_online_scannet200_CA_bifusion_tf.py` | Section 3 + 4 |
 
 复制原 cfg 并按章节替换字段即可。
+
+## 5.1 新增示例 cfg 路径
+- `configs/ESAM/online_scannet200_bifusion_tf.py`   ← **推荐** 在线多帧方案
+- `configs/ESAM/online_scannet200_bifusion_only.py` ← 仅 2D-3D 融合，无跨帧匹配
+
+可基于官方 `ESAM_online_scannet.py` 复制后改三处：`bi_encoder`, `clip_criterion`, `tformer_cfg`。
 
 ---
 
@@ -145,4 +166,15 @@ python tools/test.py \
 
 ---
 
-> 更新于 2025-06-24
+## 8. 实施 Checklist
+| 步骤 | 目的 | 操作 |
+|------|------|------|
+|① dependency| 确保 `open_clip_torch` 可用| `pip list | grep open_clip`|
+|② config     | Bi-Fusion & T-former 开关 | 修改 cfg 如 §3 §4|
+|③ pipeline   | 提供 RGB+Pose         | `with_img=True, with_cam=True`|
+|④ overfit-toy| 先用 2-scene 微集训    | epoch=3, lr=1e-4 验证前向 OK|
+|⑤ full-train | ScanNet200 train      | 8×GPU, batch=2, FP16|
+|⑥ eval       | mIoU / AP50           | `tools/test.py`|
+|⑦ compare    | 与 baseline 对比      | 记录日志 & TensorBoard|
+
+> 文档更新时间：2025-06-25
