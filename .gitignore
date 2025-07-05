@@ -67,3 +67,4 @@ thirdparty/**/*.o
 # OS
 .DS_Store
 Thumbs.db
+thirdparty/FastSAM
