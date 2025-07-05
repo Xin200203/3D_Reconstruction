@@ -99,7 +99,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 List[Tensor]: of len batch_size,
                     each of shape (n_points_i, n_classes + 1).
         """
-        if self.bi_encoder is not None:
+        if self.bi_encoder is not None and 'imgs' in batch_inputs_dict:
             # === BiFusion path ===
             encoder_out = self.bi_encoder(
                 batch_inputs_dict['points'],
@@ -136,7 +136,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
 
         # === Original path ===
         with torch.no_grad():
-            img_features = self.img_backbone(batch_inputs_dict['img_path'])
+            if getattr(self, 'img_backbone', None) is not None and 'img_path' in batch_inputs_dict:
+                _ = self.img_backbone(batch_inputs_dict['img_path'])  # unused placeholder
         img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
         
         # construct tensor field
@@ -406,7 +407,8 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
         """
         # extract image features
         with torch.no_grad():
-            img_features = self.img_backbone(batch_inputs_dict['img_path'])
+            if getattr(self, 'img_backbone', None) is not None and 'img_path' in batch_inputs_dict:
+                _ = self.img_backbone(batch_inputs_dict['img_path'])  # unused placeholder
         img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
         
         # construct tensor field
@@ -427,7 +429,7 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
 
         # forward of backbone and neck
         x = self.backbone(field.sparse(),
-                          partial(self._f, img_features=img_features, img_metas=img_metas, img_shape=img_metas[0]['img_shape']))
+                          partial(self._f, img_features=img_metas, img_shape=img_metas[0]['img_shape']))
         if self.with_neck:
             x = self.neck(x)
         x = x.slice(field)
@@ -451,7 +453,7 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
             features.append(x[begin: end])
         return features, point_features, all_xyz_w
 
-    def _f(self, x, img_features, img_metas, img_shape):
+    def _f(self, x, img_features, img_shape):
         points = x.decomposed_coordinates
         for i in range(len(points)):
             points[i] = points[i] * self.voxel_size
@@ -1101,19 +1103,13 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         """
         # extract image features
         with torch.no_grad():
-            img_features = []
-            for img_paths in batch_inputs_dict['img_paths']:
-                img_features.append(self.img_backbone(img_paths[frame_i])[0])
-        
-        # TODO check
+            if getattr(self, 'img_backbone', None) is not None and 'img_path' in batch_inputs_dict:
+                _ = self.img_backbone(batch_inputs_dict['img_path'])  # unused placeholder
         img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
-        for img_meta in img_metas:
-            img_meta['depth2img'] = img_meta['depth2img'][frame_i]
-    
+        
         # construct tensor field
         coordinates, features = [], []
         for i in range(len(batch_inputs_dict['points'])):
-            # pdb.set_trace()
             if 'elastic_coords' in batch_inputs_dict:
                 coordinates.append(
                     batch_inputs_dict['elastic_coords'][i][frame_i] * self.voxel_size)
@@ -1129,7 +1125,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
 
         # forward of backbone and neck
         x = self.backbone(field.sparse(),
-                          partial(self._f, img_features=img_features, img_metas=img_metas, img_shape=img_metas[0]['img_shape']),
+                          partial(self._f, img_features=img_metas, img_shape=img_metas[0]['img_shape']),
                           memory=self.memory if hasattr(self,'memory') else None)
         if self.with_neck:
             x = self.neck(x)
@@ -1156,7 +1152,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
             sp_xyz_list.append(x[begin: end, -3:])
         return features, point_features, all_xyz_w, sp_xyz_list
 
-    def _f(self, x, img_features, img_metas, img_shape):
+    def _f(self, x, img_features, img_shape):
         points = x.decomposed_coordinates
         for i in range(len(points)):
             points[i] = points[i] * self.voxel_size
