@@ -17,6 +17,8 @@ from .instance_merge import ins_merge_mat, ins_cat, ins_merge, OnlineMerge, GTMe
 import numpy as np
 from .img_backbone import point_sample
 import os
+from typing import Any, Dict, cast
+from mmengine import ConfigDict
 
 @MODELS.register_module()
 class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
@@ -61,26 +63,19 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.img_backbone = MODELS.build(img_backbone) if img_backbone is not None else None
-        self.backbone = MODELS.build(backbone)
-        if bi_encoder is not None:
-            self.bi_encoder = MODELS.build(bi_encoder)
-        else:
-            self.bi_encoder = None
-        if neck is not None:
-            self.neck = MODELS.build(neck)
-        self.pool = MODELS.build(pool)
-        self.decoder = MODELS.build(decoder)
-        self.criterion = MODELS.build(criterion)
-        if clip_criterion is not None:
-            self.clip_criterion = MODELS.build(clip_criterion)
-        else:
-            self.clip_criterion = None
+        self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
+        self.backbone = MODELS.build(_cfg(backbone, 'backbone'))
+        self.bi_encoder = MODELS.build(_cfg(bi_encoder, 'bi_encoder')) if bi_encoder is not None else None
+        self.neck = MODELS.build(_cfg(neck, 'neck')) if neck is not None else None
+        self.pool = MODELS.build(_cfg(pool, 'pool'))
+        self.decoder = MODELS.build(_cfg(decoder, 'decoder'))
+        self.criterion = MODELS.build(_cfg(criterion, 'criterion'))
+        self.clip_criterion = MODELS.build(_cfg(clip_criterion, 'clip_criterion')) if clip_criterion is not None else None
+        self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.voxel_size = voxel_size
         self.num_classes = num_classes
         self.query_thr = query_thr
         self.train_cfg = train_cfg
-        self.test_cfg = test_cfg
 
     def extract_feat(self, batch_inputs_dict, batch_data_samples):
         """Extract features from sparse tensor.
@@ -135,9 +130,10 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             return features, point_features, all_xyz_w
 
         # === Original path ===
+        # 如果提供了图像骨干网络，则先提取图像特征（仅占位，避免 OptionalCall 报错）
         with torch.no_grad():
-            if getattr(self, 'img_backbone', None) is not None and 'img_path' in batch_inputs_dict:
-                _ = self.img_backbone(batch_inputs_dict['img_path'])  # unused placeholder
+            if self.img_backbone is not None and 'img_path' in batch_inputs_dict:
+                _ = self.img_backbone(batch_inputs_dict['img_path'])
         img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
         
         # construct tensor field
@@ -151,7 +147,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             features.append(batch_inputs_dict['points'][i][:, 3:])
         all_xyz = coordinates
         
-        coordinates, features = ME.utils.batch_sparse_collate(
+        coordinates, features, *_ = ME.utils.batch_sparse_collate(
             [(c / self.voxel_size, f) for c, f in zip(coordinates, features)],
             device=coordinates[0].device)
         field = ME.TensorField(coordinates=coordinates, features=features)
@@ -159,9 +155,10 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         # forward of backbone and neck
         x = self.backbone(field.sparse())
         if self.with_neck:
+            assert self.neck is not None
             x = self.neck(x)
         x = x.slice(field)
-        point_features = [torch.cat([c,f], dim=-1) for c,f in zip(all_xyz, x.decomposed_features)]
+        point_features = [torch.cat([c, f], dim=-1) for c, f in zip(all_xyz, x.decomposed_features)]
         x = x.features
 
         # apply scatter_mean
@@ -171,7 +168,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w = self.pool(x, sp_idx, all_xyz)
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
 
         # apply cls_layer
         features = []
@@ -213,7 +210,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             gt_point = InstanceData()
             gt_point.p_masks = ins
             gt_point_instances.append(gt_point)
-        queries, gt_instances = self._select_queries(x, gt_instances)
+        queries, gt_instances, *_ = self._select_queries(x, gt_instances)
         ## Decoder
         super_points = ([bds.gt_pts_seg.sp_pts_mask for bds in batch_data_samples], all_xyz_w)
         x = self.decoder(x, point_features, queries, super_points)
@@ -287,7 +284,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             self.num_classes,
             device=scores.device).unsqueeze(0).repeat(
                 len(cls_preds), 1).flatten(0, 1)
-        topk_num = min(self.test_cfg.topk_insts, scores.shape[0] * scores.shape[1])
+        topk_num = min(int(self.test_cfg.topk_insts), scores.shape[0] * scores.shape[1])
         scores, topk_idx = scores.flatten(0, 1).topk(topk_num, sorted=False)
         labels = labels[topk_idx]
 
@@ -302,8 +299,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             scores = scores * mask_scores
 
         if self.test_cfg.get('nms', None):
-            kernel = self.test_cfg.matrix_nms_kernel
-            scores, labels, mask_pred_sigmoid, _ = mask_matrix_nms(
+            kernel = str(self.test_cfg.matrix_nms_kernel)
+            scores, labels, mask_pred_sigmoid, _ = mask_matrix_nms(  # type: ignore[arg-type]
                 mask_pred_sigmoid, labels, scores, kernel=kernel)
 
         mask_pred_sigmoid = mask_pred_sigmoid[:, ...]
@@ -317,7 +314,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
 
         # npoint_thr
         mask_pointnum = mask_pred.sum(1)
-        npoint_mask = mask_pointnum > self.test_cfg.npoint_thr
+        npoint_thr = int(self.test_cfg.npoint_thr)
+        npoint_mask = mask_pointnum > npoint_thr
         scores = scores[npoint_mask]
         labels = labels[npoint_mask]
         mask_pred = mask_pred[npoint_mask]
@@ -365,18 +363,17 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.img_backbone = MODELS.build(img_backbone)
-        self.backbone = MODELS.build(backbone)
-        if neck is not None:
-            self.neck = MODELS.build(neck)
-        self.pool = MODELS.build(pool)
-        self.decoder = MODELS.build(decoder)
-        self.criterion = MODELS.build(criterion)
+        self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
+        self.backbone = MODELS.build(_cfg(backbone, 'backbone'))
+        self.neck = MODELS.build(_cfg(neck, 'neck')) if neck is not None else None
+        self.pool = MODELS.build(_cfg(pool, 'pool'))
+        self.decoder = MODELS.build(_cfg(decoder, 'decoder'))
+        self.criterion = MODELS.build(_cfg(criterion, 'criterion'))
         self.voxel_size = voxel_size
         self.num_classes = num_classes
         self.query_thr = query_thr
         self.train_cfg = train_cfg
-        self.test_cfg = test_cfg
+        self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.init_weights()
 
         self.conv = nn.Sequential(
@@ -422,7 +419,7 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
             features.append(batch_inputs_dict['points'][i][:, 3:])
         all_xyz = coordinates
         
-        coordinates, features = ME.utils.batch_sparse_collate(
+        coordinates, features, *_ = ME.utils.batch_sparse_collate(
             [(c / self.voxel_size, f) for c, f in zip(coordinates, features)],
             device=coordinates[0].device)
         field = ME.TensorField(coordinates=coordinates, features=features)
@@ -431,6 +428,7 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
         x = self.backbone(field.sparse(),
                           partial(self._f, img_features=img_metas, img_shape=img_metas[0]['img_shape']))
         if self.with_neck:
+            assert self.neck is not None
             x = self.neck(x)
         x = x.slice(field)
         point_features = [torch.cat([c,f], dim=-1) for c,f in zip(all_xyz, x.decomposed_features)]
@@ -443,7 +441,7 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w = self.pool(x, sp_idx, all_xyz)
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
 
         # apply cls_layer
         features = []
@@ -458,7 +456,7 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
         for i in range(len(points)):
             points[i] = points[i] * self.voxel_size
         projected_features = []
-        for point, img_feature, img_meta in zip(points, img_features, img_metas):
+        for point, img_feature, img_meta in zip(points, img_features, img_metas):  # type: ignore[name-defined]
             coord_type = 'DEPTH'
             img_scale_factor = (
                 point.new_tensor(img_meta['scale_factor'][:2])
@@ -537,26 +535,26 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.backbone = MODELS.build(backbone)
+        self.backbone = MODELS.build(_cfg(backbone, 'backbone'))
         if memory is not None:
-            self.memory = MODELS.build(memory)
-        if neck is not None:
-            self.neck = MODELS.build(neck)
-        self.pool = MODELS.build(pool)
-        self.decoder = MODELS.build(decoder)
+            self.memory = MODELS.build(_cfg(memory, 'memory'))
+        self.neck = MODELS.build(_cfg(neck, 'neck')) if neck is not None else None
+        self.pool = MODELS.build(_cfg(pool, 'pool'))
+        dec_cfg = _cfg(decoder, 'decoder')
+        self.decoder = MODELS.build(dec_cfg)
         if merge_head is not None:
             self.merge_head = MODELS.build(merge_head)
         if merge_criterion is not None:
             self.merge_criterion = MODELS.build(merge_criterion)
-        self.criterion = MODELS.build(criterion)
-        self.decoder_online = decoder['temporal_attn']
-        self.use_bbox = decoder['bbox_flag']
-        self.sem_len = decoder['num_semantic_classes'] + 1 # 201
+        self.criterion = MODELS.build(_cfg(criterion, 'criterion'))
+        self.decoder_online = dec_cfg['temporal_attn']
+        self.use_bbox = dec_cfg['bbox_flag']
+        self.sem_len = dec_cfg['num_semantic_classes'] + 1 # 201
         self.voxel_size = voxel_size
         self.num_classes = num_classes
         self.query_thr = query_thr
         self.train_cfg = train_cfg
-        self.test_cfg = test_cfg
+        self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.map_to_rec_pcd = map_to_rec_pcd
         self.init_weights()
     
@@ -578,7 +576,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             features.append(batch_inputs_dict['points'][i][frame_i, :, 3:])
         all_xyz = coordinates
 
-        coordinates, features = ME.utils.batch_sparse_collate(
+        coordinates, features, *_ = ME.utils.batch_sparse_collate(
             [(c / self.voxel_size, f) for c, f in zip(coordinates, features)],
             device=coordinates[0].device)
         field = ME.TensorField(coordinates=coordinates, features=features)
@@ -586,6 +584,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         # forward of backbone and neck
         x = self.backbone(field.sparse(), memory=self.memory if hasattr(self,'memory') else None)
         if self.with_neck:
+            assert self.neck is not None
             x = self.neck(x)
         x = x.slice(field)
         point_features = [torch.cat([c,f], dim=-1) for c,f in zip(all_xyz, x.decomposed_features)]
@@ -598,7 +597,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w = self.pool(x, sp_idx, all_xyz, with_xyz=True)
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
 
         # apply cls_layer
         features = []
@@ -804,7 +803,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         ## Offline panoptic segmentation
         mv_sem = torch.cat([res['pts_semantic_mask'][0] for res in results])
         
-        if self.use_bbox:
+        if self.use_bbox and 'mv_bboxes' in locals() and mv_bboxes is not None:
             batch_data_samples[0].pred_bbox = mv_bboxes.cpu().numpy()
         
         # Not mapping to reconstructed point clouds, return directly for visualization
@@ -824,7 +823,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         target_offset = torch.tensor(target_coord.shape[0]).to(mv_xyz.device).float()
         source_coord = mv_xyz.contiguous().float()
         source_offset = torch.tensor(source_coord.shape[0]).to(mv_xyz.device).float()
-        indices, dis = pointops.knn_query(1, source_coord, source_offset, target_coord, target_offset)
+        indices, _ = pointops.knn_query(  # type: ignore[misc]
+            1, source_coord, source_offset, target_coord, target_offset)
         indices = indices.reshape(-1).long()
 
         merged_result = PointData(
@@ -929,7 +929,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             self.num_classes,
             device=scores.device).unsqueeze(0).repeat(
                 len(cls_preds), 1).flatten(0, 1)
-        topk_num = min(self.test_cfg.topk_insts, scores.shape[0] * scores.shape[1])
+        topk_num = min(int(self.test_cfg.topk_insts), scores.shape[0] * scores.shape[1])
         scores, topk_idx = scores.flatten(0, 1).topk(topk_num, sorted=False)
         labels = labels[topk_idx]
 
@@ -946,8 +946,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             scores = scores * mask_scores
 
         if self.test_cfg.get('nms', None):
-            kernel = self.test_cfg.matrix_nms_kernel
-            scores, labels, mask_pred_sigmoid, keep_inds = mask_matrix_nms(
+            kernel = str(self.test_cfg.matrix_nms_kernel)
+            scores, labels, mask_pred_sigmoid, keep_inds = mask_matrix_nms(  # type: ignore[arg-type]
                 mask_pred_sigmoid, labels, scores, kernel=kernel)
             queries = queries[keep_inds]
             mapping = mapping[keep_inds]
@@ -965,7 +965,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
 
         # npoint_thr
         mask_pointnum = mask_pred.sum(1)
-        npoint_mask = mask_pointnum > self.test_cfg.npoint_thr
+        npoint_thr = int(self.test_cfg.npoint_thr)
+        npoint_mask = mask_pointnum > npoint_thr
         scores = scores[npoint_mask]
         labels = labels[npoint_mask]
         mask_pred = mask_pred[npoint_mask]
@@ -1064,27 +1065,27 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.img_backbone = MODELS.build(img_backbone)
-        self.backbone = MODELS.build(backbone)
+        self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
+        self.backbone = MODELS.build(_cfg(backbone, 'backbone'))
         if memory is not None:
-            self.memory = MODELS.build(memory)
-        if neck is not None:
-            self.neck = MODELS.build(neck)
-        self.pool = MODELS.build(pool)
-        self.decoder = MODELS.build(decoder)
+            self.memory = MODELS.build(_cfg(memory, 'memory'))
+        self.neck = MODELS.build(_cfg(neck, 'neck')) if neck is not None else None
+        self.pool = MODELS.build(_cfg(pool, 'pool'))
+        dec_cfg = _cfg(decoder, 'decoder')
+        self.decoder = MODELS.build(dec_cfg)
         if merge_head is not None:
             self.merge_head = MODELS.build(merge_head)
         if merge_criterion is not None:
             self.merge_criterion = MODELS.build(merge_criterion)
-        self.criterion = MODELS.build(criterion)
-        self.decoder_online = decoder['temporal_attn']
-        self.use_bbox = decoder['bbox_flag']
-        self.sem_len = decoder['num_semantic_classes'] + 1 # 201
+        self.criterion = MODELS.build(_cfg(criterion, 'criterion'))
+        self.decoder_online = dec_cfg['temporal_attn']
+        self.use_bbox = dec_cfg['bbox_flag']
+        self.sem_len = dec_cfg['num_semantic_classes'] + 1 # 201
         self.voxel_size = voxel_size
         self.num_classes = num_classes
         self.query_thr = query_thr
         self.train_cfg = train_cfg
-        self.test_cfg = test_cfg
+        self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.init_weights()
         
         self.conv = nn.Sequential(
@@ -1106,7 +1107,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
             if getattr(self, 'img_backbone', None) is not None and 'img_path' in batch_inputs_dict:
                 _ = self.img_backbone(batch_inputs_dict['img_path'])  # unused placeholder
         img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
-        
+    
         # construct tensor field
         coordinates, features = [], []
         for i in range(len(batch_inputs_dict['points'])):
@@ -1118,7 +1119,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
             features.append(batch_inputs_dict['points'][i][frame_i, :, 3:])
         all_xyz = coordinates
         
-        coordinates, features = ME.utils.batch_sparse_collate(
+        coordinates, features, *_ = ME.utils.batch_sparse_collate(
             [(c / self.voxel_size, f) for c, f in zip(coordinates, features)],
             device=coordinates[0].device)
         field = ME.TensorField(coordinates=coordinates, features=features)
@@ -1128,6 +1129,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
                           partial(self._f, img_features=img_metas, img_shape=img_metas[0]['img_shape']),
                           memory=self.memory if hasattr(self,'memory') else None)
         if self.with_neck:
+            assert self.neck is not None
             x = self.neck(x)
         x = x.slice(field)
         point_features = [torch.cat([c,f], dim=-1) for c,f in zip(all_xyz, x.decomposed_features)]  # [B, N, 3+D]
@@ -1140,7 +1142,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w = self.pool(x, sp_idx, all_xyz, with_xyz=True)
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
 
         # apply cls_layer
         features = []
@@ -1157,7 +1159,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         for i in range(len(points)):
             points[i] = points[i] * self.voxel_size
         projected_features = []
-        for point, img_feature, img_meta in zip(points, img_features, img_metas):
+        for point, img_feature, img_meta in zip(points, img_features, img_metas):  # type: ignore[name-defined]
             coord_type = 'DEPTH'
             img_scale_factor = (
                 point.new_tensor(img_meta['scale_factor'][:2])
@@ -1204,7 +1206,7 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
             features.append(batch_inputs_dict['points'][i][:, 3:])
         all_xyz = coordinates
 
-        coordinates, features = ME.utils.batch_sparse_collate(
+        coordinates, features, *_ = ME.utils.batch_sparse_collate(
             [(c / self.voxel_size, f) for c, f in zip(coordinates, features)],
             device=coordinates[0].device)
         field = ME.TensorField(coordinates=coordinates, features=features)
@@ -1223,7 +1225,7 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w = self.pool(x, sp_idx, all_xyz, with_xyz=True)
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
 
         # apply cls_layer
         features = []
@@ -1318,7 +1320,7 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         ## Offline semantic segmentation
         mv_sem = torch.cat([res['pts_semantic_mask'][0] for res in results])
         
-        if self.use_bbox:
+        if self.use_bbox and 'mv_bboxes' in locals() and mv_bboxes is not None:
             batch_data_samples[0].pred_bbox = mv_bboxes.cpu().numpy()
         
         # Not mapping to reconstructed point clouds, return directly for visualization
@@ -1329,3 +1331,20 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
             instance_scores=mv_scores.cpu().numpy())
         batch_data_samples[0].pred_pts_seg = merged_result
         return batch_data_samples
+
+# -----------------------------------------------------------------------------
+# Utility helpers for static-type friendly module construction
+# -----------------------------------------------------------------------------
+
+def _cfg(cfg: Any, name: str) -> Dict[str, Any]:
+    """Ensure *cfg* is a dict so that static analyzers don't complain.
+
+    This wrapper raises a clear error at runtime if the user forgets to
+    provide a config section, while also narrowing the type for Pyright so
+    that calls like ``MODELS.build`` won't emit *Unknown | None* diagnostics.
+    """
+    if cfg is None:
+        raise ValueError(f'Config for "{name}" must be provided, but got None.')
+    if not isinstance(cfg, dict):
+        raise TypeError(f'Config for "{name}" must be a dict, got {type(cfg)}.')
+    return cast(Dict[str, Any], cfg)

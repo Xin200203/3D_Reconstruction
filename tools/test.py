@@ -57,6 +57,10 @@ def parse_args():
         help='job launcher')
     parser.add_argument(
         '--tta', action='store_true', help='Test time augmentation')
+    # 新增：是否使用类无关实例评测
+    parser.add_argument(
+        '--cat-agnostic', action='store_true',
+        help='If set, use category-agnostic instance evaluation (AP).')
     # When using PyTorch version >= 2.0.0, the `torch.distributed.launch`
     # will pass the `--local-rank` parameter to `tools/test.py` instead
     # of `--local_rank`.
@@ -109,6 +113,18 @@ def main():
     cfg.launcher = args.launcher
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+
+    # 根据 --cat-agnostic 调整评测模式
+    eval_mode = 'cat_agnostic' if args.cat_agnostic else 'multi_class'
+    for key in ['val_evaluator', 'test_evaluator']:
+        if key in cfg:
+            # 支持 evaluator 为字典或列表
+            if isinstance(cfg[key], dict):
+                cfg[key]['eval_mode'] = eval_mode
+            elif isinstance(cfg[key], (list, tuple)):
+                for _e in cfg[key]:
+                    if isinstance(_e, dict):
+                        _e['eval_mode'] = eval_mode
 
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:

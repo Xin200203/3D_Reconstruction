@@ -1,7 +1,7 @@
 # Adapted from mmdet3d/datasets/transforms/loading.py
 import mmengine
 import numpy as np
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 import os, pdb, json
 
 from mmdet3d.datasets.transforms import LoadAnnotations3D
@@ -426,13 +426,12 @@ class LoadAdjacentDataFromFile(BaseTransform):
         if self.use_color:
             assert len(self.use_dim) >= 6
             if attribute_dims is None:
-                attribute_dims = dict()
-            attribute_dims.update(
-                dict(color=[
+                attribute_dims = {}
+            attribute_dims['color'] = [  # type: ignore[assignment]
                     points.shape[1] - 3,
                     points.shape[1] - 2,
                     points.shape[1] - 1,
-                ]))
+            ]
 
         if self.with_bbox_3d:
             raise NotImplementedError("bbox_3d is not needed for Online seg")
@@ -461,13 +460,17 @@ class LoadAdjacentDataFromFile(BaseTransform):
         
         if self.use_FF:
             imgs = []
-            for i in range(len(img_file_paths)):
-                _results = dict(img_path=img_file_paths[i], img_prefix=None)
-                _results = self.loader(_results)
-                imgs.append(_results['img'])
-            for key in _results.keys():
-                if key not in ['img', 'img_prefix', 'img_path']:
-                    results[key] = _results[key]
+            for img_path in img_file_paths:
+                load_dict = dict(img_path=img_path, img_prefix=None)
+                _img_result = self.loader(load_dict)  # type: ignore
+                if isinstance(_img_result, dict):
+                    imgs.append(_img_result['img'])  # type: ignore[index]
+                    for k, v in _img_result.items():
+                        if k not in ['img', 'img_prefix', 'img_path']:
+                            results[k] = v  # 其余 meta 信息写回
+                else:
+                    # fallback: 仅将返回值视为图像 Tensor
+                    imgs.append(_img_result)  # type: ignore[arg-type]
             results['img'] = imgs
             results['img_paths'] = img_file_paths
             results['poses'] = poses
@@ -619,13 +622,12 @@ class LoadPointsFromFile_(BaseTransform):
         if self.use_color:
             assert len(self.use_dim) >= 6
             if attribute_dims is None:
-                attribute_dims = dict()
-            attribute_dims.update(
-                dict(color=[
+                attribute_dims = {}
+            attribute_dims['color'] = [  # type: ignore[assignment]
                     points.shape[1] - 3,
                     points.shape[1] - 2,
                     points.shape[1] - 1,
-                ]))
+            ]
 
         points_class = get_points_type(self.coord_type)
         points = points_class(
@@ -644,4 +646,57 @@ class LoadPointsFromFile_(BaseTransform):
         repr_str += f'norm_intensity={self.norm_intensity})'
         repr_str += f'norm_elongation={self.norm_elongation})'
         return repr_str
+
+@TRANSFORMS.register_module()
+class LoadClipFeature(BaseTransform):
+    """Load offline CLIP conv1 features (.pt) saved by ``precompute_clip_feats.py``.
+
+    1. 对 *SV*（单帧）样本：
+       - 优先读取 ``clip_feat_path``，若不存在则由 ``img_path`` 推断。
+    2. 对 *MV*（多帧）样本：
+       - 优先读取 ``clip_feat_paths``，否则由 ``img_paths`` 推断。
+
+    添加字段：
+        - ``clip_pix``   : Tensor 或 List[Tensor]，C=192, H/8, W/8
+        - ``clip_global``: Tensor 或 List[Tensor]，dim=768
+
+    若指定路径的 .pt 不存在，则对应位置写入 ``None``；模型内部可据此回退到在线计算。
+    """
+    def __init__(self, data_root: str, dtype: str = 'fp16') -> None:
+        super().__init__()
+        self.data_root = data_root
+        self.dtype = dtype
+
+    def _load_single(self, rel_path: Optional[str]):
+        import torch, os
+        if rel_path is None:
+            return None, None
+        full_path = os.path.join(self.data_root, rel_path)
+        if not os.path.exists(full_path):
+            return None, None
+        data = torch.load(full_path)
+        return data.get('pix', None), data.get('global', None)
+
+    def transform(self, results: dict) -> dict:
+        # Determine SV or MV
+        if 'img_paths' in results:  # MV
+            clip_paths = results.get('clip_feat_paths', None)
+            if clip_paths is None:
+                clip_paths = [p.replace('2D', 'clip_feat').replace('.jpg', '.pt')
+                              for p in results['img_paths']]
+            clip_pix_list, clip_global_list = [], []
+            for rel in clip_paths:
+                pix, glob = self._load_single(rel)
+                clip_pix_list.append(pix)
+                clip_global_list.append(glob)
+            results['clip_pix'] = clip_pix_list
+            results['clip_global'] = clip_global_list
+        else:  # SV
+            clip_path = results.get('clip_feat_path', None)
+            if clip_path is None and 'img_path' in results:
+                clip_path = results['img_path'].replace('2D', 'clip_feat').replace('.jpg', '.pt')
+            pix, glob = self._load_single(clip_path)
+            results['clip_pix'] = pix
+            results['clip_global'] = glob
+        return results
   

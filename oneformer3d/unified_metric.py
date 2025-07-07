@@ -26,6 +26,7 @@ class UnifiedSegMetric(SegMetric):
             `classes` (List[str]): class names.
         logger_keys (List[Tuple]): Keys for logger to save; of len 3:
             semantic, instance, and panoptic.
+        eval_mode (str): Evaluation mode. Must be 'auto', 'multi_class', or 'cat_agnostic'.
     """
 
     def __init__(self,
@@ -39,6 +40,7 @@ class UnifiedSegMetric(SegMetric):
                  logger_keys=[('miou',),
                               ('all_ap', 'all_ap_50%', 'all_ap_25%'), 
                               ('pq',)],
+                 eval_mode: str = 'auto',
                  **kwargs):
         self.thing_class_inds = thing_class_inds
         self.stuff_class_inds = stuff_class_inds
@@ -49,6 +51,9 @@ class UnifiedSegMetric(SegMetric):
         self.logger_keys = [('all_ap', 'all_ap_50%', 'all_ap_25%')]
         self.sem_mapping = np.array(sem_mapping)
         self.inst_mapping = np.array(inst_mapping)
+        assert eval_mode in ('auto', 'multi_class', 'cat_agnostic'), \
+            "eval_mode must be 'auto', 'multi_class', or 'cat_agnostic'"
+        self.eval_mode = eval_mode
         super().__init__(**kwargs)
 
     def compute_metrics(self, results):
@@ -63,6 +68,8 @@ class UnifiedSegMetric(SegMetric):
         """
         logger: MMLogger = MMLogger.get_current_instance()
         
+        # `dataset_meta` 在运行时由 Runner 注入；若静态检查为 None，显式断言
+        assert self.dataset_meta is not None, 'dataset_meta is None; ensure metric is built with dataset metainfo.'
         self.valid_class_ids = self.dataset_meta['seg_valid_class_ids']
         label2cat = self.metric_meta['label2cat']
         ignore_index = self.metric_meta['ignore_index']
@@ -122,7 +129,15 @@ class UnifiedSegMetric(SegMetric):
         #     label2cat,
         #     ignore_index[0],
         #     logger=logger)
-        if pred_instance_labels[0].max() == 0:
+        # decide evaluation mode: auto / multi_class / cat_agnostic
+        if self.eval_mode == 'cat_agnostic':
+            use_cat_agnostic = True
+        elif self.eval_mode == 'multi_class':
+            use_cat_agnostic = False
+        else:  # auto
+            use_cat_agnostic = (pred_instance_labels[0].max() == 0)
+
+        if use_cat_agnostic:
             ret_inst = instance_cat_agnostic_eval(
                 gt_semantic_masks_inst_task,
                 gt_instance_masks_inst_task,

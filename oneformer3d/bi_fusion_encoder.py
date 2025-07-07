@@ -82,12 +82,40 @@ class TinySANeck(nn.Module):
             for _ in range(num_layers)
         ])
 
-    def forward(self, xyz: torch.Tensor, feats: torch.Tensor):
-        """Args:
-            xyz (Tensor): (N,3) coordinates in camera/world frame.
-            feats (Tensor): (N,C) input features.
+    def forward(self, x, feats: Optional[torch.Tensor] = None, voxel_size: float = 0.02):
+        """Forward 支持两种输入：
+
+        1. `x` 为 MinkowskiEngine SparseTensor（来自 3D Backbone）。
+        2. `x` 为 (N,3) xyz 坐标张量，需同时传入 `feats` (N,C)。
+        返回与输入类型一致的数据结构。
+        """
+        import MinkowskiEngine as ME  # 避免循环依赖
+
+        # Case 1: SparseTensor
+        if isinstance(x, ME.SparseTensor):
+            sp_tensor = x
+            xyz = sp_tensor.coordinates[:, 1:].float() * voxel_size  # 去掉批索引
+            feats_in = sp_tensor.features
+            updated_feats = self._apply_sa(xyz, feats_in)
+            return ME.SparseTensor(
+                updated_feats,
+                coordinate_map_key=sp_tensor.coordinate_map_key,
+                coordinate_manager=sp_tensor.coordinate_manager)
+
+        # Case 2: xyz + feats
+        if feats is None:
+            raise ValueError('When first argument is xyz Tensor, feats must not be None.')
+        return self._apply_sa(x, feats)
+
+    # === 新增内部函数：统一执行 TinySA 堆叠 ===
+    def _apply_sa(self, xyz: torch.Tensor, feats: torch.Tensor):
+        """Apply stacked TinySA layers.
+
+        Args:
+            xyz (Tensor): (N,3) coordinates.
+            feats (Tensor): (N,C) features.
         Returns:
-            Tensor: (N,C) features after two TinySA layers.
+            Tensor: (N,C) updated features.
         """
         for sa in self.layers:
             feats = sa(xyz, feats)
@@ -210,6 +238,7 @@ class BiFusionEncoder(nn.Module):
         fused, conf = self.fuse_gate(f2d96, f3d96)
         return fused, conf, pe, clip_global
 
+    # === 恢复原 forward(points_list, imgs, cam_info) ===
     def forward(self, points_list, imgs, cam_info):
         """支持 List 或 batched Tensor 输入，统一返回 List 结果。"""
         # --- 兼容性处理 ---
@@ -228,7 +257,6 @@ class BiFusionEncoder(nn.Module):
                 with torch.no_grad():
                     amp_ctx = torch.cuda.amp.autocast(enabled=self.use_amp and imgs_batch.is_cuda)
                     with amp_ctx:
-                        # 直接提取 conv1 patch 特征，避免 vi-transformer 位置编码分辨率限制
                         clip_feat_b = self.clip_visual.conv1(imgs_batch)  # (B,768,h/16,w/16)
                         up = F.pixel_shuffle(clip_feat_b, 2)       # (B,192,h/8,w/8)
                         feat2d_maps = self.conv_reduce(up)         # (B,256,h/8,w/8)

@@ -41,6 +41,11 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
         if 'elastic_coords' in inputs:
             batch_inputs['elastic_coords'] = inputs['elastic_coords']
 
+        if 'clip_pix' in inputs:
+            batch_inputs['clip_pix'] = inputs['clip_pix']
+        if 'clip_global' in inputs:
+            batch_inputs['clip_global'] = inputs['clip_global']
+
         if 'imgs' in inputs:
             imgs = inputs['imgs']
 
@@ -61,8 +66,12 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
                         samplelist_boxtype2tensor
                     samplelist_boxtype2tensor(data_samples)
                 elif hasattr(self, 'boxlist2tensor') and self.boxlist2tensor:
-                    from mmdet.models.utils.misc import \
-                        samplelist_boxlist2tensor
+                    # 某些版本的 mmdet 并未实现 `samplelist_boxlist2tensor`，
+                    # 这里使用 try–except 保持向后兼容，避免静态分析报错。
+                    try:
+                        from mmdet.models.utils.misc import samplelist_boxlist2tensor  # type: ignore
+                    except ImportError:  # fallback to same impl as boxtype2tensor
+                        from mmdet.models.utils.misc import samplelist_boxtype2tensor as samplelist_boxlist2tensor  # type: ignore
                     samplelist_boxlist2tensor(data_samples)
                 if self.pad_mask:
                     self.pad_gt_masks(data_samples)
