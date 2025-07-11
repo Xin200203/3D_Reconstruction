@@ -63,7 +63,10 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
+        if img_backbone is not None:
+            self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
+        else:
+            self.img_backbone = None
         self.backbone = MODELS.build(_cfg(backbone, 'backbone'))
         self.bi_encoder = MODELS.build(_cfg(bi_encoder, 'bi_encoder')) if bi_encoder is not None else None
         self.neck = MODELS.build(_cfg(neck, 'neck')) if neck is not None else None
@@ -116,7 +119,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 n_super_points.append(sp_pts_mask.max() + 1)
             sp_idx = torch.cat(sp_pts_masks)
 
-            x, all_xyz_w = self.pool(x, sp_idx, all_xyz)
+            x, all_xyz_w = self.pool(x, sp_idx, all_xyz, with_xyz=False)
 
             # split per sample features
             features = []
@@ -133,7 +136,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         # 如果提供了图像骨干网络，则先提取图像特征（仅占位，避免 OptionalCall 报错）
         with torch.no_grad():
             if self.img_backbone is not None and 'img_path' in batch_inputs_dict:
-                _ = self.img_backbone(batch_inputs_dict['img_path'])
+                _ = self.img_backbone(batch_inputs_dict['img_path'])  # type: ignore[operator]
         img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
         
         # construct tensor field
@@ -168,7 +171,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=False)
 
         # apply cls_layer
         features = []
@@ -363,7 +366,10 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
+        if img_backbone is not None:
+            self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
+        else:
+            self.img_backbone = None
         self.backbone = MODELS.build(_cfg(backbone, 'backbone'))
         self.neck = MODELS.build(_cfg(neck, 'neck')) if neck is not None else None
         self.pool = MODELS.build(_cfg(pool, 'pool'))
@@ -382,7 +388,7 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
             ME.MinkowskiReLU(inplace=True))
     
     def init_weights(self):
-        if hasattr(self, 'img_backbone'):
+        if getattr(self, 'img_backbone', None) is not None:
             self.img_backbone.init_weights()
     
     def extract_feat(self, batch_inputs_dict, batch_data_samples):
@@ -405,7 +411,7 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
         # extract image features
         with torch.no_grad():
             if getattr(self, 'img_backbone', None) is not None and 'img_path' in batch_inputs_dict:
-                _ = self.img_backbone(batch_inputs_dict['img_path'])  # unused placeholder
+                _ = self.img_backbone(batch_inputs_dict['img_path'])  # type: ignore[operator]
         img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
         
         # construct tensor field
@@ -441,7 +447,7 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=False)
 
         # apply cls_layer
         features = []
@@ -559,8 +565,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         self.init_weights()
     
     def init_weights(self):
-        if hasattr(self, 'memory'):
+        if getattr(self, 'memory', None) is not None:
             self.memory.init_weights()
+        if getattr(self, 'img_backbone', None) is not None:
+            self.img_backbone.init_weights()
 
     def extract_feat(self, batch_inputs_dict, batch_data_samples, frame_i):
         """Extract features from sparse tensor.
@@ -597,7 +605,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=False)
 
         # apply cls_layer
         features = []
@@ -1065,7 +1073,10 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
+        if img_backbone is not None:
+            self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
+        else:
+            self.img_backbone = None
         self.backbone = MODELS.build(_cfg(backbone, 'backbone'))
         if memory is not None:
             self.memory = MODELS.build(_cfg(memory, 'memory'))
@@ -1094,9 +1105,9 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
             ME.MinkowskiReLU(inplace=True))
     
     def init_weights(self):
-        if hasattr(self, 'memory'):
+        if getattr(self, 'memory', None) is not None:
             self.memory.init_weights()
-        if hasattr(self, 'img_backbone'):
+        if getattr(self, 'img_backbone', None) is not None:
             self.img_backbone.init_weights()
 
     def extract_feat(self, batch_inputs_dict, batch_data_samples, frame_i):
@@ -1105,7 +1116,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         # extract image features
         with torch.no_grad():
             if getattr(self, 'img_backbone', None) is not None and 'img_path' in batch_inputs_dict:
-                _ = self.img_backbone(batch_inputs_dict['img_path'])  # unused placeholder
+                _ = self.img_backbone(batch_inputs_dict['img_path'])  # type: ignore[operator]
         img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
     
         # construct tensor field
@@ -1132,7 +1143,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
             assert self.neck is not None
             x = self.neck(x)
         x = x.slice(field)
-        point_features = [torch.cat([c,f], dim=-1) for c,f in zip(all_xyz, x.decomposed_features)]  # [B, N, 3+D]
+        point_features = [torch.cat([c, f], dim=-1) for c, f in zip(all_xyz, x.decomposed_features)]  # [B, N, 3+D]
         x = x.features
 
         # apply scatter_mean
@@ -1142,7 +1153,7 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=False)
 
         # apply cls_layer
         features = []
@@ -1225,7 +1236,7 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
             sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
             n_super_points.append(sp_pts_mask.max() + 1)
         sp_idx = torch.cat(sp_pts_masks)
-        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=True)  # type: ignore[assignment]
+        x, all_xyz_w, *_ = self.pool(x, sp_idx, all_xyz, with_xyz=False)
 
         # apply cls_layer
         features = []

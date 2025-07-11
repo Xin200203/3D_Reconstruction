@@ -25,3 +25,11 @@ from .scannet_dataset import ScanNetSegDataset_, ScanNet200SegDataset_, ScanNet2
 from .time_divided_transformer import TimeDividedTransformer
 from .bi_fusion_encoder import BiFusionEncoder
 from .bife_clip_loss import ClipConsCriterion
+# 将所有在 mmdet3d.registry.MODELS 中注册的模块同步到 mmengine.registry.MODELS，
+# 以便 mmengine 的 BaseModel 能够直接查询到自定义组件（如 Det3DDataPreprocessor_）。
+from mmdet3d.registry import MODELS as _M3D_MODELS  # noqa: E402
+from mmengine.registry import MODELS as _MM_MODELS  # noqa: E402
+for _name, _module in _M3D_MODELS.module_dict.items():
+    if _name not in _MM_MODELS.module_dict:
+        # 使用强制注册，避免与已有同名冲突时报错
+        _MM_MODELS.register_module(name=_name, force=True)(_module)

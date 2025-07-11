@@ -54,6 +54,8 @@ class FusionGate(nn.Module):
         return gate * f2d + (1 - gate) * f3d, gate.mean(dim=-1, keepdim=True)
 
 
+# 注册到 MMEngine MODELS，便于在配置中直接引用
+@MODELS.register_module()
 class TinySANeck(nn.Module):
     """Two-layer Tiny Self-Attention neck implemented by stacking TinySAModule.
 
