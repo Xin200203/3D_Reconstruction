@@ -31,7 +31,11 @@ class TinySAModule(nn.Module):
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.proj_out = nn.Linear(dim, dim)
-        self.norm = nn.LayerNorm(dim)
+        # ==== LayerNorm 拆分：分别作用于 MHSA 与 FFN 输出 ====
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        # 缓存用于 eval 的中心索引（FPS 采样）
+        self.register_buffer('_fps_idx_cache', torch.empty(0, dtype=torch.long), persistent=False)
         self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.ReLU(), nn.Linear(dim * 4, dim))
 
     def forward(self, xyz: torch.Tensor, feats: torch.Tensor):
@@ -43,9 +47,23 @@ class TinySAModule(nn.Module):
         """
         device = xyz.device
         N = xyz.size(0)
-        # 1. sample centers via random or fps
+        # 1. 采样中心点：训练阶段随机 / 推理阶段使用 FPS 并缓存
         M = max(1, int(N * self.sample_ratio))
-        idx_center = torch.randperm(N, device=device)[:M]
+        if self.training:
+            idx_center = torch.randperm(N, device=device)[:M]
+        else:
+            if self._fps_idx_cache.numel() != M:
+                # —— 简易 Farthest Point Sampling (CPU O(MN)) ——
+                idx_center = torch.empty(M, dtype=torch.long, device=device)
+                idx_center[0] = torch.randint(0, N, (1,), device=device)
+                dist = torch.full((N,), float('inf'), device=device)
+                for i in range(1, M):
+                    last = xyz[idx_center[i-1]]
+                    dist = torch.minimum(dist, torch.norm(xyz - last, dim=1))
+                    idx_center[i] = torch.argmax(dist)
+                self._fps_idx_cache = idx_center
+            else:
+                idx_center = self._fps_idx_cache
         center_xyz = xyz[idx_center]  # (M,3)
         center_feat = feats[idx_center]  # (M,C)
 
@@ -89,8 +107,9 @@ class TinySAModule(nn.Module):
         updated_center = out
 
         updated_center = self.proj_out(updated_center)
-        center_feat = center_feat + self.norm(updated_center)
-        center_feat = center_feat + self.norm(self.ffn(center_feat))
+        # LayerNorm 分别应用
+        center_feat = center_feat + self.norm1(updated_center)
+        center_feat = center_feat + self.norm2(self.ffn(center_feat))
 
         # 4. upsample to all points via nearest center
         nearest_center_idx = dist2.argmin(dim=0)  # (N,)
