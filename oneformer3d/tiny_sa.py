@@ -40,6 +40,10 @@ class TinySAModule(nn.Module):
         # ==== kNN 插值参数 ====
         self.knn_k = 8  # 默认 8 个中心
         self.alpha = 2  # 距离指数
+        # ==== Residual Refinement (中期阶段) ====
+        self.post_mlp = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU())
 
     # ------------------------------------------------------------
     # 兼容旧 checkpoint：当 state_dict 中仍是单一 `norm` 权重时，自动复制到新
@@ -153,7 +157,8 @@ class TinySAModule(nn.Module):
         weight = 1.0 / (knn_dist + 1e-6).pow(self.alpha)  # (k,N)
         weight = weight / weight.sum(dim=0, keepdim=True)  # normalize along k
         output_feats = torch.sum(center_feat[knn_idx] * weight.unsqueeze(-1), dim=0)  # (N,C)
-        # residual connection
+        # residual connection + refinement
+        output_feats = output_feats + self.post_mlp(output_feats)
         return feats + output_feats 
 
 class TinySA2D(nn.Module):

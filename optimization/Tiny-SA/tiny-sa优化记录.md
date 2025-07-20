@@ -101,5 +101,6 @@
 | 7-20 | `configs/ESAM_CA/sv3d_tiny_sa_scannet200_ca.py` | `model.neck` | sample_ratio→0.05, radius→0.2, max_k→32 |
 | 7-20 | `oneformer3d/tiny_sa.py` | `forward` | 添加邻居缺失保护逻辑；默认sample_ratio改0.05 |
 | 7-20 | `oneformer3d/tiny_sa.py` | `_load_from_state_dict` | 自动将旧 `norm` 权重复制到 `norm1/2`，无需手工迁移 |
+| 7-20 | `oneformer3d/tiny_sa.py` | `__init__` + `forward` | 新增 `post_mlp` 残差细化并在上采样后应用 |
 
 > 提交分支：`tiny-sa`；commit msg：`fix: split LayerNorm & add FPS sampling cache`

@@ -1,6 +1,5 @@
 ####################################
 # Project outputs
-work_dirs/
 logs/
 tensorboard/
 vis_demo/results/
