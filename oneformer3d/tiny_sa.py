@@ -19,7 +19,7 @@ class TinySAModule(nn.Module):
         max_k (int): maximum neighbors per center
         sample_ratio (float): ratio of points kept as centers (0‒1)
     """
-    def __init__(self, dim: int = 128, num_heads: int = 4, radius: float = 0.3, max_k: int = 32, sample_ratio: float = 0.25):
+    def __init__(self, dim: int = 128, num_heads: int = 4, radius: float = 0.3, max_k: int = 32, sample_ratio: float = 0.05):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -37,6 +37,30 @@ class TinySAModule(nn.Module):
         # 缓存用于 eval 的中心索引（FPS 采样）
         self.register_buffer('_fps_idx_cache', torch.empty(0, dtype=torch.long), persistent=False)
         self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.ReLU(), nn.Linear(dim * 4, dim))
+        # ==== kNN 插值参数 ====
+        self.knn_k = 8  # 默认 8 个中心
+        self.alpha = 2  # 距离指数
+
+    # ------------------------------------------------------------
+    # 兼容旧 checkpoint：当 state_dict 中仍是单一 `norm` 权重时，自动复制到新
+    # `norm1`、`norm2`，避免用户手动迁移。
+    # ------------------------------------------------------------
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                               missing_keys, unexpected_keys, error_msgs):
+        key_old_w = prefix + 'norm.weight'
+        key_old_b = prefix + 'norm.bias'
+        key_new_w1 = prefix + 'norm1.weight'
+        if key_old_w in state_dict and key_new_w1 not in state_dict:
+            # 自动拷贝旧权重到新结构
+            w = state_dict[key_old_w]
+            b = state_dict[key_old_b]
+            state_dict[prefix + 'norm1.weight'] = w.clone()
+            state_dict[prefix + 'norm1.bias'] = b.clone()
+            state_dict[prefix + 'norm2.weight'] = w.clone()
+            state_dict[prefix + 'norm2.bias'] = b.clone()
+            # 保持旧键，避免意外删除
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
 
     def forward(self, xyz: torch.Tensor, feats: torch.Tensor):
         """Args:
@@ -80,6 +104,13 @@ class TinySAModule(nn.Module):
         nbr_dist, nbr_idx = dist2_masked.topk(self.max_k, dim=-1, largest=False)  # (M,K)
         # 有些邻居可能不存在（值为 inf）
         mask_valid = torch.isfinite(nbr_dist)  # (M,K)
+        # —— 若某个 center 无有效邻居，直接跳过更新（保持原特征） ——
+        if (~mask_valid).all(dim=1).any():
+            valid_center = mask_valid.any(dim=1)
+            # 仅对有邻居的中心执行后续计算
+            center_mask = valid_center.unsqueeze(-1)
+        else:
+            center_mask = None
 
         # === 从 feats 中安全 gather 邻居特征，缺失用 0 填充 ===
         nbr_feats = torch.zeros(M, self.max_k, self.dim, device=feats.device, dtype=feats.dtype)
@@ -108,12 +139,20 @@ class TinySAModule(nn.Module):
 
         updated_center = self.proj_out(updated_center)
         # LayerNorm 分别应用
-        center_feat = center_feat + self.norm1(updated_center)
-        center_feat = center_feat + self.norm2(self.ffn(center_feat))
+        if center_mask is not None:
+            # 仅更新有邻居的中心；无邻居的保持原值
+            center_feat[center_mask.squeeze()] = center_feat[center_mask.squeeze()] + self.norm1(updated_center[center_mask.squeeze()])
+            center_feat[center_mask.squeeze()] = center_feat[center_mask.squeeze()] + self.norm2(self.ffn(center_feat[center_mask.squeeze()]))
+        else:
+            center_feat = center_feat + self.norm1(updated_center)
+            center_feat = center_feat + self.norm2(self.ffn(center_feat))
 
-        # 4. upsample to all points via nearest center
-        nearest_center_idx = dist2.argmin(dim=0)  # (N,)
-        output_feats = center_feat[nearest_center_idx]  # (N,C)
+        # 4. upsample with kNN inverse-distance weighting (continuous & differentiable)
+        k = min(self.knn_k, M)
+        knn_dist, knn_idx = dist2.topk(k, dim=0, largest=False)  # (k,N)
+        weight = 1.0 / (knn_dist + 1e-6).pow(self.alpha)  # (k,N)
+        weight = weight / weight.sum(dim=0, keepdim=True)  # normalize along k
+        output_feats = torch.sum(center_feat[knn_idx] * weight.unsqueeze(-1), dim=0)  # (N,C)
         # residual connection
         return feats + output_feats 
 

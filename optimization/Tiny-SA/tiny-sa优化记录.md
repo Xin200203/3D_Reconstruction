@@ -97,6 +97,9 @@
 | 日期 | 文件 | 行号/位置 | 变动概述 |
 |------|------|-----------|----------|
 | 7-20 | `oneformer3d/tiny_sa.py` | `__init__` | 拆分 `LayerNorm` → `norm1` / `norm2`；注册 `_fps_idx_cache` 缓存 |
-| 7-20 | `oneformer3d/tiny_sa.py` | `forward` | 训练阶段保留随机采样；推理阶段替换为简易 FPS 采样并缓存；调用处改用 `norm1`/`norm2` |
+| 7-20 | `oneformer3d/tiny_sa.py` | `forward` | 替换最近中心复制→kNN(8)反距离(α=2)加权插值，连续可导 |
+| 7-20 | `configs/ESAM_CA/sv3d_tiny_sa_scannet200_ca.py` | `model.neck` | sample_ratio→0.05, radius→0.2, max_k→32 |
+| 7-20 | `oneformer3d/tiny_sa.py` | `forward` | 添加邻居缺失保护逻辑；默认sample_ratio改0.05 |
+| 7-20 | `oneformer3d/tiny_sa.py` | `_load_from_state_dict` | 自动将旧 `norm` 权重复制到 `norm1/2`，无需手工迁移 |
 
 > 提交分支：`tiny-sa`；commit msg：`fix: split LayerNorm & add FPS sampling cache`

@@ -14,9 +14,9 @@ model = dict(
         type='TinySANeck',
         dim=96,
         num_heads=4,
-        radius=0.15,
-        max_k=16,
-        sample_ratio=0.02,
+        max_k=32,
+        sample_ratio=0.05,
+        radius=0.2,
         num_layers=2,
     )
 )
