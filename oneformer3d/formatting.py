@@ -14,7 +14,7 @@ import PIL.Image as Image
 class Pack3DDetInputs_(Pack3DDetInputs):
     """Just add elastic_coords, sp_pts_mask, and gt_sp_masks.
     """
-    INPUTS_KEYS = ['points', 'img', 'elastic_coords', 'img_path', 'clip_pix', 'clip_global']
+    INPUTS_KEYS = ['points', 'img', 'imgs', 'cam_info', 'elastic_coords', 'img_path', 'clip_pix', 'clip_global']
     SEG_KEYS = [
         'gt_seg_map',
         'pts_instance_mask',
@@ -170,7 +170,7 @@ class Pack3DDetInputs_(Pack3DDetInputs):
 class Pack3DDetInputs_Online(Pack3DDetInputs):
     """Just add elastic_coords, sp_pts_mask, and gt_sp_masks.
     """
-    INPUTS_KEYS = ['points', 'img', 'elastic_coords', 'img_paths', 'clip_pix', 'clip_global']
+    INPUTS_KEYS = ['points', 'img', 'imgs', 'cam_info', 'elastic_coords', 'img_paths', 'clip_pix', 'clip_global']
     SEG_KEYS = [
         'gt_seg_map',
         'pts_instance_mask',

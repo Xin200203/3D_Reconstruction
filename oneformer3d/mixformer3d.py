@@ -81,22 +81,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.train_cfg = train_cfg
 
     def extract_feat(self, batch_inputs_dict, batch_data_samples):
-        """Extract features from sparse tensor.
-
-        Args:
-            batch_inputs_dict (dict): The model input dict which include
-                `points` key.
-            batch_data_samples (List[:obj:`Det3DDataSample`]): The Data
-                Samples. It includes information such as
-                `gt_pts_seg.sp_pts_mask`.
-
-        Returns:
-            Tuple:
-                List[Tensor]: of len batch_size,
-                    each of shape (n_points_i, n_channels).
-                List[Tensor]: of len batch_size,
-                    each of shape (n_points_i, n_classes + 1).
-        """
+        """Extract features from sparse tensor."""
         if self.bi_encoder is not None and 'imgs' in batch_inputs_dict:
             # === BiFusion path ===
             encoder_out = self.bi_encoder(
@@ -108,12 +93,16 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             fused_list = encoder_out['feat_fusion']
             all_xyz = [pts[:, :3] for pts in batch_inputs_dict['points']]
 
+            # 基本长度检查（bi_encoder已经有详细验证）
+            if len(fused_list) != len(batch_data_samples):
+                raise RuntimeError(f"Fused features length {len(fused_list)} != batch samples {len(batch_data_samples)}")
+
             # concatenate all fused features
             x = torch.cat(fused_list, dim=0)
 
             # superpoint pooling
             sp_pts_masks, n_super_points = [], []
-            for data_sample in batch_data_samples:
+            for i, data_sample in enumerate(batch_data_samples):
                 sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask
                 sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
                 n_super_points.append(sp_pts_mask.max() + 1)

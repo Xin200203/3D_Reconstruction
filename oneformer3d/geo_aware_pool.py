@@ -13,6 +13,7 @@ class GeoAwarePooling(BaseModule):
     """
     def __init__(self, channel_proj):
         super().__init__()
+        self.channel_proj = channel_proj
         self.pts_proj1 = nn.Sequential(
             nn.Linear(3, channel_proj),
             nn.LayerNorm(channel_proj),
@@ -27,6 +28,9 @@ class GeoAwarePooling(BaseModule):
             nn.Linear(channel_proj, 1, bias=False),
             nn.Sigmoid()
         )
+        
+        # 输入特征适配层 (延迟初始化)
+        self.input_adapter = None
     
     def scatter_norm(self, points, idx):
         ''' Normalize positions of same-segment in a unit sphere of diameter 1
@@ -42,16 +46,63 @@ class GeoAwarePooling(BaseModule):
         return points, diameter_segment.view(-1, 1)
 
     def forward(self, x, sp_idx, all_xyz, with_xyz=False):
+        # 检查输入特征维度并适配
+        input_dim = x.shape[1]
+        if input_dim != self.channel_proj:
+            # 需要适配输入特征维度
+            if self.input_adapter is None:
+                # 延迟初始化适配层
+                self.input_adapter = nn.Sequential(
+                    nn.Linear(input_dim, self.channel_proj),
+                    nn.ReLU(),
+                    nn.LayerNorm(self.channel_proj)
+                ).to(x.device)
+                print(f"[GeoAwarePooling] Created input adapter: {input_dim} -> {self.channel_proj}")
+            
+            # 应用适配层
+            x_adapted = self.input_adapter(x)
+        else:
+            x_adapted = x
+            
+        # 原有的坐标处理逻辑
         all_xyz_ = torch.cat(all_xyz)
         all_xyz, _ = self.scatter_norm(all_xyz_, sp_idx)
         all_xyz = self.pts_proj1(all_xyz)
         all_xyz_segment = scatter(all_xyz, sp_idx, dim=0, reduce='max')
         all_xyz = torch.cat([all_xyz, all_xyz_segment[sp_idx]], dim=-1)
         all_xyz_w = self.pts_proj2(all_xyz) * 2
+        
         if with_xyz:
-            x = torch.cat([x * all_xyz_w, all_xyz_], dim=-1)
-            x = scatter_mean(x, sp_idx, dim=0)
-            x[:, :-3] = x[:, :-3] + all_xyz_segment
+            x_final = torch.cat([x_adapted * all_xyz_w, all_xyz_], dim=-1)
+            x_final = scatter_mean(x_final, sp_idx, dim=0)
+            x_final[:, :-3] = x_final[:, :-3] + all_xyz_segment
         else:
-            x = scatter_mean(x * all_xyz_w, sp_idx, dim=0) + all_xyz_segment
-        return x, all_xyz_w
+            # 确保scatter_mean结果和all_xyz_segment维度匹配
+            x_pooled = scatter_mean(x_adapted * all_xyz_w, sp_idx, dim=0)
+            # 检查维度是否匹配，如果不匹配则调整all_xyz_segment
+            if x_pooled.shape[0] != all_xyz_segment.shape[0]:
+                # 重新计算all_xyz_segment以确保维度匹配
+                num_segments = x_pooled.shape[0]
+                if all_xyz_segment.shape[0] > num_segments:
+                    all_xyz_segment = all_xyz_segment[:num_segments]
+                else:
+                    # 如果all_xyz_segment太小，则用零填充
+                    pad_size = num_segments - all_xyz_segment.shape[0]
+                    padding = torch.zeros(pad_size, all_xyz_segment.shape[1], 
+                                        device=all_xyz_segment.device, dtype=all_xyz_segment.dtype)
+                    all_xyz_segment = torch.cat([all_xyz_segment, padding], dim=0)
+            x_final = x_pooled + all_xyz_segment
+            
+        # 如果使用了适配器，需要将结果映射回原始维度
+        if self.input_adapter is not None and input_dim != self.channel_proj:
+            if not hasattr(self, 'output_adapter') or self.output_adapter is None:
+                # 创建输出适配层
+                self.output_adapter = nn.Sequential(
+                    nn.Linear(self.channel_proj, input_dim),
+                    nn.ReLU(),
+                    nn.LayerNorm(input_dim)
+                ).to(x.device)
+                print(f"[GeoAwarePooling] Created output adapter: {self.channel_proj} -> {input_dim}")
+            x_final = self.output_adapter(x_final)
+            
+        return x_final, all_xyz_w

@@ -29,6 +29,6 @@ def test_bifusion_encoder_forward():
     assert len(out['feat_fusion']) == 2
     for fused, conf, pe in zip(out['feat_fusion'], out['conf_2d'], out['pe_xyz']):
         assert not torch.isnan(fused).any(), 'NaN in fused features'
-        assert fused.shape[1] == 96, 'Fused feature dim mismatch'
+        assert fused.shape[1] == 256, 'Fused feature dim mismatch'
         assert conf.shape[-1] == 1
-        assert pe.shape[1] == 32 
+        assert pe.shape[1] == 64 

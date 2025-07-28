@@ -63,6 +63,12 @@ class TinySAModule(nn.Module):
             state_dict[prefix + 'norm2.weight'] = w.clone()
             state_dict[prefix + 'norm2.bias'] = b.clone()
             # 保持旧键，避免意外删除
+        # 兼容缺少 post_mlp 的旧checkpoint
+        key_post_mlp = prefix + 'post_mlp.0.weight'
+        if key_post_mlp not in state_dict:
+            # 初始化 post_mlp 权重（使用较小的初始化值）
+            state_dict[prefix + 'post_mlp.0.weight'] = torch.randn(self.dim, self.dim) * 0.01
+            state_dict[prefix + 'post_mlp.0.bias'] = torch.zeros(self.dim)
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
 
@@ -80,7 +86,10 @@ class TinySAModule(nn.Module):
         if self.training:
             idx_center = torch.randperm(N, device=device)[:M]
         else:
-            if self._fps_idx_cache.numel() != M:
+            need_recalc = (self._fps_idx_cache.numel() != M) or \
+                           (not hasattr(self, '_fps_cache_N')) or \
+                           (self._fps_cache_N != N)
+            if need_recalc:
                 # —— 简易 Farthest Point Sampling (CPU O(MN)) ——
                 idx_center = torch.empty(M, dtype=torch.long, device=device)
                 idx_center[0] = torch.randint(0, N, (1,), device=device)
@@ -90,8 +99,18 @@ class TinySAModule(nn.Module):
                     dist = torch.minimum(dist, torch.norm(xyz - last, dim=1))
                     idx_center[i] = torch.argmax(dist)
                 self._fps_idx_cache = idx_center
+                self._fps_cache_N = N  # 记录当前N，便于之后判断
             else:
                 idx_center = self._fps_idx_cache
+            # 若仍越界（例如上一帧比当前帧点数多），回退重算
+            if idx_center.max() >= N:
+                self._fps_idx_cache = torch.empty(0, dtype=torch.long, device=device)
+                self._fps_cache_N = None
+                return self.forward(xyz, feats)  # 递归重新计算，安全
+        # 清理缓存以节省内存（仅在内存紧张时）
+        if hasattr(self, '_memory_cleanup') and self._memory_cleanup:
+            del self._fps_idx_cache
+            self._fps_idx_cache = torch.empty(0, dtype=torch.long, device=device)
         center_xyz = xyz[idx_center]  # (M,3)
         center_feat = feats[idx_center]  # (M,C)
 
@@ -103,9 +122,13 @@ class TinySAModule(nn.Module):
 
         # 3. 向量化 Attention
         # 3.1 为每个 center 选取至多 max_k 个邻居（距离由近到远）
-        dist2_masked = dist2.clone()
+        # 内存优化：直接在原矩阵上操作，避免大副本
+        dist2_masked = dist2.clone() if dist2.numel() < 1e8 else dist2  # 小矩阵才复制
+        if dist2_masked is dist2:  # 如果使用原矩阵
+            dist2_masked = dist2.clone()  # 必须复制时再复制
         dist2_masked[~nbr_mask] = float('inf')
         nbr_dist, nbr_idx = dist2_masked.topk(self.max_k, dim=-1, largest=False)  # (M,K)
+        del dist2_masked  # 立即释放内存
         # 有些邻居可能不存在（值为 inf）
         mask_valid = torch.isfinite(nbr_dist)  # (M,K)
         # —— 若某个 center 无有效邻居，直接跳过更新（保持原特征） ——

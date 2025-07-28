@@ -160,11 +160,17 @@ class QueryDecoder(BaseModule):
                  objectness_flag, **kwargs):
         super().__init__()
         self.objectness_flag = objectness_flag
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_channels, d_model), nn.LayerNorm(d_model), nn.ReLU())
+        self.expected_in_channels = in_channels  # 保存配置的预期维度
+        self.d_model = d_model
+        
+        # 延迟初始化：实际的input_proj会在forward时根据输入维度创建
+        self.input_proj = None
+        self.input_adapter = None
+        
         if num_instance_queries + num_semantic_queries > 0:
             self.query = nn.Embedding(num_instance_queries + num_semantic_queries, d_model)
         if num_instance_queries == 0:
+            # query_proj也需要类似处理，但先用原始逻辑，出错时再修复
             self.query_proj = nn.Sequential(
                 nn.Linear(in_channels, d_model), nn.ReLU(),
                 nn.Linear(d_model, d_model))
@@ -591,9 +597,77 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         """
         cls_preds, sem_preds, pred_scores, pred_masks = [], [], [], []
         object_queries, pred_bboxes = [], []
-        inst_feats = [self.input_proj(y) for y in sp_feats] if "SP" in self.cross_attn_mode else None
-        inst_pts_feats = [self.input_proj(y) if self.share_attn_mlp else self.input_pts_proj(y)
-             for y in p_feats] if "P" in self.cross_attn_mode else None
+        
+        # 自适应初始化input_proj
+        if "SP" in self.cross_attn_mode and sp_feats:
+            actual_in_channels = sp_feats[0].shape[-1]  # 检测实际输入维度
+            
+            if self.input_proj is None:
+                # 首次初始化
+                if actual_in_channels == self.expected_in_channels:
+                    # 维度匹配，使用标准input_proj
+                    self.input_proj = nn.Sequential(
+                        nn.Linear(self.expected_in_channels, self.d_model), 
+                        nn.LayerNorm(self.d_model), 
+                        nn.ReLU()
+                    ).to(sp_feats[0].device)
+                    print(f"[QueryDecoder] Created standard input_proj: {self.expected_in_channels} -> {self.d_model}")
+                else:
+                    # 维度不匹配，创建适配器+标准投影
+                    self.input_adapter = nn.Sequential(
+                        nn.Linear(actual_in_channels, self.expected_in_channels),
+                        nn.ReLU(),
+                        nn.LayerNorm(self.expected_in_channels)
+                    ).to(sp_feats[0].device)
+                    
+                    self.input_proj = nn.Sequential(
+                        nn.Linear(self.expected_in_channels, self.d_model), 
+                        nn.LayerNorm(self.d_model), 
+                        nn.ReLU()
+                    ).to(sp_feats[0].device)
+                    
+                    print(f"[QueryDecoder] Created adaptive input_proj: {actual_in_channels} -> {self.expected_in_channels} -> {self.d_model}")
+        
+        # 应用input_proj，考虑适配器
+        if "SP" in self.cross_attn_mode:
+            if self.input_adapter is not None:
+                # 需要先适配维度
+                inst_feats = [self.input_proj(self.input_adapter(y)) for y in sp_feats]
+            else:
+                # 直接使用input_proj
+                inst_feats = [self.input_proj(y) for y in sp_feats]
+        else:
+            inst_feats = None
+
+        # 处理点特征 - 如果input_proj未初始化但需要处理点特征，则需要初始化
+        if "P" in self.cross_attn_mode and p_feats:
+            if self.input_proj is None:
+                # 为点特征初始化input_proj
+                actual_in_channels = p_feats[0].shape[-1]
+                if actual_in_channels != self.expected_in_channels:
+                    self.input_adapter = nn.Sequential(
+                        nn.Linear(actual_in_channels, self.expected_in_channels),
+                        nn.ReLU(),
+                        nn.LayerNorm(self.expected_in_channels)
+                    ).to(p_feats[0].device)
+                
+                self.input_proj = nn.Sequential(
+                    nn.Linear(self.expected_in_channels, self.d_model), 
+                    nn.LayerNorm(self.d_model), 
+                    nn.ReLU()
+                ).to(p_feats[0].device)
+            
+            # 应用点特征投影
+            if self.share_attn_mlp:
+                if self.input_adapter is not None:
+                    inst_pts_feats = [self.input_proj(self.input_adapter(y)) for y in p_feats]
+                else:
+                    inst_pts_feats = [self.input_proj(y) for y in p_feats]
+            else:
+                inst_pts_feats = [self.input_pts_proj(y) for y in p_feats]
+        else:
+            inst_pts_feats = None
+
         mask_feats = [self.x_mask(y) for y in sp_feats] if "SP" in self.mask_pred_mode else None
         mask_pts_feats = [self.x_mask(y) if self.share_mask_mlp else self.x_pts_mask(y)
              for y in p_feats] if "P" in self.mask_pred_mode else None

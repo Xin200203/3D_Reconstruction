@@ -13,6 +13,7 @@ from mmcv.transforms import Compose, LoadImageFromFile
 from mmdet3d.registry import TRANSFORMS
 from mmdet3d.structures.bbox_3d import get_box_type
 from mmdet3d.structures.points import BasePoints, get_points_type
+import torch
 
 
 @TRANSFORMS.register_module()
@@ -82,9 +83,11 @@ class NormalizePointsColor_(NormalizePointsColor):
             Default value is from SPFormer preprocessing.
     """
 
-    def __init__(self, color_mean, color_std=127.5):
+    def __init__(self, color_mean, color_std=127.5, clamp_range=None):
         self.color_mean = color_mean
         self.color_std = color_std
+        # 添加颜色值钳制范围，默认为[-3, 3]以允许合理的标准化范围
+        self.clamp_range = clamp_range or [-3.0, 3.0]
 
     def transform(self, input_dict):
         """Call function to normalize color of points.
@@ -101,12 +104,28 @@ class NormalizePointsColor_(NormalizePointsColor):
         assert points.attribute_dims is not None and \
                'color' in points.attribute_dims.keys(), \
                'Expect points have color attribute'
+        
+        # 记录原始颜色值范围用于调试
+        orig_min = points.color.min().item()
+        orig_max = points.color.max().item()
+        
         if self.color_mean is not None:
             points.color = points.color - \
                            points.color.new_tensor(self.color_mean)
         if self.color_std is not None:
             points.color = points.color / \
                 points.color.new_tensor(self.color_std)
+        
+        # 钳制颜色值到合理范围
+        if self.clamp_range is not None:
+            points.color = torch.clamp(points.color, 
+                                     min=self.clamp_range[0], 
+                                     max=self.clamp_range[1])
+        
+        # 检查是否有异常值（静默处理）
+        if orig_min < 0 or orig_max > 255:
+            pass  # 颜色值超出正常范围，已通过clamp处理
+        
         input_dict['points'] = points
         return input_dict
 
@@ -698,5 +717,63 @@ class LoadClipFeature(BaseTransform):
             pix, glob = self._load_single(clip_path)
             results['clip_pix'] = pix
             results['clip_global'] = glob
+        return results
+  
+@TRANSFORMS.register_module()
+class LoadSingleImageFromFile(BaseTransform):
+    """Load single image for BiFusion encoder.
+    
+    Adds:
+        - 'imgs': List[Tensor] (C,H,W) 
+        - 'cam_info': List[dict] with intrinsics/extrinsics
+    """
+    def __init__(self, backend_args: Optional[dict] = None, dataset_type: str = 'scannet200'):
+        self.backend_args = backend_args
+        self.dataset_type = dataset_type
+        # 使用 mmcv 的标准图像加载器
+        from mmcv.transforms import LoadImageFromFile
+        self.loader = LoadImageFromFile(backend_args=backend_args)
+    
+    def transform(self, results: dict) -> dict:
+        if 'img_path' in results:
+            # Load image using mmcv's LoadImageFromFile
+            temp_results = {'img_path': results['img_path']}
+            temp_results = self.loader(temp_results)
+            
+            # Convert to tensor format and wrap in list
+            import torch
+            import numpy as np
+            img = temp_results['img']
+            
+            # Ensure img is in proper format (H,W,C) -> (C,H,W)
+            if isinstance(img, np.ndarray):
+                if len(img.shape) == 3 and img.shape[-1] == 3:  # (H,W,C)
+                    img = torch.from_numpy(img).permute(2, 0, 1).float()  # (C,H,W)
+                else:
+                    img = torch.from_numpy(img).float()
+            elif not isinstance(img, torch.Tensor):
+                img = torch.tensor(img).float()
+            
+            results['imgs'] = [img]  # List format for batch compatibility
+            
+            # Prepare cam_info with ScanNet defaults
+            cam_info = {}
+            
+            # ScanNet default intrinsics (fx, fy, cx, cy)
+            if self.dataset_type in ['scannet', 'scannet200']:
+                intrinsics = [577.870605, 577.870605, 319.5, 239.5]
+            elif self.dataset_type == 'scenenn':
+                intrinsics = [544.47329, 544.47329, 320.0, 240.0]
+            else:
+                intrinsics = [577.870605, 577.870605, 319.5, 239.5]  # fallback
+            
+            cam_info['intrinsics'] = intrinsics
+            
+            # Use pose as extrinsics (ScanNet format: pose = cam2world)
+            if 'pose' in results:
+                cam_info['extrinsics'] = results['pose']  # cam2world matrix
+            
+            results['cam_info'] = [cam_info]  # List format for batch compatibility
+        
         return results
   

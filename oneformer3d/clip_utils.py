@@ -76,7 +76,7 @@ def build_uv_index(xyz_cam: torch.Tensor, intrinsics: torch.Tensor, img_shape):
     return valid, torch.stack([u, v], dim=-1)
 
 
-def sample_img_feat(feat_map: torch.Tensor, uv: torch.Tensor):
+def sample_img_feat(feat_map: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
     """在特征图上双线性采样。支持梯度回传。
 
     Args:
@@ -90,6 +90,11 @@ def sample_img_feat(feat_map: torch.Tensor, uv: torch.Tensor):
     uv_norm[:, 0] = uv[:, 0] / (W - 1) * 2 - 1
     uv_norm[:, 1] = uv[:, 1] / (H - 1) * 2 - 1
     grid = uv_norm.unsqueeze(0).unsqueeze(2)  # (1,N,1,2)
+    
+    # 确保feat_map和grid有相同的数据类型，处理AMP混合精度
+    if feat_map.dtype != grid.dtype:
+        grid = grid.to(feat_map.dtype)
+    
     sampled = F.grid_sample(feat_map, grid, align_corners=True).squeeze(3).squeeze(0).T  # (N,C)
     return sampled
 
