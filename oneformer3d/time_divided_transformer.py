@@ -39,11 +39,12 @@ class _GeomBiasAttnLayer(nn.Module):
         )
         self.norm3 = nn.LayerNorm(d_model)
 
-    def forward(self, q, k, p_c, p_m, mem_mask=None):
+    def forward(self, q, k, p_c, p_m, mem_mask=None, attention_mask=None):
         """Args:
             q,k: (B, N, D), (B, M, D)
             p_c,p_m: (B, N, 9), (B, M, 9)
-            mem_mask: (B, M)  bool 1=valid
+            mem_mask: (B, M)  bool 1=valid (传统Memory掩码)
+            attention_mask: (B, N, M) bool True=允许注意力，False=禁止 (IoU预剪枝掩码)
         Returns:
             q_new: (B,N,D)
             attn: (B,N,M)  softmax along M
@@ -62,16 +63,24 @@ class _GeomBiasAttnLayer(nn.Module):
         # scaled dot
         attn_logits = torch.einsum('bhnd,bhmd->bhnm', qh, kh) / sqrt(D // self.nhead)
         # geometry bias
-        pc = p_c.unsqueeze(3).expand(-1, -1, -1, Nm, -1)  # B,Nc,1,M,9?
         pc = p_c.unsqueeze(2)  # B,Nc,1,9
         pc = pc.expand(-1, -1, Nm, -1)  # B,Nc,M,9
         pm = p_m.unsqueeze(1).expand(-1, Nc, -1, -1)      # B,Nc,M,9
         geo_in = torch.cat([pc, pm], dim=-1)               # B,Nc,M,18
         geo_bias = self.geo_mlp(geo_in).squeeze(-1)        # B,Nc,M
         attn_logits = attn_logits + self.beta * geo_bias.unsqueeze(1)  # broadcast to heads
+        
+        # 🆕 应用IoU预剪枝掩码
+        if attention_mask is not None:
+            # attention_mask: (B, Nc, Nm), True=允许注意力，False=禁止
+            iou_mask = ~attention_mask.bool()  # 转换为禁止掩码
+            attn_logits = attn_logits.masked_fill(iou_mask[:, None, :, :], -1e9)  # broadcast to heads
+        
+        # 应用传统Memory掩码
         if mem_mask is not None:
             mask = ~mem_mask.bool()  # True where invalid
-            attn_logits = attn_logits.masked_fill(mask[:, None, None, :], -1e4)
+            attn_logits = attn_logits.masked_fill(mask[:, None, None, :], -1e9)
+            
         attn = F.softmax(attn_logits, dim=-1)              # B,h,Nc,Nm
         attn = self.dropout(attn)
         out = torch.einsum('bhnm,bhmd->bhnd', attn, vh)    # B,h,Nc,dh
@@ -107,15 +116,16 @@ class TimeDividedTransformer(nn.Module):
             _GeomBiasAttnLayer(d_model, nhead, dropout) for _ in range(num_layers)
         ])
 
-    def forward(self, q, k, p_c, p_m, mask_mem=None):
+    def forward(self, q, k, p_c, p_m, mask_mem=None, attention_mask=None):
         """Args:
             q, k: (B, N_c, D), (B, N_m, D)
             p_c, p_m: (B, N_c, 9), (B, N_m, 9)
-            mask_mem: (B, N_m) 1=valid
+            mask_mem: (B, N_m) 1=valid (传统Memory掩码)
+            attention_mask: (B, N_c, N_m) IoU预剪枝掩码，True=允许注意力，False=禁止
         Returns:
             attn: (B, N_c, N_m)   softmax matrix of last layer
             q_new: (B, N_c, D)
         """
         for layer in self.layers:
-            q, attn = layer(q, k, p_c, p_m, mask_mem)
+            q, attn = layer(q, k, p_c, p_m, mask_mem, attention_mask)
         return attn, q 

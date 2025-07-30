@@ -163,9 +163,13 @@ class QueryDecoder(BaseModule):
         self.expected_in_channels = in_channels  # 保存配置的预期维度
         self.d_model = d_model
         
-        # 延迟初始化：实际的input_proj会在forward时根据输入维度创建
-        self.input_proj = None
-        self.input_adapter = None
+        # 修复：在初始化时直接创建input_proj，避免延迟初始化导致的权重加载问题
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_channels, d_model), 
+            nn.LayerNorm(d_model), 
+            nn.ReLU()
+        )
+        self.input_adapter = None  # 保留适配器接口，但默认不使用
         
         if num_instance_queries + num_semantic_queries > 0:
             self.query = nn.Embedding(num_instance_queries + num_semantic_queries, d_model)
@@ -598,35 +602,21 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         cls_preds, sem_preds, pred_scores, pred_masks = [], [], [], []
         object_queries, pred_bboxes = [], []
         
-        # 自适应初始化input_proj
+        # 修复：移除动态初始化逻辑，input_proj已在__init__中创建
+        # 检查维度兼容性，如果需要可以添加适配器
         if "SP" in self.cross_attn_mode and sp_feats:
-            actual_in_channels = sp_feats[0].shape[-1]  # 检测实际输入维度
+            actual_in_channels = sp_feats[0].shape[-1]
             
-            if self.input_proj is None:
-                # 首次初始化
-                if actual_in_channels == self.expected_in_channels:
-                    # 维度匹配，使用标准input_proj
-                    self.input_proj = nn.Sequential(
-                        nn.Linear(self.expected_in_channels, self.d_model), 
-                        nn.LayerNorm(self.d_model), 
-                        nn.ReLU()
-                    ).to(sp_feats[0].device)
-                    print(f"[QueryDecoder] Created standard input_proj: {self.expected_in_channels} -> {self.d_model}")
-                else:
-                    # 维度不匹配，创建适配器+标准投影
-                    self.input_adapter = nn.Sequential(
-                        nn.Linear(actual_in_channels, self.expected_in_channels),
-                        nn.ReLU(),
-                        nn.LayerNorm(self.expected_in_channels)
-                    ).to(sp_feats[0].device)
-                    
-                    self.input_proj = nn.Sequential(
-                        nn.Linear(self.expected_in_channels, self.d_model), 
-                        nn.LayerNorm(self.d_model), 
-                        nn.ReLU()
-                    ).to(sp_feats[0].device)
-                    
-                    print(f"[QueryDecoder] Created adaptive input_proj: {actual_in_channels} -> {self.expected_in_channels} -> {self.d_model}")
+            # 如果维度不匹配且没有适配器，创建适配器
+            if actual_in_channels != self.expected_in_channels and self.input_adapter is None:
+                print(f"[QueryDecoder] 维度不匹配: 输入{actual_in_channels} vs 期望{self.expected_in_channels}，创建适配器")
+                self.input_adapter = nn.Sequential(
+                    nn.Linear(actual_in_channels, self.expected_in_channels),
+                    nn.ReLU(),
+                    nn.LayerNorm(self.expected_in_channels)
+                ).to(sp_feats[0].device)
+            elif actual_in_channels == self.expected_in_channels:
+                print(f"[QueryDecoder] 使用预初始化的input_proj: {self.expected_in_channels} -> {self.d_model}")
         
         # 应用input_proj，考虑适配器
         if "SP" in self.cross_attn_mode:
@@ -639,22 +629,17 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         else:
             inst_feats = None
 
-        # 处理点特征 - 如果input_proj未初始化但需要处理点特征，则需要初始化
+        # 修复：处理点特征，input_proj已在__init__中创建，只需检查适配器
         if "P" in self.cross_attn_mode and p_feats:
-            if self.input_proj is None:
-                # 为点特征初始化input_proj
-                actual_in_channels = p_feats[0].shape[-1]
-                if actual_in_channels != self.expected_in_channels:
-                    self.input_adapter = nn.Sequential(
-                        nn.Linear(actual_in_channels, self.expected_in_channels),
-                        nn.ReLU(),
-                        nn.LayerNorm(self.expected_in_channels)
-                    ).to(p_feats[0].device)
-                
-                self.input_proj = nn.Sequential(
-                    nn.Linear(self.expected_in_channels, self.d_model), 
-                    nn.LayerNorm(self.d_model), 
-                    nn.ReLU()
+            actual_in_channels = p_feats[0].shape[-1]
+            
+            # 如果维度不匹配且没有适配器，创建适配器
+            if actual_in_channels != self.expected_in_channels and self.input_adapter is None:
+                print(f"[QueryDecoder] 点特征维度不匹配: 输入{actual_in_channels} vs 期望{self.expected_in_channels}，创建适配器")
+                self.input_adapter = nn.Sequential(
+                    nn.Linear(actual_in_channels, self.expected_in_channels),
+                    nn.ReLU(),
+                    nn.LayerNorm(self.expected_in_channels)
                 ).to(p_feats[0].device)
             
             # 应用点特征投影

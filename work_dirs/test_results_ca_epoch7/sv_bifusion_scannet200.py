@@ -214,20 +214,9 @@ color_std = (
 )
 custom_hooks = [
     dict(after_iter=True, type='EmptyCacheHook'),
-    dict(
-        prefix_replace=(
-            'backbone.',
-            '',
-        ),
-        pretrained=
-        '/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth',
-        strict=False,
-        submodule='bi_encoder.backbone3d',
-        type='PartialLoadHook'),
 ]
 custom_imports = dict(imports=[
     'oneformer3d',
-    'oneformer3d.partial_load_hook',
 ])
 data_prefix = dict(
     pts='points',
@@ -683,7 +672,7 @@ label2cat = dict({
     99: 'ladder'
 })
 launcher = 'none'
-load_from = None
+load_from = '/home/nebula/xxy/ESAM/work_dirs/enhanced_bifusion_debug/epoch_7.pth'
 log_level = 'INFO'
 log_processor = dict(
     _scope_='mmdet3d', by_epoch=True, type='LogProcessor', window_size=1)
@@ -1147,7 +1136,7 @@ model = dict(
         use_tiny_sa_2d=False,
         use_tiny_sa_3d=False,
         voxel_size=0.02),
-    clip_criterion=dict(loss_weight=0.01, type='ClipConsCriterion'),
+    clip_criterion=dict(loss_weight=0.1, type='ClipConsCriterion'),
     criterion=dict(
         inst_criterion=dict(
             bbox_loss=dict(type='AxisAlignedIoULoss'),
@@ -1236,7 +1225,7 @@ num_semantic_classes = 200
 optim_wrapper = dict(
     accumulative_counts=3,
     clip_grad=dict(max_norm=10, norm_type=2),
-    optimizer=dict(lr=5e-05, type='AdamW', weight_decay=0.05),
+    optimizer=dict(lr=0.0001, type='AdamW', weight_decay=0.05),
     type='OptimWrapper')
 param_scheduler = dict(begin=0, end=128, power=0.9, type='PolyLR')
 resume = False
@@ -1740,6 +1729,7 @@ test_dataloader = dict(
     sampler=dict(_scope_='mmdet3d', shuffle=False, type='DefaultSampler'))
 test_evaluator = dict(
     _scope_='mmdet3d',
+    eval_mode='cat_agnostic',
     id_offset=65536,
     inst_mapping=[
         3,
@@ -3601,6 +3591,7 @@ val_dataloader = dict(
     sampler=dict(_scope_='mmdet3d', shuffle=False, type='DefaultSampler'))
 val_evaluator = dict(
     _scope_='mmdet3d',
+    eval_mode='cat_agnostic',
     id_offset=65536,
     inst_mapping=[
         3,
@@ -4630,4 +4621,4 @@ visualizer = dict(
     vis_backends=[
         dict(type='LocalVisBackend'),
     ])
-work_dir = 'work_dirs/enhanced_bifusion_debug'
+work_dir = 'work_dirs/test_results_ca_epoch7'

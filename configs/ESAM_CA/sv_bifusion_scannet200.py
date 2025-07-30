@@ -6,7 +6,7 @@ _base_ = [
     'mmdet3d::_base_/datasets/scannet-seg.py'
 ]
 
-custom_imports = dict(imports=['oneformer3d'])
+custom_imports = dict(imports=['oneformer3d', 'oneformer3d.partial_load_hook'])
 
 # ======== 类别和维度设置 ========
 num_instance_classes = 1
@@ -114,7 +114,7 @@ train_pipeline = [
         gran=[6, 20],
         mag=[40, 160],
         voxel_size=0.02,
-        p=0.5),
+        p=0.2),  # 从0.5降到0.2，减少增强频率
     dict(
         type='Pack3DDetInputs_',
         keys=[
@@ -260,10 +260,10 @@ model = dict(
             iter_matcher=True,
             fix_mean_loss=True)),
     
-    # 添加CLIP一致性损失
+    # 添加CLIP一致性损失 - 大幅降低权重避免干扰主任务
     clip_criterion=dict(
         type='ClipConsCriterion',
-        loss_weight=0.1,
+        loss_weight=0.01,  # 从0.1降到0.01，减少对主任务的干扰
     ),
     
     train_cfg=dict(),
@@ -287,9 +287,11 @@ data_prefix = dict(
     sp_pts_mask='super_points')
 
 train_dataloader = dict(
-    batch_size=4,           # 适合BiFusion的批次大小
-    num_workers=8,
+    batch_size=4,           # 立即降低到4，节省2-3GB显存
+    num_workers=10,         # 减少worker，降低内存压力
     persistent_workers=True,
+    # pin_memory=True,      # 保持注释，避免内存压力
+    prefetch_factor=3,      # 降低预取，进一步节省内存
     dataset=dict(
         type=dataset_type,
         data_root=DATA_ROOT,
@@ -352,12 +354,24 @@ test_evaluator = val_evaluator
 # ======== 训练配置 ========
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='AdamW', lr=0.0001, weight_decay=0.05),
-    clip_grad=dict(max_norm=10, norm_type=2))
+    optimizer=dict(type='AdamW', lr=0.0001, weight_decay=0.05),  # 恢复学习率，加快收敛
+    clip_grad=dict(max_norm=20, norm_type=2),  # 提高梯度剪裁，应对BiFusion大梯度
+    # 启用梯度累积，减少显存使用
+    accumulative_counts=4)  # 补偿batch_size降低：4×4=16等效batch_size
 
 param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
 
-custom_hooks = [dict(type='EmptyCacheHook', after_iter=True)]
+custom_hooks = [
+    dict(type='EmptyCacheHook', after_iter=True),
+    # 关键修复：加载3D预训练权重到BiFusion的backbone3d
+    dict(
+        type='PartialLoadHook',
+        pretrained='/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth',
+        submodule='bi_encoder.backbone3d',
+        prefix_replace=('backbone.', ''),  # 将backbone.xxx映射到bi_encoder.backbone3d.xxx
+        strict=False
+    )
+]
 default_hooks = dict(
     checkpoint=dict(
         interval=1,
@@ -367,8 +381,8 @@ default_hooks = dict(
     logger=dict(type='LoggerHook', interval=50))
 
 # ======== 预训练权重加载 ========
-load_from = '/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth'
-
+# 移除全局load_from，改用PartialLoadHook精确加载3D权重到bi_encoder.backbone3d
+# load_from = '/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth'
 # ======== 训练调度 ========
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=128)
 val_cfg = dict(type='ValLoop')

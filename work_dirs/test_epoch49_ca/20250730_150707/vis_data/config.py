@@ -683,7 +683,7 @@ label2cat = dict({
     99: 'ladder'
 })
 launcher = 'none'
-load_from = None
+load_from = '/home/nebula/xxy/ESAM/work_dirs/enhanced_bifusion_debug/epoch_49.pth'
 log_level = 'INFO'
 log_processor = dict(
     _scope_='mmdet3d', by_epoch=True, type='LogProcessor', window_size=1)
@@ -1234,9 +1234,9 @@ num_instance_classes_eval = 1
 num_points = 8192
 num_semantic_classes = 200
 optim_wrapper = dict(
-    accumulative_counts=3,
-    clip_grad=dict(max_norm=10, norm_type=2),
-    optimizer=dict(lr=5e-05, type='AdamW', weight_decay=0.05),
+    accumulative_counts=4,
+    clip_grad=dict(max_norm=20, norm_type=2),
+    optimizer=dict(lr=0.0001, type='AdamW', weight_decay=0.05),
     type='OptimWrapper')
 param_scheduler = dict(begin=0, end=128, power=0.9, type='PolyLR')
 resume = False
@@ -1740,6 +1740,7 @@ test_dataloader = dict(
     sampler=dict(_scope_='mmdet3d', shuffle=False, type='DefaultSampler'))
 test_evaluator = dict(
     _scope_='mmdet3d',
+    eval_mode='cat_agnostic',
     id_offset=65536,
     inst_mapping=[
         3,
@@ -2834,7 +2835,7 @@ test_pipeline = [
 ]
 train_cfg = dict(max_epochs=128, type='EpochBasedTrainLoop', val_interval=128)
 train_dataloader = dict(
-    batch_size=6,
+    batch_size=4,
     dataset=dict(
         _scope_='mmdet3d',
         ann_file='scannet200_sv_oneformer3d_infos_train_clip.pkl',
@@ -3153,9 +3154,9 @@ train_dataloader = dict(
         scene_idxs=None,
         test_mode=False,
         type='ScanNet200SegDataset_'),
-    num_workers=12,
+    num_workers=10,
     persistent_workers=True,
-    prefetch_factor=4,
+    prefetch_factor=3,
     sampler=dict(_scope_='mmdet3d', shuffle=True, type='DefaultSampler'))
 train_pipeline = [
     dict(
@@ -3601,6 +3602,7 @@ val_dataloader = dict(
     sampler=dict(_scope_='mmdet3d', shuffle=False, type='DefaultSampler'))
 val_evaluator = dict(
     _scope_='mmdet3d',
+    eval_mode='cat_agnostic',
     id_offset=65536,
     inst_mapping=[
         3,
@@ -4630,4 +4632,4 @@ visualizer = dict(
     vis_backends=[
         dict(type='LocalVisBackend'),
     ])
-work_dir = 'work_dirs/enhanced_bifusion_debug'
+work_dir = 'work_dirs/test_epoch49_ca'

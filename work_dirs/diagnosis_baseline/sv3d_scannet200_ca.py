@@ -1,4 +1,3 @@
-DATA_ROOT = '/home/nebula/xxy/ESAM/data/scannet200-sv/'
 backend_args = None
 class_names = [
     'wall',
@@ -214,27 +213,16 @@ color_std = (
 )
 custom_hooks = [
     dict(after_iter=True, type='EmptyCacheHook'),
-    dict(
-        prefix_replace=(
-            'backbone.',
-            '',
-        ),
-        pretrained=
-        '/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth',
-        strict=False,
-        submodule='bi_encoder.backbone3d',
-        type='PartialLoadHook'),
 ]
 custom_imports = dict(imports=[
     'oneformer3d',
-    'oneformer3d.partial_load_hook',
 ])
 data_prefix = dict(
     pts='points',
     pts_instance_mask='instance_mask',
     pts_semantic_mask='semantic_mask',
     sp_pts_mask='super_points')
-data_root = 'data/scannet/'
+data_root = 'data/scannet200-sv/'
 dataset_type = 'ScanNet200SegDataset_'
 default_hooks = dict(
     checkpoint=dict(
@@ -683,10 +671,10 @@ label2cat = dict({
     99: 'ladder'
 })
 launcher = 'none'
-load_from = None
+load_from = '/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth'
 log_level = 'INFO'
 log_processor = dict(
-    _scope_='mmdet3d', by_epoch=True, type='LogProcessor', window_size=1)
+    _scope_='mmdet3d', by_epoch=True, type='LogProcessor', window_size=50)
 metainfo = dict(
     classes=(
         'wall',
@@ -1132,22 +1120,6 @@ model = dict(
         in_channels=3,
         out_channels=96,
         type='Res16UNet34C'),
-    bi_encoder=dict(
-        clip_num_layers=6,
-        clip_pretrained=
-        '/home/nebula/xxy/ESAM/data/open_clip_pytorch_model.bin',
-        freeze_blocks=0,
-        freeze_clip_conv1=False,
-        freeze_clip_early_layers=True,
-        spatial_k=16,
-        type='BiFusionEncoder',
-        use_amp=True,
-        use_enhanced_gate=True,
-        use_spatial_attention=True,
-        use_tiny_sa_2d=False,
-        use_tiny_sa_3d=False,
-        voxel_size=0.02),
-    clip_criterion=dict(loss_weight=0.01, type='ClipConsCriterion'),
     criterion=dict(
         inst_criterion=dict(
             bbox_loss=dict(type='AxisAlignedIoULoss'),
@@ -1191,7 +1163,7 @@ model = dict(
         dropout=0.0,
         fix_attention=True,
         hidden_dim=1024,
-        in_channels=256,
+        in_channels=96,
         iter_pred=True,
         mask_pred_mode=[
             'SP',
@@ -1211,7 +1183,7 @@ model = dict(
         share_mask_mlp=False,
         type='ScanNetMixQueryDecoder'),
     num_classes=1,
-    pool=dict(channel_proj=256, type='GeoAwarePooling'),
+    pool=dict(channel_proj=96, type='GeoAwarePooling'),
     query_thr=0.5,
     test_cfg=dict(
         inst_score_thr=0.0,
@@ -1234,9 +1206,8 @@ num_instance_classes_eval = 1
 num_points = 8192
 num_semantic_classes = 200
 optim_wrapper = dict(
-    accumulative_counts=3,
     clip_grad=dict(max_norm=10, norm_type=2),
-    optimizer=dict(lr=5e-05, type='AdamW', weight_decay=0.05),
+    optimizer=dict(lr=0.0001, type='AdamW', weight_decay=0.05),
     type='OptimWrapper')
 param_scheduler = dict(begin=0, end=128, power=0.9, type='PolyLR')
 resume = False
@@ -1447,14 +1418,14 @@ test_dataloader = dict(
     batch_size=1,
     dataset=dict(
         _scope_='mmdet3d',
-        ann_file='scannet200_sv_oneformer3d_infos_val_clip.pkl',
+        ann_file='scannet200_sv_oneformer3d_infos_val.pkl',
         backend_args=None,
         data_prefix=dict(
             pts='points',
             pts_instance_mask='instance_mask',
             pts_semantic_mask='semantic_mask',
             sp_pts_mask='super_points'),
-        data_root='/home/nebula/xxy/ESAM/data/scannet200-sv/',
+        data_root='data/scannet200-sv/',
         ignore_index=200,
         metainfo=dict(classes=[
             'wall',
@@ -1675,10 +1646,6 @@ test_dataloader = dict(
                     5,
                 ]),
             dict(
-                data_root='/home/nebula/xxy/ESAM/data/scannet200-sv/',
-                type='LoadClipFeature'),
-            dict(type='LoadSingleImageFromFile'),
-            dict(
                 type='LoadAnnotations3D_',
                 with_bbox_3d=False,
                 with_label_3d=False,
@@ -1696,10 +1663,6 @@ test_dataloader = dict(
                 pts_scale_ratio=1,
                 transforms=[
                     dict(
-                        clamp_range=[
-                            -3.0,
-                            3.0,
-                        ],
                         color_mean=(
                             121.87247106275309,
                             109.73306679373762,
@@ -1721,16 +1684,10 @@ test_dataloader = dict(
                         type='AddSuperPointAnnotations'),
                 ],
                 type='MultiScaleFlipAug3D'),
-            dict(
-                keys=[
-                    'points',
-                    'imgs',
-                    'cam_info',
-                    'clip_pix',
-                    'clip_global',
-                    'sp_pts_mask',
-                ],
-                type='Pack3DDetInputs_'),
+            dict(keys=[
+                'points',
+                'sp_pts_mask',
+            ], type='Pack3DDetInputs_'),
         ],
         test_mode=True,
         type='ScanNet200SegDataset_'),
@@ -1740,6 +1697,7 @@ test_dataloader = dict(
     sampler=dict(_scope_='mmdet3d', shuffle=False, type='DefaultSampler'))
 test_evaluator = dict(
     _scope_='mmdet3d',
+    eval_mode='cat_agnostic',
     id_offset=65536,
     inst_mapping=[
         3,
@@ -2775,10 +2733,6 @@ test_pipeline = [
             5,
         ]),
     dict(
-        data_root='/home/nebula/xxy/ESAM/data/scannet200-sv/',
-        type='LoadClipFeature'),
-    dict(type='LoadSingleImageFromFile'),
-    dict(
         type='LoadAnnotations3D_',
         with_bbox_3d=False,
         with_label_3d=False,
@@ -2796,10 +2750,6 @@ test_pipeline = [
         pts_scale_ratio=1,
         transforms=[
             dict(
-                clamp_range=[
-                    -3.0,
-                    3.0,
-                ],
                 color_mean=(
                     121.87247106275309,
                     109.73306679373762,
@@ -2821,30 +2771,24 @@ test_pipeline = [
                 type='AddSuperPointAnnotations'),
         ],
         type='MultiScaleFlipAug3D'),
-    dict(
-        keys=[
-            'points',
-            'imgs',
-            'cam_info',
-            'clip_pix',
-            'clip_global',
-            'sp_pts_mask',
-        ],
-        type='Pack3DDetInputs_'),
+    dict(keys=[
+        'points',
+        'sp_pts_mask',
+    ], type='Pack3DDetInputs_'),
 ]
 train_cfg = dict(max_epochs=128, type='EpochBasedTrainLoop', val_interval=128)
 train_dataloader = dict(
-    batch_size=6,
+    batch_size=16,
     dataset=dict(
         _scope_='mmdet3d',
-        ann_file='scannet200_sv_oneformer3d_infos_train_clip.pkl',
+        ann_file='scannet200_sv_oneformer3d_infos_train.pkl',
         backend_args=None,
         data_prefix=dict(
             pts='points',
             pts_instance_mask='instance_mask',
             pts_semantic_mask='semantic_mask',
             sp_pts_mask='super_points'),
-        data_root='/home/nebula/xxy/ESAM/data/scannet200-sv/',
+        data_root='data/scannet200-sv/',
         ignore_index=200,
         metainfo=dict(classes=[
             'wall',
@@ -3065,10 +3009,6 @@ train_dataloader = dict(
                     5,
                 ]),
             dict(
-                data_root='/home/nebula/xxy/ESAM/data/scannet200-sv/',
-                type='LoadClipFeature'),
-            dict(type='LoadSingleImageFromFile'),
-            dict(
                 type='LoadAnnotations3D_',
                 with_bbox_3d=False,
                 with_label_3d=False,
@@ -3099,10 +3039,6 @@ train_dataloader = dict(
                 ],
                 type='GlobalRotScaleTrans'),
             dict(
-                clamp_range=[
-                    -3.0,
-                    3.0,
-                ],
                 color_mean=(
                     121.87247106275309,
                     109.73306679373762,
@@ -3131,16 +3067,12 @@ train_dataloader = dict(
                     40,
                     160,
                 ],
-                p=0.2,
+                p=0.5,
                 type='ElasticTransfrom',
                 voxel_size=0.02),
             dict(
                 keys=[
                     'points',
-                    'imgs',
-                    'cam_info',
-                    'clip_pix',
-                    'clip_global',
                     'gt_labels_3d',
                     'pts_semantic_mask',
                     'pts_instance_mask',
@@ -3153,9 +3085,8 @@ train_dataloader = dict(
         scene_idxs=None,
         test_mode=False,
         type='ScanNet200SegDataset_'),
-    num_workers=12,
+    num_workers=6,
     persistent_workers=True,
-    prefetch_factor=4,
     sampler=dict(_scope_='mmdet3d', shuffle=True, type='DefaultSampler'))
 train_pipeline = [
     dict(
@@ -3172,10 +3103,6 @@ train_pipeline = [
             4,
             5,
         ]),
-    dict(
-        data_root='/home/nebula/xxy/ESAM/data/scannet200-sv/',
-        type='LoadClipFeature'),
-    dict(type='LoadSingleImageFromFile'),
     dict(
         type='LoadAnnotations3D_',
         with_bbox_3d=False,
@@ -3207,10 +3134,6 @@ train_pipeline = [
         ],
         type='GlobalRotScaleTrans'),
     dict(
-        clamp_range=[
-            -3.0,
-            3.0,
-        ],
         color_mean=(
             121.87247106275309,
             109.73306679373762,
@@ -3239,16 +3162,12 @@ train_pipeline = [
             40,
             160,
         ],
-        p=0.2,
+        p=0.5,
         type='ElasticTransfrom',
         voxel_size=0.02),
     dict(
         keys=[
             'points',
-            'imgs',
-            'cam_info',
-            'clip_pix',
-            'clip_global',
             'gt_labels_3d',
             'pts_semantic_mask',
             'pts_instance_mask',
@@ -3308,14 +3227,14 @@ val_dataloader = dict(
     batch_size=1,
     dataset=dict(
         _scope_='mmdet3d',
-        ann_file='scannet200_sv_oneformer3d_infos_val_clip.pkl',
+        ann_file='scannet200_sv_oneformer3d_infos_val.pkl',
         backend_args=None,
         data_prefix=dict(
             pts='points',
             pts_instance_mask='instance_mask',
             pts_semantic_mask='semantic_mask',
             sp_pts_mask='super_points'),
-        data_root='/home/nebula/xxy/ESAM/data/scannet200-sv/',
+        data_root='data/scannet200-sv/',
         ignore_index=200,
         metainfo=dict(classes=[
             'wall',
@@ -3536,10 +3455,6 @@ val_dataloader = dict(
                     5,
                 ]),
             dict(
-                data_root='/home/nebula/xxy/ESAM/data/scannet200-sv/',
-                type='LoadClipFeature'),
-            dict(type='LoadSingleImageFromFile'),
-            dict(
                 type='LoadAnnotations3D_',
                 with_bbox_3d=False,
                 with_label_3d=False,
@@ -3557,10 +3472,6 @@ val_dataloader = dict(
                 pts_scale_ratio=1,
                 transforms=[
                     dict(
-                        clamp_range=[
-                            -3.0,
-                            3.0,
-                        ],
                         color_mean=(
                             121.87247106275309,
                             109.73306679373762,
@@ -3582,16 +3493,10 @@ val_dataloader = dict(
                         type='AddSuperPointAnnotations'),
                 ],
                 type='MultiScaleFlipAug3D'),
-            dict(
-                keys=[
-                    'points',
-                    'imgs',
-                    'cam_info',
-                    'clip_pix',
-                    'clip_global',
-                    'sp_pts_mask',
-                ],
-                type='Pack3DDetInputs_'),
+            dict(keys=[
+                'points',
+                'sp_pts_mask',
+            ], type='Pack3DDetInputs_'),
         ],
         test_mode=True,
         type='ScanNet200SegDataset_'),
@@ -3601,6 +3506,7 @@ val_dataloader = dict(
     sampler=dict(_scope_='mmdet3d', shuffle=False, type='DefaultSampler'))
 val_evaluator = dict(
     _scope_='mmdet3d',
+    eval_mode='cat_agnostic',
     id_offset=65536,
     inst_mapping=[
         3,
@@ -4630,4 +4536,4 @@ visualizer = dict(
     vis_backends=[
         dict(type='LocalVisBackend'),
     ])
-work_dir = 'work_dirs/enhanced_bifusion_debug'
+work_dir = 'work_dirs/diagnosis_baseline'

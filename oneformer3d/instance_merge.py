@@ -181,11 +181,12 @@ class GTMerge():
 
 
 class OnlineMerge():
-    def __init__(self, inscat_topk_insts, use_bbox=False, merge_type="count", tformer_cfg=None):
+    def __init__(self, inscat_topk_insts, use_bbox=False, merge_type="count", tformer_cfg=None, iou_thr=0.1):
         assert merge_type in ['count', 'frame']
         self.merge_type = merge_type
         self.inscat_topk_insts = inscat_topk_insts
         self.use_bbox = use_bbox
+        self.iou_thr = iou_thr  # IoU预剪枝阈值
         if self.use_bbox:
             self.iou_calculator = AxisAlignedBboxOverlaps3D()
         # 初始化跨帧 Transformer
@@ -240,28 +241,103 @@ class OnlineMerge():
             next_masks, next_labels, next_scores, next_queries, next_query_feats, next_sem_preds, next_xyz = \
                 masks, labels, scores, queries, query_feats, sem_preds, \
                 self._bbox_pred_to_bbox(xyz_list, bboxes) if self.use_bbox else xyz_list
+            # 步骤1: IoU预剪枝 (统一计算，TDT和传统方法共用)
+            if self.use_bbox:
+                iou_matrix = self.iou_calculator(self.cur_xyz, next_xyz, is_aligned=False)
+                # IoU计算器返回的是(Memory, Current)，我们需要(Current, Memory)
+                xyz_scores = iou_matrix.T  # 转置为(Nc, Nm)
+            else:
+                xyz_dists = torch.cdist(self.cur_xyz, next_xyz, p=2)
+                # cdist返回的是(Memory, Current)，我们需要(Current, Memory)  
+                xyz_scores = (1 / (xyz_dists + 1e-6)).T  # 转置为(Nc, Nm)
+            
+            # 🆕 生成IoU预剪枝掩码 (Nc x Nm)，并确保维度正确
+            attention_mask = xyz_scores > self.iou_thr  # True=允许注意力，False=禁止
+            
+            # 确保attention_mask的维度正确：(Nc, Nm) -> (1, Nc, Nm)
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.unsqueeze(0)  # 添加batch维度
+            
             if self.tformer is not None and self.cur_queries is not None:
+                # 步骤2a: 使用Time Divided Transformer with attention mask
                 # 构造几何向量 p_c / p_m
-                def build_geom(xyz, bbox):
-                    if bbox is None:
-                        size = torch.zeros_like(xyz)
+                def build_geom(xyz_or_bbox, bbox=None):
+                    """构造9维几何特征向量
+                    Args:
+                        xyz_or_bbox: (N, 3) 位置坐标 或 (N, 6) bbox坐标
+                        bbox: (N, 6) 或 (N, 7) bbox，或者None
+                    Returns:
+                        geom: (N, 9) 几何特征 [xyz, sin(xyz), size_xyz]
+                    """
+                    # 首先提取3维xyz坐标
+                    if xyz_or_bbox.shape[-1] == 3:
+                        # 输入是3维坐标
+                        xyz = xyz_or_bbox
+                    elif xyz_or_bbox.shape[-1] == 6:
+                        # 输入是6维bbox [x1, y1, z1, x2, y2, z2]，提取中心点
+                        xyz = (xyz_or_bbox[:, :3] + xyz_or_bbox[:, 3:6]) / 2.0
                     else:
-                        size = bbox[:, 3:]
+                        # 其他格式，尝试取前3维作为坐标
+                        xyz = xyz_or_bbox[:, :3]
+                    
+                    # 然后处理size信息
+                    if bbox is None:
+                        if xyz_or_bbox.shape[-1] == 6:
+                            # 从bbox中提取size
+                            size = xyz_or_bbox[:, 3:6] - xyz_or_bbox[:, 0:3]  # [w, h, l]
+                        else:
+                            # 使用默认尺寸
+                            size = torch.ones_like(xyz) * 0.5  # 默认0.5m尺寸
+                    else:
+                        # 统一处理bbox维度，确保size总是3维
+                        if bbox.shape[-1] == 6:
+                            # 格式：[x1, y1, z1, x2, y2, z2]
+                            size = bbox[:, 3:6] - bbox[:, 0:3]  # [w, h, l]
+                        elif bbox.shape[-1] == 7:
+                            # 格式：[center_x, center_y, center_z, w, h, l, angle]
+                            size = bbox[:, 3:6]  # [w, h, l]
+                        else:
+                            # 其他格式，使用默认尺寸
+                            size = torch.ones_like(xyz) * 0.5
+                    
+                    # 确保size是3维
+                    if size.shape[-1] != 3:
+                        size = size[:, :3] if size.shape[-1] > 3 else torch.ones_like(xyz) * 0.5
+                    
+                    # 构造9维几何特征：[xyz(3), sin(xyz)(3), size(3)]
                     geom = torch.cat([xyz, torch.sin(xyz), size], dim=-1)
+                    
+                    # 最终验证
+                    assert geom.shape[-1] == 9, f"几何特征维度错误: {geom.shape[-1]} != 9, xyz: {xyz.shape}, size: {size.shape}"
                     return geom
 
-                p_m = build_geom(self.cur_xyz, self.cur_bboxes) if self.cur_xyz is not None else None
-                p_c = build_geom(next_xyz, bboxes) if next_xyz is not None else None
+                p_m = build_geom(self.cur_xyz) if self.cur_xyz is not None else None
+                p_c = build_geom(next_xyz) if next_xyz is not None else None
                 if p_m is None or p_c is None:
                     # fallback to zeros
                     p_m = torch.zeros(self.cur_queries.shape[0], 9, device=self.cur_queries.device)
                     p_c = torch.zeros(next_queries.shape[0], 9, device=next_queries.device)
 
-                attn_mat, _ = self.tformer(next_queries.unsqueeze(0), self.cur_queries.unsqueeze(0),
-                                           p_c.unsqueeze(0), p_m.unsqueeze(0),
-                                           mask_mem=torch.ones(1, self.cur_queries.shape[0], dtype=torch.bool, device=next_queries.device))
+                attn_mat, updated_queries = self.tformer(
+                    next_queries.unsqueeze(0), 
+                    self.cur_queries.unsqueeze(0),
+                    p_c.unsqueeze(0), 
+                    p_m.unsqueeze(0),
+                    mask_mem=torch.ones(1, self.cur_queries.shape[0], dtype=torch.bool, device=next_queries.device),
+                    attention_mask=attention_mask  # 🆕 传入注意力掩码
+                )
                 mix_scores = attn_mat.squeeze(0)  # Nc x Nm
+                
+                # 🆕 使用TDT更新的特征来更新Memory (EMA更新)
+                if hasattr(self, 'ema_alpha'):
+                    alpha = self.ema_alpha
+                else:
+                    alpha = 0.9  # 默认EMA系数
+                
+                # 注意：这里updated_queries是当前帧的更新特征，应该用于后续的Memory更新
+                self._updated_next_queries = updated_queries.squeeze(0)
             else:
+                # 步骤2b: 使用传统特征匹配方法
                 # 确保特征均已初始化，静态检查不再报 None
                 if self.cur_query_feats is None or next_query_feats is None:
                     raise RuntimeError('query_feats is None when merging instances')
@@ -273,15 +349,17 @@ class OnlineMerge():
                 query_feat_scores = (self.cur_query_feats.unsqueeze(1) * next_query_feats.unsqueeze(0)).sum(2)
                 sem_pred_scores = F.cosine_similarity(
                     self.cur_sem_preds.unsqueeze(1), next_sem_preds.unsqueeze(0), dim=2)
-                if self.use_bbox:
-                    xyz_scores = self.iou_calculator(self.cur_xyz, next_xyz, is_aligned=False)
-                else:
-                    xyz_dists = torch.cdist(self.cur_xyz, next_xyz, p=2)
-                    xyz_scores = 1 / (xyz_dists + 1e-6)
 
                 mix_scores = query_feat_scores * xyz_scores
+                # 应用IoU预剪枝mask (去掉batch维度)
+                mix_scores = torch.where(attention_mask.squeeze(0), mix_scores, torch.zeros_like(mix_scores))
             
-            inst_label_scores = torch.where(self.cur_labels.unsqueeze(1) == next_labels.unsqueeze(0), torch.ones((self.cur_labels.shape[0], next_labels.shape[0])).to(self.cur_labels.device), torch.zeros((self.cur_labels.shape[0], next_labels.shape[0])).to(self.cur_labels.device))
+            # 确保标签匹配矩阵的维度与mix_scores一致 (Nc, Nm)
+            inst_label_scores = torch.where(
+                next_labels.unsqueeze(1) == self.cur_labels.unsqueeze(0), 
+                torch.ones((next_labels.shape[0], self.cur_labels.shape[0])).to(self.cur_labels.device), 
+                torch.zeros((next_labels.shape[0], self.cur_labels.shape[0])).to(self.cur_labels.device)
+            )
             
             mix_scores = torch.where(mix_scores > 0, mix_scores, torch.zeros_like(mix_scores))
             mix_scores = mix_scores * inst_label_scores
@@ -289,12 +367,23 @@ class OnlineMerge():
                 mix_scores = torch.cat((mix_scores, torch.zeros((mix_scores.shape[1]
                      - mix_scores.shape[0], mix_scores.shape[1])).to(mix_scores.device)), dim=0)
             # Hungarian assign
-            row_ind, col_ind = linear_sum_assignment(-mix_scores.cpu())
+            row_ind, col_ind = linear_sum_assignment(-mix_scores.detach().cpu())
             row_ind = torch.tensor(row_ind).to(mix_scores.device)
             col_ind = torch.tensor(col_ind).to(mix_scores.device)
-            mix_scores_mask = mix_scores[row_ind, col_ind].gt(0)
-            row_ind = row_ind[mix_scores_mask]
-            col_ind = col_ind[mix_scores_mask]
+            
+            # 🆕 添加索引边界检查，确保不会超出范围
+            valid_row_mask = (row_ind < self.cur_masks.shape[0])
+            valid_col_mask = (col_ind < next_masks.shape[0])
+            valid_mask = valid_row_mask & valid_col_mask
+            
+            row_ind = row_ind[valid_mask]
+            col_ind = col_ind[valid_mask]
+            
+            # 只保留有效的匹配分数
+            if len(row_ind) > 0:
+                mix_scores_mask = mix_scores[row_ind, col_ind].gt(0)
+                row_ind = row_ind[mix_scores_mask]
+                col_ind = col_ind[mix_scores_mask]
 
             temp = torch.zeros(self.cur_masks.shape[0]).bool().to(self.cur_masks.device)
             temp[row_ind] = True
