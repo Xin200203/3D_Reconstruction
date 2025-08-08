@@ -1,47 +1,200 @@
-# 删除旧内容并替换为新的 CA-BiFusion 配置
-# Bi-Fusion（Category-Agnostic，ScanNet200-SV）
+# Enhanced Bi-Fusion（Category-Agnostic，ScanNet200-SV）
+# 完全独立的BiFusion配置，无TinySA依赖，维度匹配优化
 
-# 继承上一阶段 TinySA CA 配置
-_base_ = ['./sv3d_scannet200_ca.py']
+_base_ = [
+    'mmdet3d::_base_/default_runtime.py',
+    'mmdet3d::_base_/datasets/scannet-seg.py'
+]
 
-custom_imports = dict(imports=['oneformer3d'])
+custom_imports = dict(imports=[
+    'oneformer3d', 
+    'oneformer3d.partial_load_hook',
+    'oneformer3d.detailed_loss_hook',
+    'oneformer3d.enhanced_training_hook'  # 🔥 导入增强训练监控Hook
+])
 
-# 仅在本文件内部使用 Config 类，改名 _Cfg，后续删除避免写入
-from copy import deepcopy
-from mmengine.config import Config as _Cfg
-import inspect, os
-# 直接定位 TinySA CA 配置文件
-_cfg_dir = os.path.dirname(inspect.getfile(inspect.currentframe()))
-_base_cfg = _Cfg.fromfile(os.path.join(_cfg_dir, 'sv3d_scannet200_ca.py'))
-# 转为普通 list 以避免 ConfigList 的懒索引
-train_pipeline = [item for item in _base_cfg.train_pipeline]
+# ======== 类别和维度设置 ========
+num_instance_classes = 1
+num_semanti# 🔥 增强日志配置 - 暂时禁用TensorBoard解决Python 3.8兼容性问题
+log_config = dict(
+    interval=5,   # 每5个iter输出一次基础日志 
+    hooks=[
+        dict(type='TextLoggerHook', by_epoch=False),
+        # dict(type='TensorboardLoggerHook', by_epoch=False)  # 暂时禁用
+    ])es = 200
+num_instance_classes_eval = 1
+
+# ======== 数据路径配置 ========
 DATA_ROOT = '/home/nebula/xxy/ESAM/data/scannet200-sv/'
 
-# 替换 ClipFeature 路径为绝对
-train_pipeline.insert(1, dict(type='LoadClipFeature', data_root=DATA_ROOT))
-# 添加图像加载（BiFusion 需要原始图像）
-train_pipeline.insert(2, dict(type='LoadSingleImageFromFile'))
-for item in train_pipeline:
-    if item.get('type') in ['Pack3DDetInputs_', 'Pack3DDetInputs_Online']:
-        item['keys'] = ['points', 'imgs', 'cam_info', 'clip_pix', 'clip_global'] + [k for k in item['keys'] if k not in ['imgs', 'cam_info', 'clip_pix', 'clip_global']]
+# ======== 颜色归一化参数 ========
+color_mean = (
+    0.47793125906962 * 255,
+    0.4303257521323044 * 255,
+    0.3749598901421883 * 255)
+color_std = (
+    0.2834475483823543 * 255,
+    0.27566157565723015 * 255,
+    0.27018971370874995 * 255)
 
-# test / val pipeline 同理
-test_pipeline = [item for item in _base_cfg.test_pipeline]
-test_pipeline.insert(1, dict(type='LoadClipFeature', data_root=DATA_ROOT))
-test_pipeline.insert(2, dict(type='LoadSingleImageFromFile'))
-for item in test_pipeline:
-    if item.get('type') in ['Pack3DDetInputs_', 'Pack3DDetInputs_Online']:
-        item['keys'] = ['points', 'imgs', 'cam_info', 'clip_pix', 'clip_global'] + [k for k in item['keys'] if k not in ['imgs', 'cam_info', 'clip_pix', 'clip_global']]
+# ======== 类别名称 ========
+class_names = [
+    'wall', 'floor', 'chair', 'table', 'door', 'couch', 'cabinet', 'shelf',
+    'desk', 'office chair', 'bed', 'pillow', 'sink', 'picture', 'window',
+    'toilet', 'bookshelf', 'monitor', 'curtain', 'book', 'armchair',
+    'coffee table', 'box', 'refrigerator', 'lamp', 'kitchen cabinet', 'towel',
+    'clothes', 'tv', 'nightstand', 'counter', 'dresser', 'stool', 'cushion',
+    'plant', 'ceiling', 'bathtub', 'end table', 'dining table', 'keyboard',
+    'bag', 'backpack', 'toilet paper', 'printer', 'tv stand', 'whiteboard',
+    'blanket', 'shower curtain', 'trash can', 'closet', 'stairs', 'microwave',
+    'stove', 'shoe', 'computer tower', 'bottle', 'bin', 'ottoman', 'bench',
+    'board', 'washing machine', 'mirror', 'copier', 'basket', 'sofa chair',
+    'file cabinet', 'fan', 'laptop', 'shower', 'paper', 'person',
+    'paper towel dispenser', 'oven', 'blinds', 'rack', 'plate', 'blackboard',
+    'piano', 'suitcase', 'rail', 'radiator', 'recycling bin', 'container',
+    'wardrobe', 'soap dispenser', 'telephone', 'bucket', 'clock', 'stand',
+    'light', 'laundry basket', 'pipe', 'clothes dryer', 'guitar',
+    'toilet paper holder', 'seat', 'speaker', 'column', 'bicycle', 'ladder',
+    'bathroom stall', 'shower wall', 'cup', 'jacket', 'storage bin',
+    'coffee maker', 'dishwasher', 'paper towel roll', 'machine', 'mat',
+    'windowsill', 'bar', 'toaster', 'bulletin board', 'ironing board',
+    'fireplace', 'soap dish', 'kitchen counter', 'doorframe',
+    'toilet paper dispenser', 'mini fridge', 'fire extinguisher', 'ball',
+    'hat', 'shower curtain rod', 'water cooler', 'paper cutter', 'tray',
+    'shower door', 'pillar', 'ledge', 'toaster oven', 'mouse',
+    'toilet seat cover dispenser', 'furniture', 'cart', 'storage container',
+    'scale', 'tissue box', 'light switch', 'crate', 'power outlet',
+    'decoration', 'sign', 'projector', 'closet door', 'vacuum cleaner',
+    'candle', 'plunger', 'stuffed animal', 'headphones', 'dish rack',
+    'broom', 'guitar case', 'range hood', 'dustpan', 'hair dryer',
+    'water bottle', 'handicap bar', 'purse', 'vent', 'shower floor',
+    'water pitcher', 'mailbox', 'bowl', 'paper bag', 'alarm clock',
+    'music stand', 'projector screen', 'divider', 'laundry detergent',
+    'bathroom counter', 'object', 'bathroom vanity', 'closet wall',
+    'laundry hamper', 'bathroom stall door', 'ceiling light', 'trash bin',
+    'dumbbell', 'stair rail', 'tube', 'bathroom cabinet', 'cd case',
+    'closet rod', 'coffee kettle', 'structure', 'shower head',
+    'keyboard piano', 'case of water bottles', 'coat rack',
+    'storage organizer', 'folded chair', 'fire alarm', 'power strip',
+    'calendar', 'poster', 'potted plant', 'luggage', 'mattress'
+]
 
-# 删除 Config 对象，防止 mmengine.pretty_text 序列化出错
-del _base_cfg
+# ======== 数据管道 ========
+train_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='DEPTH',
+        shift_height=False,
+        use_color=True,
+        load_dim=6,
+        use_dim=[0, 1, 2, 3, 4, 5]),
+    dict(type='LoadClipFeature', data_root=DATA_ROOT),
+    dict(type='LoadSingleImageFromFile'),
+    dict(
+        type='LoadAnnotations3D_',
+        with_bbox_3d=False,
+        with_label_3d=False,
+        with_mask_3d=True,
+        with_seg_3d=True,
+        with_sp_mask_3d=True),
+    dict(type='SwapChairAndFloor'),
+    dict(type='PointSegClassMapping'),
+    dict(
+        type='RandomFlip3D',
+        sync_2d=False,
+        flip_ratio_bev_horizontal=0.5,
+        flip_ratio_bev_vertical=0.5),
+    dict(
+        type='GlobalRotScaleTrans',
+        rot_range=[-3.14, 3.14],
+        scale_ratio_range=[0.8, 1.2],
+        translation_std=[0.1, 0.1, 0.1],
+        shift_height=False),
+    dict(
+        type='NormalizePointsColor_',
+        color_mean=color_mean,
+        color_std=color_std,
+        clamp_range=[-3.0, 3.0]),
+    dict(
+        type='AddSuperPointAnnotations',
+        num_classes=num_semantic_classes,
+        stuff_classes=[0, 1],
+        merge_non_stuff_cls=False),
+    dict(
+        type='ElasticTransfrom',
+        gran=[6, 20],
+        mag=[40, 160],
+        voxel_size=0.02,
+        p=0.2),  # 从0.5降到0.2，减少增强频率
+    dict(
+        type='Pack3DDetInputs_',
+        keys=[
+            'points', 'imgs', 'cam_info', 'clip_pix', 'clip_global', 
+            'gt_labels_3d', 'pts_semantic_mask', 'pts_instance_mask',
+            'sp_pts_mask', 'gt_sp_masks', 'elastic_coords'
+        ])
+]
 
-# 移除 _Cfg 以防泄漏
-del _Cfg
+test_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='DEPTH',
+        shift_height=False,
+        use_color=True,
+        load_dim=6,
+        use_dim=[0, 1, 2, 3, 4, 5]),
+    dict(type='LoadClipFeature', data_root=DATA_ROOT),
+    dict(type='LoadSingleImageFromFile'),
+    dict(
+        type='LoadAnnotations3D_',
+        with_bbox_3d=False,
+        with_label_3d=False,
+        with_mask_3d=True,
+        with_seg_3d=True,
+        with_sp_mask_3d=True),
+    dict(type='SwapChairAndFloor'),
+    dict(type='PointSegClassMapping'),
+    dict(
+        type='MultiScaleFlipAug3D',
+        img_scale=(1333, 800),
+        pts_scale_ratio=1,
+        flip=False,
+        transforms=[
+            dict(
+                type='NormalizePointsColor_',
+                color_mean=color_mean,
+                color_std=color_std,
+                clamp_range=[-3.0, 3.0]),
+            dict(
+                type='AddSuperPointAnnotations',
+                num_classes=num_semantic_classes,
+                stuff_classes=[0, 1],
+                merge_non_stuff_cls=False),
+        ]),
+    dict(
+        type='Pack3DDetInputs_', 
+        keys=['points', 'imgs', 'cam_info', 'clip_pix', 'clip_global', 'sp_pts_mask'])
+]
 
-# —— 模型部分：添加 Enhanced BiFusionEncoder ————
+# ======== 模型配置 ========
 model = dict(
-    # 保留父配置 backbone / neck，但新增 bi_encoder；在 MixFormer3D 类内部会优先使用 bi_encoder
+    type='ScanNet200MixFormer3D',
+    data_preprocessor=dict(type='Det3DDataPreprocessor_'),
+    voxel_size=0.02,
+    num_classes=num_instance_classes_eval,
+    query_thr=0.5,
+    
+    # 传统backbone配置（为了满足模型初始化要求，实际不使用）
+    backbone=dict(
+        type='Res16UNet34C',
+        in_channels=3,
+        out_channels=96,
+        config=dict(
+            dilations=[1, 1, 1, 1],
+            conv1_kernel_size=5,
+            bn_momentum=0.02)),
+    
+    # 使用BiFusionEncoder替代传统backbone+neck组合
     bi_encoder=dict(
         type='BiFusionEncoder',
         clip_pretrained='/home/nebula/xxy/ESAM/data/open_clip_pytorch_model.bin',
@@ -52,50 +205,267 @@ model = dict(
         freeze_clip_conv1=False,        # 允许conv1微调
         freeze_clip_early_layers=True,  # 冻结前3层
         
-        # Enhanced Gate配置
-        use_enhanced_gate=True,         # 启用增强Gate机制
-        use_spatial_attention=True,     # 启用空间注意力
-        spatial_k=16,                   # K近邻数量
+        # Enhanced Gate配置 - 使用LiteFusionGate 
+        use_enhanced_gate=False,        # 禁用复杂Gate，使用默认LiteFusionGate
+        use_spatial_attention=False,    # 对应禁用空间注意力
+        spatial_k=16,                   # K近邻数量（暂不使用）
+        
+        # 关键：移除TinySA依赖
+        use_tiny_sa_2d=False,           # 禁用2D TinySA
+        use_tiny_sa_3d=False,           # 禁用3D TinySA
+        
+        # 🔥 Stage 2: 统计收集配置
+        _collect_fusion_stats=True,     # 启用融合统计收集
+        collect_projection_stats=True,  # 启用投影统计收集
         
         # 其他配置
         use_amp=True,
-        use_tiny_sa_2d=False,
+        freeze_blocks=0,
     ),
     
-    # 添加CLIP一致性损失
+    # 几何感知池化 - 使用256维匹配BiFusionEncoder输出
+    pool=dict(type='GeoAwarePooling', channel_proj=256),
+    
+    # 查询解码器 - 使用256维输入
+    decoder=dict(
+        type='ScanNetMixQueryDecoder',
+        num_layers=3,
+        share_attn_mlp=False, 
+        share_mask_mlp=False,
+        cross_attn_mode=["", "SP", "SP", "SP"], 
+        mask_pred_mode=["SP", "SP", "P", "P"],
+        num_instance_queries=0,
+        num_semantic_queries=0,
+        num_instance_classes=num_instance_classes,
+        num_semantic_classes=num_semantic_classes,
+        num_semantic_linears=1,
+        in_channels=256,  # 匹配BiFusionEncoder输出维度
+        d_model=256,
+        num_heads=8,
+        hidden_dim=1024,
+        dropout=0.0,
+        activation_fn='gelu',
+        iter_pred=True,
+        attn_mask=True,
+        fix_attention=True,
+        objectness_flag=False),
+    
+    # Enhanced损失函数配置
+    criterion=dict(
+        type='ScanNetMixedCriterion',
+        num_semantic_classes=num_semantic_classes,
+        sem_criterion=dict(
+            type='ScanNetSemanticCriterion',
+            ignore_index=num_semantic_classes,
+            loss_weight=0.4),  # 动态调整，这里是基准值
+        inst_criterion=dict(
+            type='MixedInstanceCriterion',
+            matcher=dict(
+                type='SparseMatcher',
+                costs=[
+                    dict(type='QueryClassificationCost', weight=0.5),
+                    dict(type='MaskBCECost', weight=1.0),
+                    dict(type='MaskDiceCost', weight=1.0)],
+                topk=1),
+            bbox_loss=dict(type='AxisAlignedIoULoss'),
+            loss_weight=[1.0, 0.8, 0.6, 0.3, 0.0],  # [分类, BCE, Dice, Score, BBox移除]
+            num_classes=num_instance_classes,
+            non_object_weight=0.05,  # 降低背景权重，突出前景
+            fix_dice_loss_weight=True,
+            iter_matcher=True,
+            fix_mean_loss=True)),
+    
+    # � 优化后：启用增强版CLIP一致性损失
     clip_criterion=dict(
         type='ClipConsCriterion',
-        loss_weight=0.1,  # 开始时使用较小权重
+        loss_weight=0.1,              # 🔥 启用CLIP损失，权重0.1
+        temperature=0.07,             # ✅ 优化温度参数，更好的对比学习
+        gradient_flow_ratio=0.05,     # ✅ 5%梯度流控制，避免梯度爆炸
     ),
-)
+    
+    # 🔥 启用辅助损失函数，提升特征质量
+    auxiliary_losses=dict(
+        spatial_consistency=dict(
+            type='SpatialConsistencyLoss',
+            loss_weight=0.02,          # 🔥 启用空间一致性损失
+            k_neighbors=8              # KNN邻居数量
+        ),
+        # no_view_supervision=dict(    # 暂时保持禁用
+        #     type='NoViewSupervisionLoss', 
+        #     loss_weight=0.01,
+        #     confidence_threshold=0.8
+        # )
+    ),
+    
+    train_cfg=dict(),
+    test_cfg=dict(
+        topk_insts=100,
+        inst_score_thr=0.0,
+        pan_score_thr=0.5,
+        npoint_thr=100,
+        obj_normalization=True,
+        sp_score_thr=0.4,
+        nms=True,
+        matrix_nms_kernel='linear',
+        stuff_classes=[0, 1]))
 
-# —— 继续训练：加载上一阶段权重（仅回填 3D 分支） ————
-load_from = '/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth'
+# ======== 数据集配置 ========
+dataset_type = 'ScanNet200SegDataset_'
+data_prefix = dict(
+    pts='points',
+    pts_instance_mask='instance_mask',
+    pts_semantic_mask='semantic_mask',
+    sp_pts_mask='super_points')
 
-# ——— 数据集路径与 ann_file 覆写 ——————————————————————————
-data_root = DATA_ROOT  # 覆写父级变量
-
-# 覆写并显式声明所有字段
 train_dataloader = dict(
-    batch_size=4,           # 先尝试 4
-    num_workers=8,
+    batch_size=6,           # 提升到6，利用优化后的显存效率
+    num_workers=8,          # 减少worker，降低内存压力
     persistent_workers=True,
+    # pin_memory=True,      # 保持注释，避免内存压力
+    prefetch_factor=2,      # 降低预取，进一步节省内存
     dataset=dict(
-    data_root=DATA_ROOT,
+        type=dataset_type,
+        data_root=DATA_ROOT,
         ann_file='scannet200_sv_oneformer3d_infos_train_clip.pkl',
-        pipeline=train_pipeline)  # 使用修改后的 pipeline
-)
+        data_prefix=data_prefix,
+        metainfo=dict(classes=class_names),
+        pipeline=train_pipeline,
+        ignore_index=num_semantic_classes,
+        scene_idxs=None,
+        test_mode=False))
 
-val_dataloader = dict(dataset=dict(
-    data_root=DATA_ROOT,
-    ann_file='scannet200_sv_oneformer3d_infos_val_clip.pkl',
-    pipeline=test_pipeline))  # 使用修改后的 pipeline
+val_dataloader = dict(
+    dataset=dict(
+        type=dataset_type,
+        data_root=DATA_ROOT,
+        ann_file='scannet200_sv_oneformer3d_infos_val_clip.pkl',
+        data_prefix=data_prefix,
+        metainfo=dict(classes=class_names),
+        pipeline=test_pipeline,
+        ignore_index=num_semantic_classes,
+        test_mode=True))
 
-test_dataloader = val_dataloader 
+test_dataloader = val_dataloader
 
-# ---------- 资源调度：单卡 4090 ----------
-train_dataloader.update(batch_size=4, num_workers=8, persistent_workers=True)
+# ======== 评估配置 ========
+label2cat = {i: name for i, name in enumerate(class_names + ['unlabeled'])}
+metric_meta = dict(
+    label2cat=label2cat,
+    ignore_index=[num_semantic_classes],
+    classes=class_names + ['unlabeled'])
 
-# ---------- 日志配置：实时监控 gate_mean / valid_ratio ----------
+sem_mapping = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23,
+    24, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 42, 44, 45, 46,
+    47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 58, 59, 62, 63, 64, 65, 66, 67, 68,
+    69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 82, 84, 86, 87, 88, 89, 90,
+    93, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 110, 112,
+    115, 116, 118, 120, 121, 122, 125, 128, 130, 131, 132, 134, 136, 138, 139,
+    140, 141, 145, 148, 154, 155, 156, 157, 159, 161, 163, 165, 166, 168, 169,
+    170, 177, 180, 185, 188, 191, 193, 195, 202, 208, 213, 214, 221, 229, 230,
+    232, 233, 242, 250, 261, 264, 276, 283, 286, 300, 304, 312, 323, 325, 331,
+    342, 356, 370, 392, 395, 399, 408, 417, 488, 540, 562, 570, 572, 581, 609,
+    748, 776, 1156, 1163, 1164, 1165, 1166, 1167, 1168, 1169, 1170, 1171, 1172,
+    1173, 1174, 1175, 1176, 1178, 1179, 1180, 1181, 1182, 1183, 1184, 1185,
+    1186, 1187, 1188, 1189, 1190, 1191
+]
+inst_mapping = sem_mapping[2:]
+
+val_evaluator = dict(
+    type='UnifiedSegMetric',
+    stuff_class_inds=[0, 1], 
+    thing_class_inds=list(range(2, num_semantic_classes)),
+    min_num_points=1, 
+    id_offset=2**16,
+    sem_mapping=sem_mapping,
+    inst_mapping=inst_mapping,
+    metric_meta=metric_meta)
+test_evaluator = val_evaluator
+
+# ======== 训练配置 ========
+optim_wrapper = dict(
+    type='OptimWrapper',
+    optimizer=dict(type='AdamW', lr=0.00005, weight_decay=0.01),  # 进一步降低学习率和权重衰减
+    clip_grad=dict(max_norm=1.0, norm_type=2),  # 更严格的梯度裁剪
+    # 启用梯度累积，减少显存使用
+    accumulative_counts=4)  # 增加累积：4×4=16等效batch_size
+
+param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
+
+custom_hooks = [
+    dict(type='EmptyCacheHook', after_iter=True),
+    
+    # � 增强训练监控Hook - 详细损失、fusion gate、投影率、梯度监控
+    dict(
+        type='EnhancedTrainingHook',
+        log_interval=10,              # 每10个iter输出详细统计
+        grad_monitor_interval=50,     # 每50个iter监控梯度健康度
+        detailed_stats=True           # 启用详细统计
+    ),
+    
+    # 🔍 原有详细损失监控Hook (保留兼容性)
+    dict(
+        type='DetailedLossMonitorHook',
+        log_interval=20,              # 降低频率避免重复
+        collect_grad_norm=True,
+        collect_fusion_stats=True,
+        collect_clip_stats=True
+    ),
+    
+    # 🚨 NaN检测Hook
+    dict(
+        type='NaNDetectionHook',
+        check_interval=5  # 每5个iter检测一次NaN
+    ),
+    
+    # 关键修复：加载3D预训练权重到BiFusion的backbone3d
+    dict(
+        type='PartialLoadHook',
+        pretrained='/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth',
+        submodule='bi_encoder.backbone3d',
+        prefix_replace=('backbone\\.', 'bi_encoder.backbone3d.'),  # 正确映射：backbone.xxx -> bi_encoder.backbone3d.xxx
+        strict=False
+    )
+]
+default_hooks = dict(
+    checkpoint=dict(
+        interval=1,
+        max_keep_ckpts=1,
+        save_best=['all_ap_50%'],
+        rule='greater'),
+    logger=dict(
+        type='LoggerHook', 
+        interval=10,  # 每10个iter输出一次，更频繁的监控
+        log_metric_by_epoch=False,  # 按iter输出，便于观察训练稳定性
+        out_suffix='.log'
+    ))
+
+# ======== 预训练权重加载 ========
+# 移除全局load_from，改用PartialLoadHook精确加载3D权重到bi_encoder.backbone3d
+# load_from = '/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth'
+# ======== 训练调度 - 每5epoch评估 ========
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)  # 🔥 每5epoch评估
+val_cfg = dict(type='ValLoop')
+test_cfg = dict(type='TestLoop')
+
+# ======== 增强日志配置 - 详细损失、fusion gate、投影率输出 ========
 log_processor = dict(type='LogProcessor', window_size=1, by_epoch=True)
-default_hooks = dict(logger=dict(type='LoggerHook', interval=50)) 
+
+# � 增强日志配置 - 输出所有损失和BiFusion统计信息
+log_config = dict(
+    interval=5,   # 每5个iter输出一次基础日志 
+    hooks=[
+        dict(type='TextLoggerHook', by_epoch=False),
+        dict(type='TensorboardLoggerHook', by_epoch=False)
+    ])
+
+# 🔥 可视化配置 - 禁用TensorBoard解决Python 3.8兼容性问题
+vis_backends = [
+    dict(type='LocalVisBackend'),
+    # dict(type='TensorboardVisBackend',  # 暂时禁用TensorBoard
+    #      save_dir='./work_dirs/tensorboard_logs')
+]
+visualizer = dict(
+    type='Det3DLocalVisualizer',
+    vis_backends=vis_backends,
+    name='visualizer') 

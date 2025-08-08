@@ -17,7 +17,7 @@ from .instance_merge import ins_merge_mat, ins_cat, ins_merge, OnlineMerge, GTMe
 import numpy as np
 from .img_backbone import point_sample
 import os
-from typing import Any, Dict, cast
+from typing import Any, Dict, List, Tuple, Union, Optional, cast
 from mmengine import ConfigDict
 
 @MODELS.register_module()
@@ -80,7 +80,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.query_thr = query_thr
         self.train_cfg = train_cfg
 
-    def extract_feat(self, batch_inputs_dict, batch_data_samples):
+    def extract_feat(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any]) -> Tuple[List[Any], List[torch.Tensor], Any]:  # type: ignore[override]
         """Extract features from sparse tensor."""
         if self.bi_encoder is not None and 'imgs' in batch_inputs_dict:
             # === BiFusion path ===
@@ -170,11 +170,11 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             features.append(x[begin: end])
         return features, point_features, all_xyz_w
 
-    def _forward(*args, **kwargs):
+    def _forward(self, *args, **kwargs) -> Any:  # type: ignore[override]
         """Implement abstract method of Base3DDetector."""
         pass
 
-    def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
+    def loss(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], **kwargs) -> Dict[str, torch.Tensor]:  # type: ignore[override]
         """Calculate losses from a batch of inputs dict and data samples.
 
         Args:
@@ -205,15 +205,26 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         queries, gt_instances, *_ = self._select_queries(x, gt_instances)
         ## Decoder
         super_points = ([bds.gt_pts_seg.sp_pts_mask for bds in batch_data_samples], all_xyz_w)
-        x = self.decoder(x, point_features, queries, super_points)
+        x = self.decoder(x=x, queries=queries, sp_feats=x, p_feats=point_features, super_points=super_points)
         ## Loss
         losses = self.criterion(x, gt_instances, gt_point_instances, None, self.decoder.mask_pred_mode)
         if self.clip_criterion is not None and hasattr(self, '_encoder_out'):
             loss_clip = self.clip_criterion(self._encoder_out['feat_fusion'], self._encoder_out['clip_global'])
             losses.update(dict(loss_clip=loss_clip))
+        # 收集融合统计信息用于日志输出
+        if self.bi_encoder is not None and hasattr(self.bi_encoder, '_fusion_stats') and self.bi_encoder._fusion_stats:
+            fusion_stats = self.bi_encoder._fusion_stats
+            # 将融合统计信息添加到losses中（现在统计信息会正确生成）
+            losses.update({
+                'fusion_2d_ratio': torch.tensor(fusion_stats.get('fusion_2d_ratio', 0.5)),
+                'fusion_3d_ratio': torch.tensor(fusion_stats.get('fusion_3d_ratio', 0.5)), 
+                'avg_confidence': torch.tensor(fusion_stats.get('avg_confidence', 0.5)),
+                'valid_points_ratio': torch.tensor(fusion_stats.get('valid_points_ratio', 1.0))
+            })
+        
         return losses
 
-    def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
+    def predict(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], **kwargs) -> List[Any]:  # type: ignore[override]
         """Predict results from a batch of inputs and data samples with post-
         processing.
 
@@ -239,7 +250,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         x, point_features, all_xyz_w = self.extract_feat(batch_inputs_dict, batch_data_samples)
         ## Decoder
         super_points = ([bds.gt_pts_seg.sp_pts_mask for bds in batch_data_samples], all_xyz_w)
-        x = self.decoder(x, point_features, x, super_points)
+        x = self.decoder(x=x, queries=x, sp_feats=x, p_feats=point_features, super_points=super_points)
         ## Post-processing
         pred_pts_seg = self.predict_by_feat(
             x, batch_data_samples[0].gt_pts_seg.sp_pts_mask)
@@ -371,13 +382,13 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
         self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.init_weights()
 
-        self.conv = nn.Sequential(
-            ME.MinkowskiConvolution(960, 32, kernel_size=1, dimension=3),
-            ME.MinkowskiBatchNorm(32),
-            ME.MinkowskiReLU(inplace=True))
+        # 初始化为None，将在运行时动态创建
+        self.conv = None
     
     def init_weights(self):
-        if getattr(self, 'img_backbone', None) is not None:
+        if hasattr(self, 'memory') and self.memory is not None:
+            self.memory.init_weights()
+        if hasattr(self, 'img_backbone') and self.img_backbone is not None:
             self.img_backbone.init_weights()
     
     def extract_feat(self, batch_inputs_dict, batch_data_samples):
@@ -483,6 +494,14 @@ class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
             coordinate_map_key=x.coordinate_map_key,
             coordinate_manager=x.coordinate_manager)
         
+        # 动态初始化卷积层
+        if self.conv is None:
+            self.conv = nn.Sequential(
+                ME.MinkowskiConvolution(projected_features.shape[1], 32, kernel_size=1, dimension=3),
+                ME.MinkowskiBatchNorm(32),
+                ME.MinkowskiReLU(inplace=True)
+            ).to(projected_features.device)
+        
         projected_features = self.conv(projected_features)
         return projected_features + x
 
@@ -554,12 +573,12 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         self.init_weights()
     
     def init_weights(self):
-        if getattr(self, 'memory', None) is not None:
+        if hasattr(self, 'memory') and self.memory is not None:
             self.memory.init_weights()
-        if getattr(self, 'img_backbone', None) is not None:
+        if hasattr(self, 'img_backbone') and self.img_backbone is not None:
             self.img_backbone.init_weights()
 
-    def extract_feat(self, batch_inputs_dict, batch_data_samples, frame_i):
+    def extract_feat(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], frame_i: int) -> Tuple[List[Any], List[torch.Tensor], Any, List[Any]]:  # type: ignore[override]
         """Extract features from sparse tensor.
         """
         # construct tensor field
@@ -606,7 +625,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             sp_xyz_list.append(x[begin: end, -3:])
         return features, point_features, all_xyz_w, sp_xyz_list
     
-    def _select_queries(self, x, gt_instances, sp_xyz, frame_i):
+    def _select_queries(self, x: List[Any], gt_instances: List[Any], sp_xyz: Optional[List[Any]] = None, frame_i: int = 0) -> Tuple[List[Any], List[Any], List[Any]]:  # type: ignore[override]
         """Select queries for train pass.
         """
         gt_instances_ = []
@@ -626,18 +645,19 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 ids = torch.randperm(len(x[i]))[:n].to(x[i].device)
                 queries.append(x[i][ids])
                 gt_instances_[i].query_masks = gt_instances_[i].sp_masks[:, ids]
-                sp_xyz[i] = sp_xyz[i][ids]
+                if sp_xyz is not None:
+                    sp_xyz[i] = sp_xyz[i][ids]
             else:
                 queries.append(x[i])
                 gt_instances_[i].query_masks = gt_instances_[i].sp_masks
         
-        return queries, gt_instances_, sp_xyz
+        return queries, gt_instances_, sp_xyz if sp_xyz is not None else []
 
-    def _forward(*args, **kwargs):
+    def _forward(self, *args, **kwargs) -> Any:  # type: ignore[override]
         """Implement abstract method of Base3DDetector."""
         pass
 
-    def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
+    def loss(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], **kwargs) -> Dict[str, torch.Tensor]:  # type: ignore[override]
         """Calculate losses from a batch of inputs dict and data samples.
         """
         losses, merge_feat_n_frames, ins_masks_query_n_frames = {}, [], []
@@ -670,7 +690,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             queries, gt_instances, sp_xyz = self._select_queries(x, gt_instances, sp_xyz, frame_i)
             ## Decoder
             super_points = ([bds.gt_pts_seg.sp_pts_mask[frame_i] for bds in batch_data_samples], all_xyz_w)
-            x = self.decoder(x, point_features, queries, super_points)
+            x = self.decoder(x=x, queries=queries, sp_feats=x, p_feats=point_features, super_points=super_points)
             ## Query projector
             for i in range(len(gt_instances)):
                 ins_masks_query = gt_instances[i].query_masks[:-self.sem_len, :]
@@ -697,15 +717,33 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                  for i in range(len(ins_masks_query_n_frames[0]))]
             loss = self.merge_criterion(merge_feat_n_frames, ins_masks_query_n_frames)
             losses.update(loss)
+        # 收集融合统计信息用于日志输出
+        if self.bi_encoder is not None and hasattr(self.bi_encoder, '_fusion_stats'):
+            fusion_stats = self.bi_encoder._fusion_stats
+            # 将融合统计信息添加到losses中
+            losses.update({
+                'fusion_2d_ratio': torch.tensor(fusion_stats['fusion_2d_ratio']),
+                'fusion_3d_ratio': torch.tensor(fusion_stats['fusion_3d_ratio']), 
+                'avg_confidence': torch.tensor(fusion_stats['avg_confidence']),
+                'valid_points_ratio': torch.tensor(fusion_stats['valid_points_ratio'])
+            })
+        
         return losses
 
-    def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
+    def predict(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], **kwargs) -> List[Any]:  # type: ignore[override]
         """Predict results from a batch of inputs and data samples with post-
         processing.
         """
         assert len(batch_data_samples) == 1
         results, query_feats_list, sem_preds_list, sp_xyz_list, bboxes_list, cls_preds_list = [], [], [], [], [], []
         num_frames = batch_inputs_dict['points'][0].shape[0]
+        
+        # Initialize variables that may be used later
+        mv_mask, mv_labels, mv_scores, mv_bboxes = None, None, None, None
+        mv_mask2, mv_labels2, mv_scores2 = None, None, None
+        mv_queries = None
+        online_merger = None
+        
         if hasattr(self, 'memory'):
             self.memory.reset()
         for frame_i in range(num_frames):
@@ -713,7 +751,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             x, point_features, all_xyz_w, sp_xyz = self.extract_feat(batch_inputs_dict, batch_data_samples, frame_i)
             ## Decoder
             super_points = ([bds.gt_pts_seg.sp_pts_mask[frame_i] for bds in batch_data_samples], all_xyz_w)
-            x = self.decoder(x, point_features, x, super_points)
+            x = self.decoder(x=x, queries=x, sp_feats=x, p_feats=point_features, super_points=super_points)
             ## Post-processing
             pred_pts_seg, mapping = self.predict_by_feat(
                 x, batch_data_samples[0].gt_pts_seg.sp_pts_mask[frame_i])
@@ -732,19 +770,20 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             if self.test_cfg.merge_type == 'learnable_online':
                 if frame_i == 0:
                     online_merger = OnlineMerge(self.test_cfg.inscat_topk_insts, self.use_bbox)
-                mv_mask, mv_labels, mv_scores, mv_queries, mv_bboxes = online_merger.merge(
-                    results[-1].pop('pts_instance_mask')[0],
-                    results[-1].pop('instance_labels')[0],
-                    results[-1].pop('instance_scores')[0],
-                    results[-1].pop('instance_queries')[0],
-                    query_feats_list.pop(-1)[0],
-                    sem_preds_list.pop(-1)[0],
-                    sp_xyz_list.pop(-1)[0],
-                    bboxes_list.pop(-1)[0] if self.use_bbox else None)
-                # Empty cache. Only offline merging requires the whole list.
-                torch.cuda.empty_cache()
-                if frame_i == num_frames - 1:
-                    online_merger.clean() # Ignore panoptic segmentation
+                if online_merger is not None:
+                    mv_mask, mv_labels, mv_scores, mv_queries, mv_bboxes = online_merger.merge(
+                        results[-1].pop('pts_instance_mask')[0],
+                        results[-1].pop('instance_labels')[0],
+                        results[-1].pop('instance_scores')[0],
+                        results[-1].pop('instance_queries')[0],
+                        query_feats_list.pop(-1)[0],
+                        sem_preds_list.pop(-1)[0],
+                        sp_xyz_list.pop(-1)[0],
+                        bboxes_list.pop(-1)[0] if self.use_bbox else None)
+                    # Empty cache. Only offline merging requires the whole list.
+                    torch.cuda.empty_cache()
+                    if frame_i == num_frames - 1:
+                        online_merger.clean() # Ignore panoptic segmentation
         
         ## Offline merging
         if self.test_cfg.merge_type == 'learnable':
@@ -800,7 +839,14 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         ## Offline panoptic segmentation
         mv_sem = torch.cat([res['pts_semantic_mask'][0] for res in results])
         
-        if self.use_bbox and 'mv_bboxes' in locals() and mv_bboxes is not None:
+        # Ensure variables are not None before using them
+        if mv_mask is None or mv_labels is None or mv_scores is None:
+            # If no merging was performed, use the first result
+            mv_mask = results[0]['pts_instance_mask'][0]
+            mv_labels = results[0]['instance_labels'][0]
+            mv_scores = results[0]['instance_scores'][0]
+        
+        if self.use_bbox and mv_bboxes is not None:
             batch_data_samples[0].pred_bbox = mv_bboxes.cpu().numpy()
         
         # Not mapping to reconstructed point clouds, return directly for visualization
@@ -855,7 +901,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         results.pts_instance_mask[0] = ins_mask.cpu().numpy()
         return results
     
-    def predict_by_feat(self, out, superpoints):
+    def predict_by_feat(self, out: Dict[str, Any], superpoints: Any) -> Tuple[List[PointData], List[torch.Tensor]]:  # type: ignore[override]
         """Predict instance, semantic, and panoptic masks for a single scene.
 
         Args:
@@ -894,7 +940,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 instance_scores=instance_scores,
                 instance_queries=instance_queries)], mapping
     
-    def predict_by_feat_instance(self, out, superpoints, score_threshold):
+    def predict_by_feat_instance(self, out: Dict[str, Any], superpoints: Any, score_threshold: float) -> Tuple[Any, torch.Tensor, torch.Tensor, Any, torch.Tensor]:  # type: ignore[override]
         """Predict instance masks for a single scene.
 
         Args:
@@ -972,14 +1018,14 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
 
         return mask_pred, labels, scores, queries, mapping
     
-    def predict_by_feat_panoptic(self, sem_map, mask_pred, labels, scores):
+    def predict_by_feat_panoptic(self, sem_map: torch.Tensor, mask_pred: torch.Tensor, labels: torch.Tensor, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
         """Predict panoptic masks for a single scene.
 
         Args:
-            out (Dict): Decoder output, each value is List of len 1. Keys:
-                `cls_preds` of shape (n_queries, n_instance_classes + 1),
-                `sem_preds` of shape (n_queries, n_semantic_classes + 1),
-                `masks` of shape (n_queries, n_points),
+            sem_map: Semantic map tensor
+            mask_pred: Predicted instance masks tensor
+            labels: Predicted class labels tensor
+            scores: Predicted confidence scores tensor
                 `scores` of shape (n_queris, 1) or None.
             superpoints (Tensor): of shape (n_raw_points,).
         
@@ -1001,7 +1047,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             mask_pred.shape[0] + n_stuff_classes, 
             device=mask_pred.device).view(-1, 1)
         insts = inst_idxs * mask_pred
-        things_inst_mask, idxs = insts.max(axis=0)
+        things_inst_mask, idxs = insts.max(dim=0)
         things_sem_mask = labels[idxs] + n_stuff_classes
 
         inst_idxs, num_pts = things_inst_mask.unique(return_counts=True)
@@ -1088,15 +1134,13 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.init_weights()
         
-        self.conv = nn.Sequential(
-            ME.MinkowskiConvolution(960, 32, kernel_size=1, dimension=3),
-            ME.MinkowskiBatchNorm(32),
-            ME.MinkowskiReLU(inplace=True))
+        # 初始化为None，将在运行时动态创建
+        self.conv = None
     
     def init_weights(self):
-        if getattr(self, 'memory', None) is not None:
+        if hasattr(self, 'memory') and self.memory is not None:
             self.memory.init_weights()
-        if getattr(self, 'img_backbone', None) is not None:
+        if hasattr(self, 'img_backbone') and self.img_backbone is not None:
             self.img_backbone.init_weights()
 
     def extract_feat(self, batch_inputs_dict, batch_data_samples, frame_i):
@@ -1191,12 +1235,20 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
             coordinate_map_key=x.coordinate_map_key,
             coordinate_manager=x.coordinate_manager)
         
+        # 动态初始化卷积层
+        if self.conv is None:
+            self.conv = nn.Sequential(
+                ME.MinkowskiConvolution(projected_features.shape[1], 32, kernel_size=1, dimension=3),
+                ME.MinkowskiBatchNorm(32),
+                ME.MinkowskiReLU(inplace=True)
+            ).to(projected_features.device)
+        
         projected_features = self.conv(projected_features)
         return projected_features + x
 
 @MODELS.register_module()
 class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
-    def extract_feat(self, batch_inputs_dict, batch_data_samples):
+    def extract_feat(self, batch_inputs_dict, batch_data_samples, frame_i=None):
         """Extract features from sparse tensor.
         """
         # construct tensor field
@@ -1235,7 +1287,7 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
             end = sum(n_super_points[:i + 1])
             features.append(x[begin: end, :-3])
             sp_xyz_list.append(x[begin: end, -3:])
-        return features, point_features, all_xyz_w, sp_xyz_list, map_index, x_voxel
+        return features, point_features, all_xyz_w, sp_xyz_list
     
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
         """Predict results from a batch of inputs and data samples with post-
@@ -1244,16 +1296,18 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         assert len(batch_data_samples) == 1
         results, query_feats_list, sem_preds_list, sp_xyz_list, bboxes_list, cls_preds_list = [], [], [], [], [], []
         
+        # Initialize variables that may be used later
+        mv_mask, mv_labels, mv_scores, mv_bboxes = None, None, None, None
+        
         if hasattr(self, 'memory'):
             self.memory.reset()
 
-        # t0 = time.time()
         ## Backbone
-        x, point_features, all_xyz_w, sp_xyz, map_index, x_voxel = self.extract_feat(
+        x, point_features, all_xyz_w, sp_xyz = self.extract_feat(
             batch_inputs_dict, batch_data_samples)
         ## Decoder
         super_points = ([bds.gt_pts_seg.sp_pts_mask for bds in batch_data_samples], all_xyz_w)
-        x = self.decoder(x, point_features, x, super_points)
+        x = self.decoder(x=x, queries=x, sp_feats=x, p_feats=point_features, super_points=super_points)
         ## Post-processing
         pred_pts_seg, mapping = self.predict_by_feat(
             x, batch_data_samples[0].gt_pts_seg.sp_pts_mask)
@@ -1320,8 +1374,15 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         ## Offline semantic segmentation
         mv_sem = torch.cat([res['pts_semantic_mask'][0] for res in results])
         
-        if self.use_bbox and 'mv_bboxes' in locals() and mv_bboxes is not None:
+        if self.use_bbox and mv_bboxes is not None:
             batch_data_samples[0].pred_bbox = mv_bboxes.cpu().numpy()
+        
+        # Ensure variables are not None before using them
+        if mv_mask is None or mv_labels is None or mv_scores is None:
+            # If no merging was performed, use the first result
+            mv_mask = results[0]['pts_instance_mask'][0]
+            mv_labels = results[0]['instance_labels'][0]
+            mv_scores = results[0]['instance_scores'][0]
         
         # Not mapping to reconstructed point clouds, return directly for visualization
         merged_result = PointData(

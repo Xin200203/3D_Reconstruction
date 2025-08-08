@@ -17,6 +17,9 @@ from .instance_criterion import (
     MaskDiceCost, HungarianMatcher, SparseMatcher)
 from .loading import LoadAnnotations3D_, NormalizePointsColor_
 from .formatting import Pack3DDetInputs_
+# Enhanced loss functions for BiFusion optimization
+from .bife_clip_loss import ClipConsCriterion, LegacyClipConsCriterion
+from .auxiliary_loss import SpatialConsistencyLoss, NoViewSupervisionLoss
 from .transforms_3d import (
     ElasticTransfrom, AddSuperPointAnnotations, SwapChairAndFloor)
 from .data_preprocessor import Det3DDataPreprocessor_

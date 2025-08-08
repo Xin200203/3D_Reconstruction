@@ -27,7 +27,7 @@ class ScanNetSegDataset_(ScanNetSegDataset):
         info['super_pts_path'] = osp.join(
             self.data_prefix.get('sp_pts_mask', ''), info['super_pts_path'])
         info['img_path'] = osp.join(
-            self.data_root, info['img_path'])
+            self.data_root or '', info['img_path'])
 
         info = super().parse_data_info(info)
 
@@ -185,11 +185,11 @@ class ScanNet200SegMVDataset_(ScanNetSegDataset_):
             dict: Has `ann_info` in training stage. And
             all path has been converted to absolute path.
         """
-        info['super_pts_paths'] = [osp.join(self.data_root, path) for path in info['super_pts_paths']]
-        info['pts_paths'] = [osp.join(self.data_root, path) for path in info['pts_paths']]
-        info['pts_instance_mask_paths'] = [osp.join(self.data_root, path) for path in info['pts_instance_mask_paths']]
-        info['pts_semantic_mask_paths'] = [osp.join(self.data_root, path) for path in info['pts_semantic_mask_paths']]
-        info['img_paths'] = [osp.join(self.data_root, path) for path in info['img_paths']]
+        info['super_pts_paths'] = [osp.join(self.data_root or '', path) for path in info['super_pts_paths']]
+        info['pts_paths'] = [osp.join(self.data_root or '', path) for path in info['pts_paths']]
+        info['pts_instance_mask_paths'] = [osp.join(self.data_root or '', path) for path in info['pts_instance_mask_paths']]
+        info['pts_semantic_mask_paths'] = [osp.join(self.data_root or '', path) for path in info['pts_semantic_mask_paths']]
+        info['img_paths'] = [osp.join(self.data_root or '', path) for path in info['img_paths']]
 
         if self.modality['use_camera']:
             for cam_id, img_info in info['images'].items():
@@ -234,12 +234,12 @@ class ScanNetSegMVDataset_(ScanNetSegDataset_):
             dict: Has `ann_info` in training stage. And
             all path has been converted to absolute path.
         """
-        info['super_pts_paths'] = [osp.join(self.data_root, path) for path in info['super_pts_paths']]
-        info['pts_paths'] = [osp.join(self.data_root, path) for path in info['pts_paths']]
-        info['pts_instance_mask_paths'] = [osp.join(self.data_root, path) for path in info['pts_instance_mask_paths']]
-        info['pts_semantic_mask_paths'] = [osp.join(self.data_root, path) for path in info['pts_semantic_mask_paths']]
+        info['super_pts_paths'] = [osp.join(self.data_root or '', path) for path in info['super_pts_paths']]
+        info['pts_paths'] = [osp.join(self.data_root or '', path) for path in info['pts_paths']]
+        info['pts_instance_mask_paths'] = [osp.join(self.data_root or '', path) for path in info['pts_instance_mask_paths']]
+        info['pts_semantic_mask_paths'] = [osp.join(self.data_root or '', path) for path in info['pts_semantic_mask_paths']]
         if 'img_paths' in info:
-            info['img_paths'] = [osp.join(self.data_root, path) for path in info['img_paths']]
+            info['img_paths'] = [osp.join(self.data_root or '', path) for path in info['img_paths']]
 
         if self.modality['use_camera']:
             for cam_id, img_info in info['images'].items():

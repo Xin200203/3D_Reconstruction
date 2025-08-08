@@ -6,7 +6,12 @@ _base_ = [
     'mmdet3d::_base_/datasets/scannet-seg.py'
 ]
 
-custom_imports = dict(imports=['oneformer3d', 'oneformer3d.partial_load_hook'])
+custom_imports = dict(imports=[
+    'oneformer3d', 
+    'oneformer3d.partial_load_hook',
+    'oneformer3d.detailed_loss_hook',
+    'oneformer3d.enhanced_training_hook'  # 🔥 导入增强训练监控Hook
+])
 
 # ======== 类别和维度设置 ========
 num_instance_classes = 1
@@ -114,7 +119,7 @@ train_pipeline = [
         gran=[6, 20],
         mag=[40, 160],
         voxel_size=0.02,
-        p=0.2),  # 从0.5降到0.2，减少增强频率
+        p=0.2),
     dict(
         type='Pack3DDetInputs_',
         keys=[
@@ -190,28 +195,31 @@ model = dict(
         voxel_size=0.02,
         
         # Enhanced CLIP配置
-        clip_num_layers=6,              # 使用前6层Transformer
-        freeze_clip_conv1=False,        # 允许conv1微调
-        freeze_clip_early_layers=True,  # 冻结前3层
+        clip_num_layers=6,
+        freeze_clip_conv1=False,
+        freeze_clip_early_layers=True,
         
-        # Enhanced Gate配置
-        use_enhanced_gate=True,         # 启用增强Gate机制
-        use_spatial_attention=True,     # 启用空间注意力
-        spatial_k=16,                   # K近邻数量
+        # Enhanced Gate配置 - 使用LiteFusionGate 
+        use_enhanced_gate=False,
+        use_spatial_attention=False,
+        spatial_k=16,
         
         # 关键：移除TinySA依赖
-        use_tiny_sa_2d=False,           # 禁用2D TinySA
-        use_tiny_sa_3d=False,           # 禁用3D TinySA
+        use_tiny_sa_2d=False,
+        use_tiny_sa_3d=False,
         
         # 其他配置
         use_amp=True,
         freeze_blocks=0,
+        
+        # 调试输出控制
+        debug=False,  # 设置为False以关闭详细调试输出
     ),
     
-    # 几何感知池化 - 使用256维匹配BiFusionEncoder输出
+    # 几何感知池化
     pool=dict(type='GeoAwarePooling', channel_proj=256),
     
-    # 查询解码器 - 使用256维输入
+    # 查询解码器
     decoder=dict(
         type='ScanNetMixQueryDecoder',
         num_layers=3,
@@ -224,7 +232,7 @@ model = dict(
         num_instance_classes=num_instance_classes,
         num_semantic_classes=num_semantic_classes,
         num_semantic_linears=1,
-        in_channels=256,  # 匹配BiFusionEncoder输出维度
+        in_channels=256,
         d_model=256,
         num_heads=8,
         hidden_dim=1024,
@@ -235,14 +243,14 @@ model = dict(
         fix_attention=True,
         objectness_flag=False),
     
-    # 损失函数
+    # Enhanced损失函数配置
     criterion=dict(
         type='ScanNetMixedCriterion',
         num_semantic_classes=num_semantic_classes,
         sem_criterion=dict(
             type='ScanNetSemanticCriterion',
             ignore_index=num_semantic_classes,
-            loss_weight=0.5),
+            loss_weight=0.4),
         inst_criterion=dict(
             type='MixedInstanceCriterion',
             matcher=dict(
@@ -253,17 +261,19 @@ model = dict(
                     dict(type='MaskDiceCost', weight=1.0)],
                 topk=1),
             bbox_loss=dict(type='AxisAlignedIoULoss'),
-            loss_weight=[0.5, 1.0, 1.0, 0.5, 0.5],
+            loss_weight=[1.0, 0.8, 0.6, 0.3, 0.0],
             num_classes=num_instance_classes,
-            non_object_weight=0.1,
+            non_object_weight=0.05,
             fix_dice_loss_weight=True,
             iter_matcher=True,
             fix_mean_loss=True)),
     
-    # 添加CLIP一致性损失 - 大幅降低权重避免干扰主任务
+    # CLIP一致性损失
     clip_criterion=dict(
         type='ClipConsCriterion',
-        loss_weight=0.01,  # 从0.1降到0.01，减少对主任务的干扰
+        loss_weight=0.1,
+        temperature=0.07,
+        gradient_flow_ratio=0.05,
     ),
     
     train_cfg=dict(),
@@ -287,11 +297,10 @@ data_prefix = dict(
     sp_pts_mask='super_points')
 
 train_dataloader = dict(
-    batch_size=4,           # 立即降低到4，节省2-3GB显存
-    num_workers=10,         # 减少worker，降低内存压力
+    batch_size=6,
+    num_workers=8,
     persistent_workers=True,
-    # pin_memory=True,      # 保持注释，避免内存压力
-    prefetch_factor=3,      # 降低预取，进一步节省内存
+    prefetch_factor=2,
     dataset=dict(
         type=dataset_type,
         data_root=DATA_ROOT,
@@ -354,39 +363,74 @@ test_evaluator = val_evaluator
 # ======== 训练配置 ========
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='AdamW', lr=0.0001, weight_decay=0.05),  # 恢复学习率，加快收敛
-    clip_grad=dict(max_norm=20, norm_type=2),  # 提高梯度剪裁，应对BiFusion大梯度
-    # 启用梯度累积，减少显存使用
-    accumulative_counts=4)  # 补偿batch_size降低：4×4=16等效batch_size
+    optimizer=dict(type='AdamW', lr=0.00005, weight_decay=0.01),
+    clip_grad=dict(max_norm=1.0, norm_type=2),
+    accumulative_counts=4)
 
 param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
 
 custom_hooks = [
     dict(type='EmptyCacheHook', after_iter=True),
-    # 关键修复：加载3D预训练权重到BiFusion的backbone3d
+    
+    # 增强训练监控Hook
+    dict(
+        type='EnhancedTrainingHook',
+        log_interval=10,
+        grad_monitor_interval=50,
+        detailed_stats=True
+    ),
+    
+    # 原有详细损失监控Hook
+    dict(
+        type='DetailedLossMonitorHook',
+        log_interval=20,
+        collect_grad_norm=True,
+        collect_clip_stats=True
+    ),
+    
+    # NaN检测Hook
+    dict(
+        type='NaNDetectionHook',
+        check_interval=5
+    ),
+    
+    # 加载3D预训练权重
     dict(
         type='PartialLoadHook',
         pretrained='/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth',
         submodule='bi_encoder.backbone3d',
-        prefix_replace=('backbone.', ''),  # 将backbone.xxx映射到bi_encoder.backbone3d.xxx
+        prefix_replace=('backbone\\.', 'bi_encoder.backbone3d.'),
         strict=False
     )
 ]
+
 default_hooks = dict(
     checkpoint=dict(
         interval=1,
         max_keep_ckpts=1,
         save_best=['all_ap_50%'],
         rule='greater'),
-    logger=dict(type='LoggerHook', interval=50))
+    logger=dict(
+        type='LoggerHook', 
+        interval=10,
+        log_metric_by_epoch=False,
+        out_suffix='.log'
+    ))
 
-# ======== 预训练权重加载 ========
-# 移除全局load_from，改用PartialLoadHook精确加载3D权重到bi_encoder.backbone3d
-# load_from = '/home/nebula/xxy/ESAM/work_dirs/sv3d_scannet200_ca/best_all_ap_50%_epoch_128.pth'
 # ======== 训练调度 ========
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=128)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
-# ======== 日志配置 ========
-log_processor = dict(type='LogProcessor', window_size=1, by_epoch=True) 
+# ======== 日志配置 - 禁用TensorBoard解决Python 3.8兼容性问题 ========
+log_processor = dict(type='LogProcessor', window_size=1, by_epoch=True)
+
+# 禁用TensorBoard相关组件
+vis_backends = [
+    dict(type='LocalVisBackend'),
+]
+
+visualizer = dict(
+    type='Det3DLocalVisualizer',
+    vis_backends=vis_backends,
+    name='visualizer')
