@@ -19,6 +19,9 @@ from .img_backbone import point_sample
 import os
 from typing import Any, Dict, List, Tuple, Union, Optional, cast
 from mmengine import ConfigDict
+from .training_scheduler import ProgressScheduler
+from .param_groups import create_param_groups, ProgressiveFreezeManager
+from .cumulative_loss_recorder import EnhancedCumulativeLossRecorder
 
 @MODELS.register_module()
 class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
@@ -52,6 +55,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                  backbone=None,
                  bi_encoder=None,
                  clip_criterion=None,
+                 alpha_regularizers=None,  # NEW: Alpha regularization
+                 training_optimization=None,  # NEW: Training optimization config
                  neck=None,
                  pool=None,
                  decoder=None,
@@ -74,11 +79,102 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.decoder = MODELS.build(_cfg(decoder, 'decoder'))
         self.criterion = MODELS.build(_cfg(criterion, 'criterion'))
         self.clip_criterion = MODELS.build(_cfg(clip_criterion, 'clip_criterion')) if clip_criterion is not None else None
+        
+        # Alpha regularizers (optional)
+        self.alpha_regularizers = {}
+        if alpha_regularizers is not None:
+            for reg_name, reg_config in alpha_regularizers.items():
+                if reg_config is not None:
+                    self.alpha_regularizers[reg_name] = MODELS.build(_cfg(reg_config, f'alpha_{reg_name}'))
+                else:
+                    self.alpha_regularizers[reg_name] = None
+        
+        # Training optimization components
+        self.training_optimization = training_optimization or {}
+        self.progress_scheduler = None
+        self.progressive_freeze_manager = None
+        self.enhanced_loss_recorder = None
+        
+        # Initialize optimization components if configuration provided
+        if self.training_optimization.get('enabled', True):
+            opt_config = self.training_optimization
+            
+            # Progress scheduler
+            scheduler_config = opt_config.get('progress_scheduler', {})
+            if scheduler_config.get('enabled', True):
+                self.progress_scheduler = ProgressScheduler(
+                    max_updates=scheduler_config.get('max_updates', 10000)
+                )
+                
+                # Inject progress scheduler into CLIP criterion
+                if self.clip_criterion is not None and hasattr(self.clip_criterion, 'set_progress_scheduler'):
+                    self.clip_criterion.set_progress_scheduler(self.progress_scheduler)
+            
+            # Progressive freeze manager will be initialized with model after creation
+            self.progressive_freeze_config = opt_config.get('progressive_freeze', {})
+            
+            # Enhanced loss recorder
+            recorder_config = opt_config.get('loss_recorder', {})
+            if recorder_config.get('enabled', True):
+                self.enhanced_loss_recorder = EnhancedCumulativeLossRecorder(
+                    output_file=recorder_config.get('output_file', 'work_dirs/enhanced_loss_records.jsonl'),
+                    window_size=recorder_config.get('window_size', 1000),
+                    log_interval=recorder_config.get('log_interval', 50)
+                )
+        
         self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.voxel_size = voxel_size
         self.num_classes = num_classes
         self.query_thr = query_thr
         self.train_cfg = train_cfg
+
+    def initialize_training_optimization(self):
+        """Initialize progressive freeze manager after model is fully constructed."""
+        if (hasattr(self, 'progressive_freeze_config') and 
+            self.progressive_freeze_config.get('enabled', False)):
+            self.progressive_freeze_manager = ProgressiveFreezeManager(self)
+
+    def get_param_groups(self, base_lr: float = 1e-4) -> List[Dict]:
+        """Get parameter groups for differential learning rates."""
+        return create_param_groups(
+            self,
+            base_lr=base_lr,
+            clip_backbone_lr_ratio=0.1,  # CLIP backbone gets 10% of base LR
+            clip_heads_lr_ratio=0.2,     # CLIP heads get 20% of base LR
+            backbone3d_lr_ratio=1.0,     # 3D backbone gets full base LR
+            decoder_lr_ratio=1.0,        # Decoder gets full base LR
+            base_weight_decay=0.05
+        )
+
+    def update_training_progress(self, step: int):
+        """Update training progress and apply scheduled modifications."""
+        if self.progress_scheduler is not None:
+            self.progress_scheduler.current_step = step
+            
+            # Apply progressive freeze/unfreeze based on progress
+            if self.progressive_freeze_manager is not None:
+                progress = self.progress_scheduler.get_progress()
+                freeze_config = self._get_freeze_config_for_progress(progress)
+                self.progressive_freeze_manager.apply_freeze_schedule(freeze_config)
+
+    def _get_freeze_config_for_progress(self, progress: float) -> Dict[str, bool]:
+        """Get freeze configuration based on training progress."""
+        config = {}
+        
+        # Example progressive freeze schedule
+        if progress < 0.1:
+            # Early stage: freeze CLIP backbone completely
+            config['clip_vit_all'] = True
+        elif progress < 0.3:
+            # Mid-early: unfreeze late layers, keep early layers frozen
+            config['clip_vit_early'] = True
+            config['clip_vit_late'] = False
+        elif progress < 0.7:
+            # Mid-late: unfreeze all ViT layers
+            config['clip_vit_all'] = False
+        # Late stage: everything unfrozen
+        
+        return config
 
     def extract_feat(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any]) -> Tuple[List[Any], List[torch.Tensor], Any]:  # type: ignore[override]
         """Extract features from sparse tensor."""
@@ -89,6 +185,11 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 batch_inputs_dict['imgs'],
                 batch_inputs_dict['cam_info']
             )
+            
+            # Add clip_global from batch_inputs to encoder_out for loss computation
+            if 'clip_global' in batch_inputs_dict:
+                encoder_out['clip_global'] = batch_inputs_dict['clip_global']
+            
             self._encoder_out = encoder_out  # cache for loss
             fused_list = encoder_out['feat_fusion']
             all_xyz = [pts[:, :3] for pts in batch_inputs_dict['points']]
@@ -206,21 +307,128 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         ## Decoder
         super_points = ([bds.gt_pts_seg.sp_pts_mask for bds in batch_data_samples], all_xyz_w)
         x = self.decoder(x=x, queries=queries, sp_feats=x, p_feats=point_features, super_points=super_points)
-        ## Loss
+        ## Loss computation with v1 optimizations
         losses = self.criterion(x, gt_instances, gt_point_instances, None, self.decoder.mask_pred_mode)
+        
+        # Enhanced CLIP consistency loss with progress-aware scheduling
+        clip_loss_value = 0.0
         if self.clip_criterion is not None and hasattr(self, '_encoder_out'):
-            loss_clip = self.clip_criterion(self._encoder_out['feat_fusion'], self._encoder_out['clip_global'])
+            # Update step counter for CLIP criterion
+            self.clip_criterion.step()
+            
+            # Update training progress if scheduler is available
+            if self.progress_scheduler is not None:
+                self.progress_scheduler.step()
+            
+            # Use valid projection mask for point-level consistency
+            valid_mask = None
+            if (self.bi_encoder is not None and 
+                hasattr(self.bi_encoder, '_debug_stats') and 
+                self.bi_encoder._debug_stats):
+                # Extract valid projection masks from debug stats if available
+                valid_mask = [torch.tensor(stats.get('valid_points', []), dtype=torch.bool, device=self._encoder_out['feat_fusion'][0].device) 
+                             for stats in self.bi_encoder._debug_stats]
+            
+            loss_clip = self.clip_criterion(
+                self._encoder_out['feat_fusion'], 
+                self._encoder_out['clip_global'],
+                valid_projection_mask=valid_mask
+            )
             losses.update(dict(loss_clip=loss_clip))
-        # 收集融合统计信息用于日志输出
+            clip_loss_value = float(loss_clip) if isinstance(loss_clip, torch.Tensor) else loss_clip
+        
+        # Alpha regularization losses (if enabled)
+        if hasattr(self, 'alpha_regularizers') and self.alpha_regularizers:
+            if hasattr(self, '_encoder_out') and 'alpha_values' in self._encoder_out:
+                alpha_values = self._encoder_out['alpha_values']
+                
+                for reg_name, regularizer in self.alpha_regularizers.items():
+                    if regularizer is not None:
+                        regularizer.step()  # Update step counter
+                        reg_loss = regularizer(alpha_values)
+                        losses.update({f'alpha_{reg_name}': reg_loss})
+        
+        # Ensure all losses are in FP32 for numerical stability
+        for key, value in losses.items():
+            if isinstance(value, torch.Tensor) and value.dtype != torch.float32:
+                losses[key] = value.float()
+        
+        # 收集融合统计信息用于日志输出（enhanced with more metrics）
         if self.bi_encoder is not None and hasattr(self.bi_encoder, '_fusion_stats') and self.bi_encoder._fusion_stats:
             fusion_stats = self.bi_encoder._fusion_stats
-            # 将融合统计信息添加到losses中（现在统计信息会正确生成）
-            losses.update({
-                'fusion_2d_ratio': torch.tensor(fusion_stats.get('fusion_2d_ratio', 0.5)),
-                'fusion_3d_ratio': torch.tensor(fusion_stats.get('fusion_3d_ratio', 0.5)), 
-                'avg_confidence': torch.tensor(fusion_stats.get('avg_confidence', 0.5)),
-                'valid_points_ratio': torch.tensor(fusion_stats.get('valid_points_ratio', 1.0))
-            })
+
+            # Core fusion statistics
+            stat_keys = [
+                'avg_confidence',
+                'valid_ratio',
+                'norm_ratio_2d_over_3d',
+                'cos_2d3d_mean',
+                'cos_2d3d_mean_ln',
+                'norm_2d_mean',
+                'norm_3d_mean',
+                'feat3d_mean_abs',
+                'feat3d_std',
+                'feat3d_nonzero_ratio',
+                'feat2d_mean_abs',
+                'feat2d_std',
+                'feat2d_nonzero_ratio',
+                'fused_mean_abs',
+                'fused_std',
+                'grad_norm_feat3d',
+                'grad_norm_feat2d',
+                'grad_norm_feat3d_raw',
+                'grad_norm_feat2d_raw',
+                'grad_norm_fusion_raw',
+                'grad_params_feat2d',
+                'grad_params_feat3d',
+                'grad_params_fusion',
+                'grad_params_decoder',
+                'grad_ratio_2d_over_3d'
+            ]
+            tensor_stats = {
+                key: torch.tensor(fusion_stats[key], dtype=torch.float32)
+                for key in stat_keys if key in fusion_stats
+            }
+            losses.update(tensor_stats)
+        
+        # Enhanced loss recording and anomaly detection
+        if self.enhanced_loss_recorder is not None:
+            # Calculate total loss (only summing tensor values)
+            tensor_losses = {k: v for k, v in losses.items() if isinstance(v, torch.Tensor)}
+            total_loss_value = float(sum(tensor_losses.values()))
+            
+            # Collect comprehensive metrics for monitoring
+            enhanced_metrics = {
+                'total_loss': total_loss_value,
+                'clip_loss': clip_loss_value,
+                'progress': self.progress_scheduler.get_progress() if self.progress_scheduler else 0.0,
+            }
+            
+            # Add fusion stats if available
+            if self.bi_encoder is not None and hasattr(self.bi_encoder, '_fusion_stats') and self.bi_encoder._fusion_stats:
+                fusion_stats = self.bi_encoder._fusion_stats
+                enhanced_metrics.update({
+                    'valid_ratio': fusion_stats.get('valid_ratio', 1.0),
+                    'cos_2d3d_mean': fusion_stats.get('cos_2d3d_mean', 0.0),
+                    'cos_2d3d_mean_ln': fusion_stats.get('cos_2d3d_mean_ln', 0.0)
+                })
+            
+            # Record with anomaly detection (mimicking hook interface)
+            try:
+                # Create a simplified runner-like object for the hook
+                class SimpleRunner:
+                    def __init__(self):
+                        self.iter = getattr(self, '_training_step', 0)
+                
+                runner_like = SimpleRunner()
+                self.enhanced_loss_recorder.after_train_iter(
+                    runner_like, 
+                    batch_idx=getattr(self, '_training_step', 0),
+                    outputs={'loss': enhanced_metrics['total_loss']}
+                )
+            except Exception as e:
+                # Fail silently for monitoring - don't break training
+                print(f"Warning: Enhanced loss recording failed: {e}")
         
         return losses
 
@@ -720,14 +928,29 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         # 收集融合统计信息用于日志输出
         if self.bi_encoder is not None and hasattr(self.bi_encoder, '_fusion_stats'):
             fusion_stats = self.bi_encoder._fusion_stats
-            # 将融合统计信息添加到losses中
-            losses.update({
-                'fusion_2d_ratio': torch.tensor(fusion_stats['fusion_2d_ratio']),
-                'fusion_3d_ratio': torch.tensor(fusion_stats['fusion_3d_ratio']), 
-                'avg_confidence': torch.tensor(fusion_stats['avg_confidence']),
-                'valid_points_ratio': torch.tensor(fusion_stats['valid_points_ratio'])
-            })
-        
+            monitor_keys = [
+                'avg_confidence',
+                'valid_ratio',
+                'norm_ratio_2d_over_3d',
+                'cos_2d3d_mean',
+                'cos_2d3d_mean_ln',
+                'feat3d_mean_abs',
+                'feat3d_std',
+                'feat3d_nonzero_ratio',
+                'feat2d_mean_abs',
+                'feat2d_std',
+                'feat2d_nonzero_ratio',
+                'fused_mean_abs',
+                'fused_std',
+                'grad_norm_feat3d',
+                'grad_norm_feat2d'
+            ]
+            monitor_tensors = {
+                key: torch.tensor(fusion_stats[key])
+                for key in monitor_keys if key in fusion_stats
+            }
+            losses.update(monitor_tensors)
+
         return losses
 
     def predict(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], **kwargs) -> List[Any]:  # type: ignore[override]

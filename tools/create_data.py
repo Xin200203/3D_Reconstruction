@@ -58,7 +58,11 @@ def _add_clip_paths_to_pkl(pkl_path: str, data_root: str, suffix: str = '_clip')
     """在 pkl 的每条记录中加入 clip_feat 路径字段。
 
     对 SV 记录新增 ``clip_feat_path`` (str)，对 MV 记录新增 ``clip_feat_paths`` (list[str])。
-    路径按照 ``2D -> clip_feat``、``.jpg -> .pt`` 规则转换；若对应 .pt 不存在则跳过该条，保持原 pkl 内容。
+    路径按照 ``2D -> clip_feat``、``.jpg -> .pt`` 规则转换。
+    
+    支持不同采样频率:
+    - SV: 200间隔采样 (每200帧取一个，对应的CLIP特征已按此频率软链接)
+    - MV: 40间隔采样 (每40帧取一个，对应的CLIP特征已按此频率软链接)
     """
     if not Path(pkl_path).exists():
         print(f"[add_clip_paths] pkl not found: {pkl_path}")
@@ -71,27 +75,64 @@ def _add_clip_paths_to_pkl(pkl_path: str, data_root: str, suffix: str = '_clip')
     else:
         data_list = infos
 
+    # 检测数据集类型以确定采样策略
+    is_sv_dataset = 'sv' in pkl_path.lower()
+    sampling_interval = 200 if is_sv_dataset else 40
+    
+    print(f"[add_clip_paths] 检测到数据集类型: {'SV' if is_sv_dataset else 'MV'}, 采样间隔: {sampling_interval}")
+
     updated = 0
+    skipped = 0
+    
     for rec in data_list:
-        # MV
+        # MV 数据集
         if 'img_paths' in rec:
             if 'clip_feat_paths' in rec:
                 continue  # 已处理
-            feat_paths = [p.replace('2D', 'clip_feat').replace('.jpg', '.pt') for p in rec['img_paths']]
-            # 可选存在性检查
-            abs_paths = [Path(data_root)/fp for fp in feat_paths]
-            if not all(ap.exists() for ap in abs_paths):
-                # 若有缺失则保留推断路径，后续加载时自行回退
-                print(f"[add_clip_paths] warning: some .pt missing for record, still writing paths")
-            rec['clip_feat_paths'] = feat_paths
-            updated += 1
-        # SV
+            
+            # 将2D图像路径转换为CLIP特征路径
+            feat_paths = []
+            for img_path in rec['img_paths']:
+                # 提取帧号
+                frame_str = Path(img_path).stem  # 例如从 '120.jpg' 提取 '120'
+                try:
+                    frame_num = int(frame_str)
+                    # 检查是否符合采样间隔（MV应该是40的倍数）
+                    if frame_num % sampling_interval == 0:
+                        feat_path = img_path.replace('2D', 'clip_feat').replace('.jpg', '.pt')
+                        feat_paths.append(feat_path)
+                except ValueError:
+                    print(f"[add_clip_paths] 无法解析帧号: {img_path}")
+                    continue
+            
+            if feat_paths:
+                rec['clip_feat_paths'] = feat_paths
+                updated += 1
+            else:
+                skipped += 1
+                print(f"[add_clip_paths] 跳过记录，无有效帧: {rec.get('sample_idx', 'unknown')}")
+        
+        # SV 数据集
         elif 'img_path' in rec:
             if 'clip_feat_path' in rec:
                 continue
-            feat_path = rec['img_path'].replace('2D', 'clip_feat').replace('.jpg', '.pt')
-            rec['clip_feat_path'] = feat_path
-            updated += 1
+            
+            # 提取帧号并检查是否符合SV采样间隔
+            img_path = rec['img_path']
+            frame_str = Path(img_path).stem
+            try:
+                frame_num = int(frame_str)
+                # 检查是否符合采样间隔（SV应该是200的倍数）
+                if frame_num % sampling_interval == 0:
+                    feat_path = img_path.replace('2D', 'clip_feat').replace('.jpg', '.pt')
+                    rec['clip_feat_path'] = feat_path
+                    updated += 1
+                else:
+                    skipped += 1
+                    print(f"[add_clip_paths] SV跳过非{sampling_interval}倍数帧: {frame_num}")
+            except ValueError:
+                print(f"[add_clip_paths] 无法解析SV帧号: {img_path}")
+                skipped += 1
 
     if updated:
         # 生成新文件名：插入 suffix（含前导 _）到 .pkl 之前
@@ -101,9 +142,9 @@ def _add_clip_paths_to_pkl(pkl_path: str, data_root: str, suffix: str = '_clip')
             new_pkl = pkl_path  # 若 suffix 为空，则覆盖原文件
 
         mmengine.dump(infos, new_pkl)
-        print(f"[add_clip_paths] {updated} records written to {new_pkl}")
+        print(f"[add_clip_paths] {updated} records updated, {skipped} records skipped, saved to {new_pkl}")
     else:
-        print(f"[add_clip_paths] no record updated for {pkl_path} (maybe already done)")
+        print(f"[add_clip_paths] no record updated for {pkl_path} (maybe already done or no valid frames)")
 
 parser = argparse.ArgumentParser(description='Data converter arg parser')
 parser.add_argument('dataset', metavar='kitti', help='name of the dataset')

@@ -1,9 +1,10 @@
 # Copied from mmdet3d/models/data_preprocessors/data_preprocessor.py
+import torch
+import numpy as np
+import os
 from mmdet3d.models.data_preprocessors.data_preprocessor import \
     Det3DDataPreprocessor
 from mmdet3d.registry import MODELS
-import torch
-import numpy as np
 
 
 @MODELS.register_module()
@@ -69,14 +70,39 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
                             if img.dim() == 3 and img.shape[0] in [1, 3]:
                                 tensor_imgs.append(img)
                     
-                    # 处理cam_info，确保长度匹配
+                    # 处理cam_info，保持batch中每个样本的独立性
                     if 'cam_info' in inputs:
                         cam_info = inputs['cam_info']
-                        if isinstance(cam_info, list) and len(cam_info) == 1:
-                            # 复制cam_info以匹配图像数量
-                            batch_inputs['cam_info'] = [cam_info[0] for _ in range(len(tensor_imgs))]
-                        else:
-                            batch_inputs['cam_info'] = cam_info
+                        
+                        # 🔧 关键修复：将clip_pix添加到cam_info中供BiFusion使用
+                        if 'clip_pix' in inputs:
+                            clip_pix = inputs['clip_pix']
+                            # 确保cam_info是列表格式
+                            if isinstance(cam_info, list):
+                                # 对每个样本的cam_info添加clip_pix
+                                for i, cam_meta in enumerate(cam_info):
+                                    if isinstance(cam_meta, dict):
+                                        # 单帧：直接添加clip_pix (应该是单个tensor)
+                                        if torch.is_tensor(clip_pix):
+                                            cam_meta['clip_pix'] = clip_pix
+                                        elif isinstance(clip_pix, list) and len(clip_pix) > i:
+                                            # 如果clip_pix是列表，取对应的tensor
+                                            cam_meta['clip_pix'] = clip_pix[i] if i < len(clip_pix) else clip_pix[0]
+                                        else:
+                                            cam_meta['clip_pix'] = clip_pix
+                            elif isinstance(cam_info, dict):
+                                # 单个样本的情况
+                                if torch.is_tensor(clip_pix):
+                                    cam_info['clip_pix'] = clip_pix
+                                elif isinstance(clip_pix, list) and len(clip_pix) > 0:
+                                    cam_info['clip_pix'] = clip_pix[0]
+                                else:
+                                    cam_info['clip_pix'] = clip_pix
+                                cam_info = [cam_info]  # 转换为列表
+                                
+                        batch_inputs['cam_info'] = cam_info
+                        if os.environ.get('BIFUSION_DEBUG_CAMINFO'):
+                            print(f"[Det3DDataPreprocessor_] tuple imgs cam_info len={len(cam_info)}")
                 
                 else:
                     # 处理其他格式的图像列表
@@ -87,13 +113,29 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
                     
                     # 处理cam_info
                     if 'cam_info' in inputs:
-                        batch_inputs['cam_info'] = inputs['cam_info']
+                        cam_info = inputs['cam_info']
+                        
+                        # 🔧 关键修复：将clip_pix添加到cam_info中供BiFusion使用
+                        if 'clip_pix' in inputs:
+                            clip_pix = inputs['clip_pix']
+                            if isinstance(cam_info, list):
+                                for i, cam_meta in enumerate(cam_info):
+                                    if isinstance(cam_meta, dict):
+                                        cam_meta['clip_pix'] = clip_pix
+                            elif isinstance(cam_info, dict):
+                                cam_info['clip_pix'] = clip_pix
+                                
+                        batch_inputs['cam_info'] = cam_info
+                        if os.environ.get('BIFUSION_DEBUG_CAMINFO'):
+                            print(f"[Det3DDataPreprocessor_] list imgs cam_info len={len(cam_info)}")
             
             # 验证最终的图像列表
             if len(tensor_imgs) == 0:
                 raise ValueError("No valid images found after preprocessing")
             
             batch_inputs['imgs'] = tensor_imgs
+            if os.environ.get('BIFUSION_DEBUG_CAMINFO'):
+                print(f"[Det3DDataPreprocessor_] batch imgs={len(tensor_imgs)}")
 
         elif 'img' in inputs:
             # 原来的 img 处理逻辑

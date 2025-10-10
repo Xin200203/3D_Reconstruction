@@ -74,6 +74,31 @@ def main():
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
 
+    # Safety guard: if user requests num_workers=0 via cfg options or config,
+    # ensure prefetch_factor is disabled (DataLoader requires multiprocessing
+    # to use prefetch_factor) and persistent_workers is turned off. This
+    # allows quick debug runs with single-process dataloaders.
+    try:
+        # train_dataloader may be a dict-like object in the Config
+        for dl_key in ('train_dataloader', 'val_dataloader', 'test_dataloader'):
+            if dl_key in cfg:
+                dl_cfg = cfg[dl_key]
+                # handle both dict and nested dict with 'dataset' key
+                if isinstance(dl_cfg, dict):
+                    numw = dl_cfg.get('num_workers', None)
+                    if numw == 0:
+                        if 'prefetch_factor' in dl_cfg and dl_cfg.get('prefetch_factor', None) is not None:
+                            import logging
+                            from mmengine.logging import print_log
+                            print_log(f"Disabling prefetch_factor for {dl_key} because num_workers=0.", level=logging.WARNING)
+                            dl_cfg['prefetch_factor'] = None
+                        if dl_cfg.get('persistent_workers', False):
+                            dl_cfg['persistent_workers'] = False
+                # else leave as-is
+    except Exception:
+        # Non-critical guard: if anything goes wrong, continue with original cfg
+        pass
+
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:
         # update configs according to CLI args if args.work_dir is not None

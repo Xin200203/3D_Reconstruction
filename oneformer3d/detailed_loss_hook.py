@@ -80,7 +80,32 @@ class DetailedLossMonitorHook(Hook):
                 loss_report[f'clip_{key}'] = log_vars[key]
                 
         # 融合统计（直接从log_vars中提取）
-        fusion_keys = ['fusion_2d_ratio', 'fusion_3d_ratio', 'avg_confidence', 'valid_points_ratio']
+        fusion_keys = [
+            'avg_confidence',
+            'valid_ratio',
+            'norm_ratio_2d_over_3d',
+            'cos_2d3d_mean',
+            'cos_2d3d_mean_ln',
+            'feat3d_mean_abs',
+            'feat3d_std',
+            'feat3d_nonzero_ratio',
+            'feat2d_mean_abs',
+            'feat2d_std',
+            'feat2d_nonzero_ratio',
+            'fused_mean_abs',
+            'fused_std',
+            'grad_norm_feat3d',
+            'grad_norm_feat2d',
+            'grad_norm_fusion',
+            'grad_norm_feat3d_raw',
+            'grad_norm_feat2d_raw',
+            'grad_norm_fusion_raw',
+            'grad_params_feat2d',
+            'grad_params_feat3d',
+            'grad_params_fusion',
+            'grad_params_decoder',
+            'grad_ratio_2d_over_3d'
+        ]
         for key in fusion_keys:
             if key in log_vars:
                 loss_report[key] = log_vars[key]
@@ -168,27 +193,37 @@ class DetailedLossMonitorHook(Hook):
             fusion_losses = {}
             other_losses = {}
             
+            fusion_prefixes = [
+                'avg_confidence',
+                'valid_ratio',
+                'norm_ratio_2d_over_3d',
+                'cos_2d3d',
+                'feat3d_',
+                'feat2d_',
+                'fused_',
+                'grad_norm_feat'
+            ]
+
             for key, value in loss_report.items():
-                if isinstance(value, (int, float)):
-                    if any(x in key for x in ['fusion_2d_ratio', 'fusion_3d_ratio', 'avg_confidence', 'valid_points_ratio']):
-                        fusion_losses[key] = value
-                    elif any(x in key for x in ['loss', 'semantic', 'instance', 'clip']):
-                        main_losses[key] = value
-                    else:
-                        other_losses[key] = value
+                if not isinstance(value, (int, float)):
+                    continue
+
+                if any(key.startswith(prefix) for prefix in fusion_prefixes):
+                    fusion_losses[key] = value
+                elif any(x in key for x in ['loss', 'semantic', 'instance', 'clip']):
+                    main_losses[key] = value
+                else:
+                    other_losses[key] = value
             
             # 显示主要损失
             for key, value in main_losses.items():
                 print(f"  {key:<25}: {value:.6f}")
                 
-            # 显示融合统计（gate比值）
+            # 显示融合与分支统计
             if fusion_losses:
-                print(f"\n🔀 融合门控统计 (Gate Ratios):")
+                print(f"\n🔀 融合与分支统计:")
                 for key, value in fusion_losses.items():
-                    if 'ratio' in key:
-                        print(f"  🚪 {key:<20}: {value:.4f} ({value*100:.1f}%)")
-                    else:
-                        print(f"  📊 {key:<20}: {value:.4f}")
+                    print(f"  📊 {key:<30}: {value:.6f}")
                         
             # 显示其他统计
             if other_losses:

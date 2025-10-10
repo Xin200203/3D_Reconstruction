@@ -703,7 +703,19 @@ class LoadClipFeature(BaseTransform):
         if not os.path.exists(full_path):
             return None, None
         data = torch.load(full_path)
-        return data.get('pix', None), data.get('global', None)
+        
+        # 处理不同的数据格式
+        if isinstance(data, dict):
+            # 原始格式：字典包含 'pix' 和 'global'
+            return data.get('pix', None), data.get('global', None)
+        elif isinstance(data, torch.Tensor):
+            # 新格式：直接是60×80的特征张量 (512, 60, 80)
+            # 这就是我们需要的 'pix' 特征，没有 'global' 特征
+            return data, None
+        else:
+            # 未知格式
+            print(f"警告: 未知的CLIP特征格式: {type(data)} 在文件 {full_path}")
+            return None, None
 
     def transform(self, results: dict) -> dict:
         # Determine SV or MV
@@ -778,16 +790,26 @@ class LoadSingleImageFromFile(BaseTransform):
             
             results['imgs'] = [img]  # List format for batch compatibility
             
-            # Prepare cam_info with ScanNet defaults
+            # Prepare cam_info with intrinsics from PKL or defaults
             cam_info = {}
             
-            # ScanNet default intrinsics (fx, fy, cx, cy)
+            # 🔧 核心修复：完全忽略PKL中的内参，统一使用ScanNet标准内参
+            # 参考官方数据处理策略: load_scannet_sv_data_v2_fast.py 第152行
+            # 官方使用: unify_intrinsic = adjust_intrinsic(make_intrinsic(577.870605,577.870605,319.5,239.5), [640,480], unify_dim)
+            # 这解释了为什么不同场景有不同内参值 - 官方根本不使用场景特定内参！
+            
+            # ScanNet标准内参 (fx, fy, cx, cy) - 统一使用
             if self.dataset_type in ['scannet', 'scannet200']:
                 intrinsics = [577.870605, 577.870605, 319.5, 239.5]
             elif self.dataset_type == 'scenenn':
                 intrinsics = [544.47329, 544.47329, 320.0, 240.0]
             else:
                 intrinsics = [577.870605, 577.870605, 319.5, 239.5]  # fallback
+            
+            # 🔧 只在初始化时打印一次，避免重复日志
+            if not hasattr(self, '_intrinsics_logged'):
+                print(f"[LoadCamInfo] 使用固定标准内参: {intrinsics} (ScanNet官方策略)")
+                self._intrinsics_logged = True
             
             cam_info['intrinsics'] = intrinsics
             

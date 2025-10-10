@@ -136,7 +136,20 @@ class ScanNetMixedCriterion:
         
         loss = self.inst_criterion(pred, inst_gts, mask_pred_mode)
         loss.update(self.sem_criterion(pred, sem_gts))
+        
+        # 🔥 添加融合平衡损失：鼓励2D-3D特征平衡使用
+        fusion_balance_loss = self._get_fusion_balance_loss()
+        if fusion_balance_loss is not None:
+            loss['fusion_balance_loss'] = fusion_balance_loss * 0.1  # 权重0.1
+        
         return loss
+    
+    def _get_fusion_balance_loss(self):
+        """从BiFusionEncoder获取融合平衡损失"""
+        try:
+            return globals().get('_current_fusion_balance_loss', None)
+        except Exception as e:
+            return None
 
 
 @MODELS.register_module()

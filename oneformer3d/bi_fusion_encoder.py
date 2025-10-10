@@ -1,101 +1,32 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import open_clip
 import math
-import os
 import numpy as np
-from typing import List, Dict, Optional, Tuple, cast
+import contextlib
+from typing import List, Dict, Optional, Tuple, Union, cast
 
 import MinkowskiEngine as ME
 from mmdet3d.registry import MODELS
 from .mink_unet import Res16UNet34C
-from .tiny_sa import TinySAModule, TinySA2D
-from .clip_utils import (
-    freeze_clip_except_last_blocks as _freeze_clip_except_last_blocks,
-    build_uv_index as _build_uv_index,
-    sample_img_feat as _sample_img_feat
-)
 from types import SimpleNamespace
 
 
 class EnhancedProjectionHead3D(nn.Module):
-    """Enhanced 3D Projection Head: 96维 -> 256维的投影头
+    """简化的3D投影头：96维 -> 256维
     
-    按照优化脚本要求：1×1 SparseConv(96→256) + BN + ReLU → L2-Norm
+    按照优化指南要求：Linear(96→256) + LayerNorm
     """
     
     def __init__(self,
                  input_dim: int = 96,
-                 output_dim: int = 256,
-                 use_dropout: bool = True,
-                 dropout_rate: float = 0.1):
+                 output_dim: int = 256):
         super().__init__()
         
-        # 对应稀疏卷积的1×1卷积投影
+        # 简化投影：单层Linear + LayerNorm
         self.projection = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.BatchNorm1d(output_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate) if use_dropout else nn.Identity(),
-            nn.Linear(output_dim, output_dim),
-            nn.BatchNorm1d(output_dim)
-        )
-        
-        # 初始化权重
-        self._init_weights()
-    
-    def _init_weights(self):
-        """权重初始化"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 数值稳定性检查
-        if torch.any(torch.isnan(x)) or torch.any(torch.isinf(x)):
-            print("Warning: NaN/Inf in projection input, clamping")
-            x = torch.clamp(x, -10, 10)
-        """3D特征投影 (N, 96) -> (N, 256)"""
-        return self.projection(x)
-
-
-class EnhancedProjectionHead2D(nn.Module):
-    """Enhanced 2D Projection Head: 渐进式维度压缩
-    
-    按照优化脚本要求：LayerNorm(768) → GELU → Linear(768→512) → GELU → Linear(512→256)
-    """
-    
-    def __init__(self,
-                 input_dim: int = 768,
-                 hidden_dim: int = 512,
-                 output_dim: int = 256,
-                 use_dropout: bool = True,
-                 dropout_rate: float = 0.1):
-        super().__init__()
-        
-        self.projection = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.GELU(),
-            nn.Linear(input_dim, hidden_dim),
-            nn.Dropout(dropout_rate) if use_dropout else nn.Identity(),
-            nn.GELU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-        
-        # 空间特征投影 (for spatial features)
-        self.spatial_projection = nn.Sequential(
-            nn.Conv2d(input_dim, hidden_dim, kernel_size=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.GELU(),
-            nn.Dropout2d(dropout_rate) if use_dropout else nn.Identity(),
-            nn.Conv2d(hidden_dim, output_dim, kernel_size=1),
-            nn.BatchNorm2d(output_dim)
+            nn.Linear(input_dim, output_dim),        # 融合特征
+            nn.LayerNorm(output_dim)
         )
         
         # 初始化权重
@@ -108,220 +39,96 @@ class EnhancedProjectionHead2D(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
     
-    def forward_global(self, x: torch.Tensor) -> torch.Tensor:
-        """全局特征投影 (B, 768) -> (B, 256)"""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """3D特征投影 (N, 96) -> (N, 256)"""
+        # 数值稳定性检查
+        if torch.any(torch.isnan(x)) or torch.any(torch.isinf(x)):
+            print("Warning: NaN/Inf in 3D projection input, clamping")
+            x = torch.clamp(x, -10, 10)
         return self.projection(x)
-    
-    def forward_spatial(self, x: torch.Tensor) -> torch.Tensor:
-        """空间特征投影 (B, 768, H, W) -> (B, 256, H, W)"""
-        return self.spatial_projection(x)
 
 
-def build_geo_pe(xyz_world: torch.Tensor, bbox_size: torch.Tensor,
-                 pose_delta: torch.Tensor, height: torch.Tensor) -> torch.Tensor:
-    """Assemble 64-d geometric positional encoding.
-    xyz_world: (N,3) world coordinates
-    bbox_size: (N,3) w,h,l
-    pose_delta: (9,) repeat to N (R6 + t3)
-    height: (N,1)
-    return: (N,64)
-    """
-    N = xyz_world.shape[0]
-    # base 3
-    feats = [xyz_world]
-    # sin/cos 48d (8 freq per axis)
-    freq = torch.pow(2, torch.arange(8, device=xyz_world.device, dtype=xyz_world.dtype)) * math.pi
-    sin_list = []
-    for f in freq:
-        sin_list.append(torch.sin(xyz_world * f))
-        sin_list.append(torch.cos(xyz_world * f))
-    feats.append(torch.cat(sin_list, dim=-1))  # (N,3*2*8)
-    feats.append(bbox_size)  # 3
-    feats.append(pose_delta.unsqueeze(0).repeat(N, 1))  # 9
-    feats.append(height)  # 1
-    return torch.cat(feats, dim=-1)  # (N,64)
-
-
-class EnhancedCLIPEncoder(nn.Module):
-    """改进的CLIP编码器，使用前几层Transformer blocks"""
-    
-    def __init__(self,
-                 clip_pretrained: str = 'openai',
-                 num_layers: int = 6,
-                 freeze_conv1: bool = False,
-                 freeze_early_layers: bool = True,
-                 target_resolution: int = 224):
+class MaskedSE1D(nn.Module):
+    """掩码化SE模块 - 只统计有效点的通道均值"""
+    def __init__(self, C, r=16):
         super().__init__()
-        
-        # 🔧 优先使用本地CLIP权重 - 避免网络依赖
-        local_weight_path = '/home/nebula/xxy/ESAM/data/open_clip_pytorch_model.bin'
-        
-        try:
-            # 方案1：如果传入了本地文件路径，直接使用
-            if os.path.exists(clip_pretrained):
-                print(f"✅ 使用指定的本地CLIP权重: {clip_pretrained}")
-                self.clip_model, _, self.clip_transform = open_clip.create_model_and_transforms(
-                    'ViT-B-16', pretrained=clip_pretrained
-                )
-            # 方案2：如果有预设的本地权重文件，优先使用
-            elif os.path.exists(local_weight_path):
-                print(f"✅ 使用预设的本地CLIP权重: {local_weight_path}")
-                # 先创建模型结构，然后加载权重
-                self.clip_model, _, self.clip_transform = open_clip.create_model_and_transforms(
-                    'ViT-B-16', pretrained=None
-                )
-                # 手动加载本地权重
-                state_dict = torch.load(local_weight_path, map_location='cpu')
-                # 处理可能的键名不匹配问题
-                if 'model' in state_dict:
-                    state_dict = state_dict['model']
-                self.clip_model.load_state_dict(state_dict, strict=False)
-                print(f"✅ 本地CLIP权重加载成功")
-            # 方案3：回退到网络下载（如果本地权重不可用）
-            else:
-                print(f"🌐 本地权重不可用，尝试网络下载: {clip_pretrained}")
-                self.clip_model, _, self.clip_transform = open_clip.create_model_and_transforms(
-                    'ViT-B-16', pretrained=clip_pretrained
-                )
-        except Exception as e:
-            print(f"⚠️  CLIP权重加载失败: {e}")
-            # 最终回退：使用随机初始化
-            print("🔄 回退到随机初始化的CLIP模型")
-            self.clip_model, _, self.clip_transform = open_clip.create_model_and_transforms(
-                'ViT-B-16', pretrained=None
-            )
-        
-        self.clip_visual = self.clip_model.visual
-        self.num_layers = num_layers
-        self.target_resolution = target_resolution
-        
-        # 智能冻结策略
-        self._setup_freezing(freeze_conv1, freeze_early_layers)
-        
-        # 改进的2D投影头：渐进式维度压缩 768->512->256
-        self.enhanced_proj_2d = EnhancedProjectionHead2D(
-            input_dim=768,
-            hidden_dim=512,
-            output_dim=256,
-            use_dropout=True,
-            dropout_rate=0.1
+        self.excite = nn.Sequential(
+            nn.Conv1d(C, C//r, 1), nn.ReLU(),
+            nn.Conv1d(C//r, C, 1), nn.Sigmoid()
         )
-        
-    def _setup_freezing(self, freeze_conv1: bool, freeze_early_layers: bool):
-        """智能冻结策略"""
-        for name, param in self.clip_visual.named_parameters():
-            if 'conv1' in name:
-                param.requires_grad = not freeze_conv1
-            elif 'positional_embedding' in name or 'class_embedding' in name:
-                param.requires_grad = not freeze_conv1
-            elif 'ln_pre' in name:
-                param.requires_grad = not freeze_conv1
-            elif 'transformer.resblocks' in name:
-                layer_idx = int(name.split('.')[2])
-                if freeze_early_layers and layer_idx < 3:
-                    param.requires_grad = False
-                elif layer_idx < self.num_layers:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
-            else:
-                param.requires_grad = False
-                
-        # 打印冻结状态
-        total_params = sum(p.numel() for p in self.clip_visual.parameters())
-        trainable_params = sum(p.numel() for p in self.clip_visual.parameters() if p.requires_grad)
-        print(f"Enhanced CLIP: {trainable_params:,}/{total_params:,} "
-              f"参数可训练 ({trainable_params/total_params*100:.1f}%)")
     
-    def forward(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """前向传播"""
-        B = images.shape[0]
-        
-        # Resize到CLIP标准尺寸
-        if images.shape[-2:] != (self.target_resolution, self.target_resolution):
-            images = F.interpolate(images, size=(self.target_resolution, self.target_resolution), 
-                                 mode='bilinear', align_corners=False)
-        
-        # Patch embedding
-        x = self.clip_visual.conv1(images)  # (B, 768, 14, 14)
-        spatial_raw = x
-        
-        # Reshape for transformer
-        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)  # (B, 196, 768)
-        
-        # Add class token and positional embedding
-        class_token = self.clip_visual.class_embedding.to(x.dtype) + torch.zeros(
-            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+    def forward(self, x, valid_mask): 
+        # x: (B, C, N), valid_mask: (B, N)
+        m = valid_mask.unsqueeze(1).float()             # (B,1,N)
+        s = (x * m).sum(-1, keepdim=True)               # (B,C,1)  有效点的通道求和
+        cnt = m.sum(-1, keepdim=True).clamp_min(1.0)    # (B,1,1)  有效点计数
+        z = s / cnt                                     # (B,C,1)  掩码化均值
+        w = self.excite(z)                              # (B,C,1)
+        return x * w                                    # 通道重加权
+
+
+class Head(nn.Module):
+    """统一的Head结构 - 2D/3D分支对称使用"""
+    def __init__(self, dim=256, hidden=256, p=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(p),
+            nn.Linear(hidden, dim),
+            nn.LayerNorm(dim)
         )
-        x = torch.cat([class_token, x], dim=1)  # (B, 197, 768)
-        x = x + self.clip_visual.positional_embedding.to(x.dtype)
-        x = self.clip_visual.ln_pre(x)
-        
-        # 通过前num_layers层Transformer
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        # 使用 type: ignore 来处理CLIP内部结构的类型检查问题
-        for i in range(self.num_layers):
-            x = self.clip_visual.transformer.resblocks[i](x)  # type: ignore
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        
-        # 重建空间特征
-        patch_tokens = x[:, 1:, :].permute(0, 2, 1).reshape(B, 768, 14, 14)
-        fused_spatial = patch_tokens + spatial_raw  # 残差连接
-        spatial_feat = self.enhanced_proj_2d.forward_spatial(fused_spatial)  # (B, 256, 14, 14)
-        
-        # 全局特征
-        cls_token = x[:, 0, :]  # (B, 768)
-        global_feat = self.enhanced_proj_2d.forward_global(cls_token)  # (B, 256)
-        
-        # L2归一化到单位球面 (按照优化脚本要求)
-        global_feat = F.normalize(global_feat, dim=-1)
-        # 对空间特征的每个位置进行L2归一化
-        B, C, H, W = spatial_feat.shape
-        spatial_feat = F.normalize(spatial_feat.view(B, C, -1), dim=1).view(B, C, H, W)
-        
-        return spatial_feat, global_feat
+    def forward(self, x):
+        return self.net(x)
 
 
 class LiteFusionGate(nn.Module):
     """Lite Fusion Gate - 轻量级融合门控机制
     
-    按照优化脚本要求：点级融合 + 通道级SE注意力
+    简化版本：点级融合 + 掩码化SE通道注意力，移除分阶段训练逻辑
     参数量约0.12M，远低于原EnhancedGate
     """
     
     def __init__(self, 
                  feat_dim: int = 256,
-                 early_steps: int = 3000):
+                 use_masked_se: bool = True):
         super().__init__()
         
         self.feat_dim = feat_dim
-        self.early_steps = early_steps
-        self.training_step = 0
+        self.use_masked_se = use_masked_se
         
-        # 点级融合权重MLP: Linear(512→64→1) + Sigmoid
+        # 点级融合权重MLP: 添加LayerNorm确保特征稳定性
         self.point_mlp = nn.Sequential(
             nn.Linear(feat_dim * 2, 64),  # 256*2 -> 64
+            nn.LayerNorm(64),  # 添加归一化层
             nn.ReLU(),
+            nn.Dropout(0.1),   # 添加少量dropout防止过拟合
             nn.Linear(64, 1),
             nn.Sigmoid()
         )
         
-        # SE通道注意力模块
-        self.se_module = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Conv1d(feat_dim, feat_dim // 16, 1),
-            nn.ReLU(),
-            nn.Conv1d(feat_dim // 16, feat_dim, 1),
-            nn.Sigmoid()
-        )
+        # 🔧 调整初始化：bias设为正值，鼓励更多使用2D特征
+        nn.init.constant_(self.point_mlp[-2].bias, 1.0)  # 初始偏向2D特征
         
-        # 早期冻结：前3000步α固定为0.5
-        self.register_buffer('frozen_alpha', torch.tensor(0.5))
+        # 🔧 同时调整权重初始化，使用较小的权重避免梯度消失  
+        # 只初始化Linear层的权重
+        for module in self.point_mlp:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.5)
+        
+        # 掩码化SE通道注意力模块
+        if use_masked_se:
+            self.se_masked = MaskedSE1D(feat_dim, r=16)
+        else:
+            # 原版SE模块（备用）
+            self.se_module = nn.Sequential(
+                nn.AdaptiveAvgPool1d(1),
+                nn.Conv1d(feat_dim, feat_dim // 16, 1),
+                nn.ReLU(),
+                nn.Conv1d(feat_dim // 16, feat_dim, 1),
+                nn.Sigmoid()
+            )
         
     def forward(self, 
                 f2d: torch.Tensor, 
@@ -338,362 +145,75 @@ class LiteFusionGate(nn.Module):
         """
         B, N, C = f2d.shape
         
-        # 1. 计算点级融合权重α
-        if self.training and self.training_step < self.early_steps:
-            # 早期冻结阶段：α = 0.5
-            alpha_raw = self.frozen_alpha.expand(B, N, 1)
-        else:
-            # 正常训练阶段：α = σ(MLP([f₂D‖f₃D]))
-            feat_concat = torch.cat([f2d, f3d], dim=-1)  # (B, N, 512)
-            alpha_raw = self.point_mlp(feat_concat)  # (B, N, 1)
+        # 1. 特征标准化：确保2D和3D特征在相同数值范围
+        f2d_norm = F.normalize(f2d, dim=-1, p=2)  # L2归一化
+        f3d_norm = F.normalize(f3d, dim=-1, p=2)  # L2归一化
         
-        # 2. 应用有效掩码调整：α = α*valid + 0.1*(1-valid)
+        # 2. 计算点级融合权重α
+        feat_concat = torch.cat([f2d_norm, f3d_norm], dim=-1)  # (B, N, 512)
+        alpha_raw = self.point_mlp(feat_concat)  # (B, N, 1)
+        
+        # 2. 应用有效掩码调整：改进invalid点处理策略
         valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, N, 1)
-        alpha = alpha_raw * valid_mask_expanded + 0.1 * (1 - valid_mask_expanded)
         
-        # 3. 点级融合：f_mix = α·f₂D + (1-α)·f₃D
-        f_mix = alpha * f2d + (1 - alpha) * f3d  # (B, N, 256)
+        # 🔧 改进：对invalid点使用更智能的fallback策略
+        # 如果大部分点都invalid，说明投影质量差，应该更多依赖3D
+        valid_ratio = valid_mask.float().mean(dim=1, keepdim=True)  # (B, 1)
         
-        # 4. SE通道重加权：w = σ(SE(f_mix))
-        # 调整维度适配SE模块：(B, N, C) -> (B, C, N)
-        f_mix_transposed = f_mix.permute(0, 2, 1)  # (B, 256, N)
-        se_weights = self.se_module(f_mix_transposed)  # (B, 256, 1)
-        se_weights = se_weights.permute(0, 2, 1)  # (B, 1, 256)
+        # 动态调整fallback权重：投影质量好时用更多2D特征
+        fallback_alpha = 0.3 * valid_ratio.unsqueeze(-1)  # (B, 1, 1) -> (B, N, 1)
+        alpha = torch.where(valid_mask_expanded.bool(), alpha_raw, fallback_alpha)
         
-        # 5. 应用SE权重：fused = w⊙f_mix
-        fused_feat = se_weights * f_mix  # (B, N, 256)
+        # 3. 点级融合：f_mix = α·f₂D + (1-α)·f₃D  
+        # 使用归一化后的特征进行融合
+        f_mix = alpha * f2d_norm + (1 - alpha) * f3d_norm  # (B, N, 256)
+        
+        # 4. 掩码化SE通道重加权
+        f_mix_t = f_mix.permute(0, 2, 1)  # (B, 256, N)
+        if self.use_masked_se:
+            fused_t = self.se_masked(f_mix_t, valid_mask)  # (B, 256, N)
+        else:
+            # 回退到原版SE
+            se_weights = self.se_module(f_mix_t)  # (B, 256, 1)
+            fused_t = se_weights * f_mix_t  # (B, 256, N)
+        fused_feat = fused_t.permute(0, 2, 1)  # (B, N, 256)
         
         # 返回融合特征和置信度
         confidence = alpha  # 融合权重可作为置信度
         
-        # 收集融合统计信息（如果启用）
-        if hasattr(self, "collect_stats") and self.collect_stats:
-            fusion_2d_ratio = alpha.mean().item()
-            fusion_3d_ratio = (1 - alpha).mean().item()
-            avg_confidence = confidence.mean().item()
-            valid_points_ratio = valid_mask.float().mean().item()
-            
-            # 可以通过全局变量或日志记录这些统计信息
-            if not hasattr(self, "_stats_buffer"):
-                self._stats_buffer = []
-            self._stats_buffer.append({
-                "fusion_2d_ratio": fusion_2d_ratio,
-                "fusion_3d_ratio": fusion_3d_ratio,
-                "avg_confidence": avg_confidence,
-                "valid_points_ratio": valid_points_ratio
-            })
         return fused_feat, confidence
     
-    def update_training_step(self, step: int):
-        """更新训练步数"""
-        self.training_step = step
-
-
-class EnhancedFusionGate(nn.Module):
-    """增强的融合Gate机制"""
-    
-    def __init__(self, 
-                 feat_dim: int = 96,
-                 use_spatial_attention: bool = True,
-                 spatial_k: int = 16):
-        super().__init__()
+    def compute_fusion_balance_loss(self, alpha: torch.Tensor, valid_mask: torch.Tensor, 
+                                   target_ratio: float = 0.4) -> torch.Tensor:
+        """计算融合平衡损失，鼓励合理的2D-3D融合比例
         
-        self.feat_dim = feat_dim
-        self.use_spatial_attention = use_spatial_attention
-        self.spatial_k = spatial_k
-        
-        # 基础Gate
-        self.base_gate = nn.Sequential(
-            nn.Linear(feat_dim * 2, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-        # 空间注意力模块
-        if use_spatial_attention:
-            self.spatial_attn = nn.Sequential(
-                nn.Conv1d(feat_dim * 2, 64, 1),
-                nn.ReLU(),
-                nn.Conv1d(64, 64, 1),
-                nn.ReLU(),
-                nn.Conv1d(64, 1, 1),
-                nn.Sigmoid()
-            )
-        
-        # 几何一致性模块
-        self.geo_encoder = nn.Sequential(
-            nn.Linear(6, 32),  # xyz + normal
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU()
-        )
-        
-        self.consistency_mlp = nn.Sequential(
-            nn.Linear(feat_dim * 2 + 16, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-        # Gate融合
-        num_gates = 2 if use_spatial_attention else 1
-        self.gate_fusion = nn.Sequential(
-            nn.Linear(num_gates + 1, 16),  # base + spatial + geometry
-            nn.ReLU(),
-            nn.Linear(16, 1),
-            nn.Sigmoid()
-        )
-        
-        # 置信度预测
-        self.confidence_mlp = nn.Sequential(
-            nn.Linear(feat_dim * 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-    
-    def _estimate_normals(self, xyz: torch.Tensor, k: int = 8) -> torch.Tensor:
-        """简单的法向量估计"""
-        N = xyz.shape[0]
-        device = xyz.device
-        
-        with torch.no_grad():
-            dist = torch.cdist(xyz, xyz)
-            _, knn_idx = torch.topk(dist, k+1, dim=1, largest=False)
-            knn_idx = knn_idx[:, 1:]  # 去掉自己
-        
-        neighbors = xyz[knn_idx]  # (N, k, 3)
-        center = xyz.unsqueeze(1)  # (N, 1, 3)
-        centered = neighbors - center  # (N, k, 3)
-        cov = torch.bmm(centered.transpose(1, 2), centered)  # (N, 3, 3)
-        
-        try:
-            eigenvalues, eigenvectors = torch.linalg.eigh(cov)
-            normals = eigenvectors[:, :, 0]  # 最小特征值对应的向量
-        except:
-            normals = torch.randn(N, 3, device=device)
-        
-        normals = F.normalize(normals, dim=1)
-        return normals
-    
-    def forward(self, 
-                f2d: torch.Tensor, 
-                f3d: torch.Tensor,
-                xyz: torch.Tensor,
-                valid_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
         Args:
-            f2d: (N, C) 2D特征
-            f3d: (N, C) 3D特征
-            xyz: (N, 3) 3D坐标
-            valid_mask: (N,) 投影有效性
+            alpha: 融合权重 (B, N, 1)
+            valid_mask: 有效掩码 (B, N)
+            target_ratio: 目标2D特征比例，默认0.4（略偏向3D）
             
         Returns:
-            fused_feat: (N, C) 融合特征
-            confidence: (N, 1) 融合置信度
+            balance_loss: 标量损失值
         """
-        N, C = f2d.shape
-        
-        # 基础Gate
-        base_input = torch.cat([f2d, f3d], dim=1)
-        base_gate = self.base_gate(base_input)  # (N, 1)
-        
-        gates = [base_gate]
-        
-        # 空间注意力Gate
-        if self.use_spatial_attention:
-            with torch.no_grad():
-                dist = torch.cdist(xyz, xyz)
-                _, knn_idx = torch.topk(dist, self.spatial_k, dim=1, largest=False)
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=alpha.device, requires_grad=True)
             
-            f2d_neighbors = f2d[knn_idx]  # (N, k, C)
-            f3d_neighbors = f3d[knn_idx]  # (N, k, C)
-            f2d_local = f2d_neighbors.mean(dim=1)  # (N, C)
-            f3d_local = f3d_neighbors.mean(dim=1)  # (N, C)
-            
-            fusion_input = torch.cat([f2d + f2d_local, f3d + f3d_local], dim=1)  # (N, 2C)
-            fusion_input = fusion_input.unsqueeze(0).transpose(1, 2)  # (1, 2C, N)
-            spatial_gate = self.spatial_attn(fusion_input).transpose(1, 2).squeeze(0)  # (N, 1)
-            gates.append(spatial_gate)
+        # 只考虑有效点的融合比例
+        valid_alpha = alpha[valid_mask.unsqueeze(-1).expand_as(alpha)]
         
-        # 几何一致性Gate (不受valid_mask影响，仅作为几何先验)
-        normals = self._estimate_normals(xyz)
-        geo_feat = torch.cat([xyz, normals], dim=1)  # (N, 6)
-        geo_encoded = self.geo_encoder(geo_feat)  # (N, 16)
-        consistency_input = torch.cat([f2d, f3d, geo_encoded], dim=1)
-        geometry_gate = self.consistency_mlp(consistency_input)  # (N, 1)
-        # 几何Gate不受valid_mask直接影响，而是作为几何先验
-        gates.append(geometry_gate)
+        if valid_alpha.numel() == 0:
+            return torch.tensor(0.0, device=alpha.device, requires_grad=True)
         
-        # 融合多个Gate
-        gate_concat = torch.cat(gates, dim=1)  # (N, num_gates)
-        final_gate = self.gate_fusion(gate_concat)  # (N, 1)
+        # 计算当前2D特征平均比例
+        current_ratio = valid_alpha.mean()
         
-        # 应用有效性约束 - 这里才考虑valid_mask
-        valid_weight = valid_mask.float().unsqueeze(1)
-        # 对于无效投影点，使用较小的2D权重但不完全清零
-        final_gate = final_gate * valid_weight + final_gate * 0.1 * (1 - valid_weight)
+        # L2损失鼓励接近目标比例
+        balance_loss = F.mse_loss(current_ratio, torch.tensor(target_ratio, device=alpha.device))
         
-        # 特征融合
-        fused_feat = final_gate * f2d + (1 - final_gate) * f3d
-        
-        # 置信度估计
-        confidence = self.confidence_mlp(base_input)
-        # 置信度受valid_mask影响，无效点置信度较低
-        confidence = confidence * (valid_weight * 0.9 + 0.1)  # 最低保持10%置信度
-        
-        # 收集融合统计信息（如果启用）
-        if hasattr(self, "collect_stats") and self.collect_stats:
-            fusion_2d_ratio = final_gate.mean().item()
-            fusion_3d_ratio = (1 - final_gate).mean().item()
-            avg_confidence = confidence.mean().item()
-            valid_points_ratio = valid_mask.float().mean().item()
-            
-            # 可以通过全局变量或日志记录这些统计信息
-            if not hasattr(self, "_stats_buffer"):
-                self._stats_buffer = []
-            self._stats_buffer.append({
-                "fusion_2d_ratio": fusion_2d_ratio,
-                "fusion_3d_ratio": fusion_3d_ratio,
-                "avg_confidence": avg_confidence,
-                "valid_points_ratio": valid_points_ratio
-            })
-        return fused_feat, confidence
+        return balance_loss
 
 
-class FiLMModulation(nn.Module):
-    """FiLM调制机制 - 几何位置编码注入
-    
-    按照优化脚本要求：Linear(64→128) + SiLU + Linear(128→512) → γ, β (各256)
-    FiLM: (1+γ) ⊙ feat + β 同时作用于 f₂D, f₃D
-    """
-    
-    def __init__(self, 
-                 pe_dim: int = 64,
-                 hidden_dim: int = 128,
-                 feat_dim: int = 256):
-        super().__init__()
-        
-        self.feat_dim = feat_dim
-        
-        # PE到FiLM参数的映射
-        self.pe_to_film = nn.Sequential(
-            nn.Linear(pe_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, feat_dim * 2)  # γ + β
-        )
-        
-        # 初始化：γ接近0（保持原特征），β接近0（不增加偏置）
-        self._init_weights()
-    
-    def _init_weights(self):
-        """初始化权重：确保初始时FiLM调制接近恒等变换"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-        
-        # 最后一层的γ部分初始化为小值，β部分初始化为0
-        with torch.no_grad():
-            final_layer = self.pe_to_film[-1]
-            # 前半部分是γ，后半部分是β
-            final_layer.weight.data[:self.feat_dim] *= 0.01  # γ接近0
-            final_layer.weight.data[self.feat_dim:] *= 0.01  # β接近0
-    
-    def forward(self, features: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            features: 输入特征 (B, N, feat_dim) 或 (N, feat_dim)
-            pe: 位置编码 (B, N, pe_dim) 或 (N, pe_dim)
-        Returns:
-            调制后的特征 (与输入形状相同)
-        """
-        # 获取FiLM参数
-        film_params = self.pe_to_film(pe)  # (..., feat_dim*2)
-        
-        # 分离γ和β
-        gamma, beta = torch.chunk(film_params, 2, dim=-1)  # 各自 (..., feat_dim)
-        
-        # 应用FiLM调制: (1+γ) ⊙ feat + β
-        modulated_features = (1 + gamma) * features + beta
-        
-        return modulated_features
-
-
-# 注册到 MMEngine MODELS，便于在配置中直接引用
-@MODELS.register_module()
-class TinySANeck(nn.Module):
-    """Two-layer Tiny Self-Attention neck implemented by stacking TinySAModule.
-
-    Args:
-        dim (int): feature dimension.
-        num_heads (int): number of attention heads for each TinySA layer.
-        radius (float): ball query radius.
-        max_k (int): max neighbours per center.
-        sample_ratio (float): ratio of sampled center points.
-        num_layers (int): number of TinySA layers to stack. Default 2 as in paper spec.
-    """
-    def __init__(self,
-                 dim: int = 128,
-                 num_heads: int = 4,
-                 radius: float = 0.3,
-                 max_k: int = 32,
-                 sample_ratio: float = 0.25,
-                 num_layers: int = 2):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            TinySAModule(dim=dim,
-                          num_heads=num_heads,
-                          radius=radius,
-                          max_k=max_k,
-                          sample_ratio=sample_ratio)
-            for _ in range(num_layers)
-        ])
-
-    def forward(self, x, feats: Optional[torch.Tensor] = None, voxel_size: float = 0.02):
-        """Forward 支持两种输入：
-
-        1. `x` 为 MinkowskiEngine SparseTensor（来自 3D Backbone）。
-        2. `x` 为 (N,3) xyz 坐标张量，需同时传入 `feats` (N,C)。
-        返回与输入类型一致的数据结构。
-        """
-        import MinkowskiEngine as ME  # 避免循环依赖
-
-        # Case 1: SparseTensor
-        if isinstance(x, ME.SparseTensor):
-            sp_tensor = x
-            xyz = sp_tensor.coordinates[:, 1:].float() * voxel_size  # 去掉批索引
-            feats_in = sp_tensor.features
-            updated_feats = self._apply_sa(xyz, feats_in)
-            return ME.SparseTensor(
-                updated_feats,
-                coordinate_map_key=sp_tensor.coordinate_map_key,
-                coordinate_manager=sp_tensor.coordinate_manager)
-
-        # Case 2: xyz + feats
-        if feats is None:
-            raise ValueError('When first argument is xyz Tensor, feats must not be None.')
-        return self._apply_sa(x, feats)
-
-    # === 新增内部函数：统一执行 TinySA 堆叠 ===
-    def _apply_sa(self, xyz: torch.Tensor, feats: torch.Tensor):
-        """Apply stacked TinySA layers.
-
-        Args:
-            xyz (Tensor): (N,3) coordinates.
-            feats (Tensor): (N,C) features.
-        Returns:
-            Tensor: (N,C) updated features.
-        """
-        for sa in self.layers:
-            feats = sa(xyz, feats)
-        return feats
+# Remove FiLM and PE modules - they are no longer used in simplified architecture
 
 
 @MODELS.register_module()
@@ -701,121 +221,202 @@ class BiFusionEncoder(nn.Module):
     """Enhanced Bi-Fusion Encoder combining 2D CLIP visual features and 3D Sparse features."""
 
     def __init__(self,
-                 clip_pretrained: str = 'openai',
                  voxel_size: float = 0.02,
-                 freeze_blocks: int = 0,  # 控制CLIP冻结层数
                  use_amp: bool = True,
-                 use_tiny_sa_2d: bool = False,
-                 # Enhanced CLIP配置
-                 clip_num_layers: int = 6,
-                 freeze_clip_conv1: bool = False,
-                 freeze_clip_early_layers: bool = True,
-                 # Enhanced Gate配置
-                 use_enhanced_gate: bool = True,
-                 use_spatial_attention: bool = True,
-                 spatial_k: int = 16,
-                 # TinySA控制
-                 use_tiny_sa_3d: bool = False,  # 新增参数控制是否使用TinySA
+                 # 🎯 特征域配置（简化为仅支持60×80预计算）
+                 feat_space: str = "precomp_60x80",      # 固定为预计算特征
+                 use_precomp_2d: bool = True,            # 默认启用预计算特征
                  # 调试模式控制
-                 debug: bool = False):  # 控制调试信息输出
+                 debug: bool = False,
+                 **kwargs):  # 接收其他未知参数
         super().__init__()
         
-        # Enhanced CLIP编码器
-        self.enhanced_clip = EnhancedCLIPEncoder(
-            clip_pretrained=clip_pretrained,
-            num_layers=clip_num_layers,
-            freeze_conv1=freeze_clip_conv1,
-            freeze_early_layers=freeze_clip_early_layers
-        )
+        # 🎯 特征域配置
+        self.feat_space = feat_space
+        self.use_precomp_2d = use_precomp_2d
+        self.debug = debug
+
+        # 🎯 根据特征域设置（简化，只支持60×80预计算）
+        if feat_space != "precomp_60x80":
+            print(f"警告: 当前仅支持precomp_60x80特征域，自动切换到precomp_60x80")
+            feat_space = "precomp_60x80"
         
-        # 2D特征处理
-        self.lin2d = nn.Sequential(nn.Linear(256, 256), nn.ReLU())
-        self.ln2d = nn.LayerNorm(256)
+        # 删除Enhanced CLIP编码器（不再需要）
+        # self.enhanced_clip = None
         
         # 3D encoder - 保持原始96维以兼容预训练权重，然后使用投影头到256维
         cfg_backbone = SimpleNamespace(dilations=[1, 1, 1, 1], bn_momentum=0.02, conv1_kernel_size=5)
         self.backbone3d = Res16UNet34C(in_channels=3, out_channels=96, config=cfg_backbone, D=3)
         
-        # 3D投影头：96维 -> 256维 (替代简单的适配层)
+        # 3D投影头：96维 -> 256维（简化版本）
         self.proj_3d = EnhancedProjectionHead3D(
             input_dim=96,
-            output_dim=256,
-            use_dropout=True,
-            dropout_rate=0.1
+            output_dim=256
         )
         
-        # 条件性地使用TinySA或简单的线性层 - 在投影后的256维上操作
-        self.use_tiny_sa_3d = use_tiny_sa_3d
+        # 统一的Head结构（2D/3D对称）
+        self.head3d = Head(256, 256, p=0.1)
+        self.head2d = Head(256, 256, p=0.1)
         
-        if use_tiny_sa_3d:
-            # 使用TinySA（如果明确启用）
-            self.tiny_sa_neck = TinySANeck(dim=256, num_heads=8, radius=0.3, max_k=32, sample_ratio=0.25, num_layers=2)
-        else:
-            # 使用简单的线性层替代TinySA
-            self.simple_neck = nn.Sequential(
-                nn.Linear(256, 256),
-                nn.ReLU(),
-                nn.LayerNorm(256),
-                nn.Linear(256, 256),
-                nn.ReLU(),
-                nn.LayerNorm(256)
-            )
-            
-        # 3D特征最终处理层（在256维上操作）
-        self.lin3d = nn.Sequential(nn.Linear(256, 256), nn.ReLU())
-        self.ln3d = nn.LayerNorm(256)
+        # 融合机制：使用掩码化SE的LiteFusionGate      
+        self.fusion_gate = LiteFusionGate(
+            feat_dim=256,
+            use_masked_se=True
+        )
+        
+        # 🎯 预计算特征适配器（惰性初始化）
+        self.precomp_adapter = None
+        
+        # 🎯 Alpha回退值（可学习参数）
+        
+        # 🎯 损失历史记录（用于抖动分析）
+        from collections import deque
+        self._loss_hist = deque(maxlen=100)
 
-        # PE mapping with FiLM modulation
-        self.pe_mlp = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
-        self.film_modulation = FiLMModulation(pe_dim=64, hidden_dim=128, feat_dim=256)
-        
-        # 特征对齐 - 调整维度以匹配256维输出（不再需要PE拼接，因为使用FiLM调制）
-        self.lin2d_final = nn.Linear(256, 256)  # 256 -> 256 (移除PE拼接)
-        self.lin3d_final = nn.Linear(256, 256)  # 256 -> 256 (移除PE拼接)
-
-        # 融合机制选择：优先使用LiteFusionGate
-        self.use_enhanced_gate = use_enhanced_gate
-        self.use_lite_gate = True  # 默认使用轻量级门控
-        
-        if self.use_lite_gate:
-            # 使用轻量级LiteFusionGate
-            self.fusion_gate = LiteFusionGate(
-                feat_dim=256,
-                early_steps=3000
-            )
-        elif use_enhanced_gate:
-            self.fusion_gate = EnhancedFusionGate(
-                feat_dim=256,
-                use_spatial_attention=use_spatial_attention,
-                spatial_k=spatial_k
-            )
-        else:
-            # 回退到简单Gate - 调整输入维度以匹配256维特征
-            self.gate_mlp = nn.Sequential(
-                nn.Linear(512, 128),  # 256*2 -> 128
-                nn.ReLU(),
-                nn.Linear(128, 1),
-                nn.Sigmoid()
-            )
-        
+        # 基本运行/调试开关和统计结构
         self.voxel_size = voxel_size
         self.use_amp = use_amp
-        self.debug = debug  # 保存调试模式设置
+        self.use_lite_gate = True
         
-        # 🔍 统计信息收集配置
-        self._collect_fusion_stats = debug   # 基于调试模式启用融合统计收集
-        self._collect_gradient_stats = debug  # 基于调试模式启用梯度统计收集
-        self._fusion_stats = {}  # 存储融合统计信息
-        self._stats_history = []  # 历史统计信息
+        # 🎯 标准分辨率与内参配置
+        self.W0, self.H0 = 640, 480
+        self.standard_scannet_intrinsics = (577.870605, 577.870605, 319.5, 239.5)
+        self.warn_valid_ratio = 0.60   # 🔧 进一步降低阈值，减少干扰信息
+        self.align_corners = True  # 🚨 修复：与测试脚本的直接索引采样保持一致
+        self.max_depth = 20.0
+        
+        # 🔧 关键修复：禁用外参自动推断，统一使用确定性处理
+        self.auto_pose = False  # 强制禁用，按优化指南要求
+        self._pose_pick_stats = {'direct': 0, 'inv': 0}
+        # 🔧 修复：始终收集融合统计，方便训练监控
+        self._collect_fusion_stats = True  # 始终启用，便于监控融合效果
+        self._collect_gradient_stats = debug  # 梯度统计仍然受debug控制
+        self._fusion_stats = {}
+        self._stats_history = []
 
-    def update_training_step(self, step: int):
-        """更新训练步数，用于LiteFusionGate的早期冻结策略"""
-        if self.use_lite_gate and hasattr(self.fusion_gate, 'update_training_step'):
-            self.fusion_gate.update_training_step(step)
+    def _intrinsics_for_feat(self, Hf: int, Wf: int):
+        """统一内参换算函数 - 使用正确的ScanNet内参计算
+        Args:
+            Hf: 特征图高度 (H)
+            Wf: 特征图宽度 (W)
+        Returns:
+            tuple: (fx_feat, fy_feat, cx_feat, cy_feat)
+        """
+        fx0, fy0, cx0, cy0 = self.standard_scannet_intrinsics
+        # 输出特征尺寸 - 仅debug模式
+        if self.debug:
+            print(f"🎯 计算特征内参: 特征图尺寸=({Hf},{Wf}) - H×W格式")
+
+        # 🔧 修正：确保缩放方向正确
+        # 原始ScanNet: 640×480 (W×H)
+        # 特征图: Wf×Hf
+        scale_w = Wf / 640.0  # 宽度缩放
+        scale_h = Hf / 480.0  # 高度缩放
+
+        # 内参缩放：保持x/y方向对应关系
+        fx_feat = fx0 * scale_w  # x方向焦距随宽度缩放
+        fy_feat = fy0 * scale_h  # y方向焦距随高度缩放
+        cx_feat = cx0 * scale_w  # x方向主点随宽度缩放
+        cy_feat = cy0 * scale_h  # y方向主点随高度缩放
+
+        if self.debug:
+            print(f"🔧 内参缩放: 宽度缩放={scale_w:.3f}, 高度缩放={scale_h:.3f}")
+            print(f"🔧 计算结果: fx={fx_feat:.1f}, fy={fy_feat:.1f}, cx={cx_feat:.1f}, cy={cy_feat:.1f}")
+
+        return (fx_feat, fy_feat, cx_feat, cy_feat)
+
+
+    def get_pose_pick_stats(self):
+        return dict(self._pose_pick_stats)
+
+    def reset_pose_pick_stats(self):
+        self._pose_pick_stats = {'direct': 0, 'inv': 0}
+    
+    def _ensure_precomp_adapter(self, c_in: int):
+        """惰性初始化预计算特征适配器：512 → 256"""
+        if (self.precomp_adapter is None) or (self.precomp_adapter[0].in_features != c_in):
+            # 按照优化指南要求：Linear(512→256) + LayerNorm
+            self.precomp_adapter = nn.Sequential(
+                nn.Linear(c_in, 256),
+                nn.LayerNorm(256)
+            ).to(next(self.parameters()).device)
+            if self.debug:
+                print(f"🔧 初始化预计算适配器: {c_in} → 256 (优化版本)")
+    
+    def get_grad_stats(self):
+        """获取梯度健康度统计"""
+        stats = {}
+        for name, module in [("head2d", self.head2d), ("head3d", self.head3d), ("gate", self.fusion_gate)]:
+            total = 0.0
+            cnt = 0
+            for p in module.parameters():
+                if p.grad is not None:
+                    total += p.grad.data.norm().item()
+                    cnt += 1
+            stats[f"grad_{name}"] = total / max(cnt, 1)
+        return stats
+    
+    def update_loss_stat(self, loss_val: float):
+        """更新损失历史记录"""
+        self._loss_hist.append(float(loss_val))
+    
+    def get_loss_var(self):
+        """获取损失滑窗方差"""
+        if len(self._loss_hist) < 20:
+            return None
+        arr = torch.tensor(list(self._loss_hist))
+        return float(arr.var(unbiased=False))
+    
+    def _log_key_metrics(self, valid: torch.Tensor, conf: torch.Tensor):
+        """简化监控输出：仅输出关键指标"""
+        # 🔧 修复：始终输出关键指标，不受debug模式限制
+        # if not self.debug:
+        #     return  # 非调试模式不输出
+            
+        with torch.no_grad():
+            # 1. Valid比例
+            valid_ratio = valid.float().mean().item()
+            
+            # 2. Fusion gate参数（alpha统计）- 只计算有效点的alpha
+            alpha = conf.squeeze(-1) if conf.dim() == 2 else conf  # (N,)
+            
+            if valid.any():
+                # 只统计有效投影点的alpha
+                alpha_valid = alpha[valid]
+                alpha_mean = float(alpha_valid.mean()) if alpha_valid.numel() else 0.0
+                alpha_std = float(alpha_valid.std(unbiased=False)) if alpha_valid.numel() > 1 else 0.0
+            else:
+                # 没有有效点时的处理
+                alpha_mean = 0.0
+                alpha_std = 0.0
+            
+            # 🔧 增强输出格式：包含融合比例统计
+            fusion_2d_ratio = alpha_mean  # α表示2D特征权重
+            fusion_3d_ratio = 1.0 - alpha_mean  # 1-α表示3D特征权重
+            
+            print(f"🎯 Valid比例: {valid_ratio:.3f} | Fusion-α: 均值={alpha_mean:.3f}±{alpha_std:.3f}")
+            print(f"🎯 融合比例: 2D={fusion_2d_ratio:.3f} | 3D={fusion_3d_ratio:.3f} | 总点数={valid.numel()}")
+            
+            # 如果valid比例为0，输出调试信息
+            if valid_ratio == 0.0:
+                print(f"⚠️ DEBUG: valid全为0，总点数={valid.numel()}")
+                
+            # 🔧 添加融合模式分析
+            if valid.any():
+                if alpha_mean < 0.2:
+                    print(f"📊 融合模式: 主要使用3D特征 (α={alpha_mean:.3f})")
+                elif alpha_mean > 0.8:
+                    print(f"📊 融合模式: 主要使用2D特征 (α={alpha_mean:.3f})")
+                else:
+                    print(f"📊 融合模式: 平衡融合 (α={alpha_mean:.3f})")
+            
+            # 可配置的有效比例警告
+            if self.warn_valid_ratio and valid_ratio < self.warn_valid_ratio:
+                print(f"⚠️ 有效比例过低: {valid_ratio:.3f} < {self.warn_valid_ratio}")
     
     def _collect_fusion_statistics(self, conf: torch.Tensor, valid: torch.Tensor, 
                                  f2d: torch.Tensor, f3d: torch.Tensor):
-        """收集融合门控统计信息"""
+        """收集融合门控统计信息 - 🔧 只统计valid点"""
         try:
             with torch.no_grad():
                 # 基础统计
@@ -824,20 +425,53 @@ class BiFusionEncoder(nn.Module):
                 else:
                     conf_values = conf
                 
-                # 计算融合比例
-                fusion_2d_ratio = conf_values.mean().item()
-                fusion_3d_ratio = 1.0 - fusion_2d_ratio
-                avg_confidence = conf_values.mean().item()
+                # 🔧 关键修复：只统计valid点，避免invalid点污染统计
+                if valid.any():
+                    # 只使用有效点进行统计
+                    valid_conf = conf_values[valid]
+                    valid_f2d = f2d[valid]
+                    valid_f3d = f3d[valid]
+                    
+                    # 计算融合比例（基于有效点）
+                    fusion_2d_ratio = valid_conf.mean().item()
+                    fusion_3d_ratio = 1.0 - fusion_2d_ratio
+                    avg_confidence = valid_conf.mean().item()
+                    
+                    # 特征质量统计（基于有效点）
+                    f2d_norm = torch.norm(valid_f2d, dim=-1).mean().item()
+                    f3d_norm = torch.norm(valid_f3d, dim=-1).mean().item()
+                    
+                    # 特征相似度（基于有效点）
+                    cos_sim = F.cosine_similarity(valid_f2d, valid_f3d, dim=-1).mean().item()
+                    
+                    total_valid_points = valid.sum().item()
+                else:
+                    # 没有有效点的fallback
+                    fusion_2d_ratio = 0.0
+                    fusion_3d_ratio = 1.0  
+                    avg_confidence = 0.0
+                    f2d_norm = 0.0
+                    f3d_norm = 0.0
+                    cos_sim = 0.0
+                    total_valid_points = 0
+                
+                # 有效点比例（相对于总点数）
                 valid_points_ratio = valid.float().mean().item()
                 
-                # 特征质量统计
-                f2d_norm = torch.norm(f2d, dim=-1).mean().item()
-                f3d_norm = torch.norm(f3d, dim=-1).mean().item()
+                # 🔧 计算alpha分布统计（基于有效点）
+                if valid.any():
+                    valid_alpha = conf_values[valid]
+                    alpha_mean = float(valid_alpha.mean())
+                    alpha_std = float(valid_alpha.std(unbiased=False)) if valid_alpha.numel() > 1 else 0.0
+                    alpha_min = float(valid_alpha.min())
+                    alpha_max = float(valid_alpha.max())
+                else:
+                    alpha_mean = avg_confidence  # 使用总体均值作为fallback
+                    alpha_std = 0.0
+                    alpha_min = 0.0
+                    alpha_max = 1.0
                 
-                # 特征相似度
-                cos_sim = F.cosine_similarity(f2d, f3d, dim=-1).mean().item()
-                
-                # 更新统计信息
+                # 更新统计信息 - 🔧 包含完整的alpha统计
                 self._fusion_stats = {
                     'fusion_2d_ratio': fusion_2d_ratio,
                     'fusion_3d_ratio': fusion_3d_ratio, 
@@ -846,7 +480,17 @@ class BiFusionEncoder(nn.Module):
                     'f2d_norm_avg': f2d_norm,
                     'f3d_norm_avg': f3d_norm,
                     'feature_similarity': cos_sim,
-                    'total_points': conf_values.numel()
+                    'total_points': conf_values.numel(),
+                    'total_valid_points': total_valid_points,
+                    # 🔧 添加缺失的alpha统计
+                    'alpha_mean': alpha_mean,
+                    'alpha_std': alpha_std,
+                    'alpha_min': alpha_min,
+                    'alpha_max': alpha_max,
+                    'cos_2d3d_mean': cos_sim,  # 别名，确保兼容性
+                    'norm_ratio_2d_over_3d': f2d_norm / max(f3d_norm, 1e-8),  # 避免除零
+                    'valid_ratio': valid_points_ratio,  # 别名，确保兼容性
+                    'in_feat': 1.0  # 特征输入状态
                 }
                 
                 # 保留历史记录（最多100条）
@@ -861,6 +505,23 @@ class BiFusionEncoder(nn.Module):
     def get_fusion_statistics(self):
         """获取融合统计信息"""
         return self._fusion_stats.copy() if self._fusion_stats else {}
+    
+    def get_fusion_ratios(self):
+        """专门获取融合比例统计 - 供Hook使用"""
+        if not self._fusion_stats:
+            return {'fusion_2d_ratio': 0.0, 'fusion_3d_ratio': 1.0, 'valid_points_ratio': 0.0}
+        
+        return {
+            'fusion_2d_ratio': self._fusion_stats.get('fusion_2d_ratio', 0.0),
+            'fusion_3d_ratio': self._fusion_stats.get('fusion_3d_ratio', 1.0), 
+            'valid_points_ratio': self._fusion_stats.get('valid_points_ratio', 0.0),
+            'avg_confidence': self._fusion_stats.get('avg_confidence', 0.0),
+            'feature_similarity': self._fusion_stats.get('feature_similarity', 0.0)
+        }
+    
+    def get_fusion_balance_loss(self):
+        """获取融合平衡损失 - 供主损失函数使用"""
+        return getattr(self, '_fusion_balance_loss', None)
     
     def get_statistics_summary(self, last_n: int = 10):
         """获取最近N次的统计摘要"""
@@ -879,108 +540,248 @@ class BiFusionEncoder(nn.Module):
         
         return summary
 
-    def build_uv_index(self, xyz_cam, intr, img_shape):
-        return _build_uv_index(xyz_cam, intr, img_shape)
+    # 删除了复杂的 _improved_projection_with_geometry 函数，
+    # 统一使用 unified_projection_and_sample
 
-    def sample_img_feat(self, feat_map, uv):
-        return _sample_img_feat(feat_map, uv)
-    
-    def _improved_projection(self, xyz_cam, intr, img_shape):
-        """改进的投影机制：增加视距裁剪和优先级过滤"""
-        # 1. 基础投影
-        fx, fy, cx, cy = intr
+    def _pixels_to_grid(self, uv_feat: torch.Tensor,
+                        feat_hw: Tuple[int,int],
+                        align_corners: bool = True) -> torch.Tensor:
+        """
+        关键修复：统一grid_sample规范化标准
+        把像素坐标 (u,v) 转为 grid_sample 需要的 [-1,1] 归一化坐标。
+        - uv_feat: (M,2) 像素坐标（特征图尺度）
+        - feat_hw: (H_feat, W_feat)
+        - 返回: (1, M, 1, 2) 的 grid
+        """
+        H, W = feat_hw
+        u = uv_feat[:, 0]
+        v = uv_feat[:, 1]
+        
+        if align_corners:
+            # 🔧 align_corners=True: 边界为 [0, W-1] [0, H-1]
+            # 这样 (0,0) 映射到 (-1,-1), (W-1,H-1) 映射到 (1,1)
+            x_norm = 2.0 * u / max(float(W - 1), 1.0) - 1.0
+            y_norm = 2.0 * v / max(float(H - 1), 1.0) - 1.0
+        else:
+            # align_corners=False: 边界为 [0, W) [0, H)
+            x_norm = 2.0 * (u + 0.5) / float(W) - 1.0
+            y_norm = 2.0 * (v + 0.5) / float(H) - 1.0
+            
+        grid = torch.stack([x_norm, y_norm], dim=-1).view(1, -1, 1, 2)
+        return grid
+
+    def _sample_img_feat(self, feat_map: torch.Tensor,
+                         uv_feat: torch.Tensor,
+                         valid_mask: torch.Tensor,
+                         align_corners: bool = True) -> torch.Tensor:
+        """
+        从特征图 (1,C,H,W) 采样 N 个点的特征。
+        - feat_map: (1, C, H, W)
+        - uv_feat:  (N, 2) 像素坐标（特征图尺度）
+        - valid_mask: (N,) bool
+        - 返回: (N, C)
+        """
+        assert feat_map.dim() == 4 and feat_map.size(0) == 1
+        H, W = feat_map.shape[-2], feat_map.shape[-1]
+
+        # 只对 valid 的点构造 grid，可以减少边界异常
+        idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            return feat_map.new_zeros((uv_feat.size(0), feat_map.size(1)))
+
+        uv_valid = uv_feat[idx]  # (M,2)
+        grid = self._pixels_to_grid(uv_valid, (H, W), align_corners=align_corners)  # 1xMx1x2
+
+        # 确保feat_map和grid有相同的数据类型
+        if feat_map.dtype != grid.dtype:
+            grid = grid.to(feat_map.dtype)
+
+        # 采样: F.grid_sample(1, C, H, W), (1, M, 1, 2) -> (1, C, 1, M)
+        sampled = F.grid_sample(
+            feat_map, grid, mode='bilinear',
+            align_corners=align_corners
+        ).squeeze(3).squeeze(0).T  # (1, C, M) -> (C, M) -> (M, C)
+
+        out = feat_map.new_zeros((uv_feat.size(0), feat_map.size(1)))
+        out[idx] = sampled
+        return out
+
+    def unified_projection_and_sample(self,
+                                      xyz_cam: torch.Tensor,
+                                      feat_map: torch.Tensor):
+        """
+        🔧 核心修复：动态内参换算，解决valid比例为0的问题
+        
+        核心原则：
+        1. 根据当前特征图尺寸动态计算内参，支持任意H×W
+        2. 严格的边界和深度检查
+        
+        Args:
+            xyz_cam: (N, 3) 相机坐标系点云
+            intr: (4,) 原图内参 [fx, fy, cx, cy] - 已废弃，改用动态计算
+            feat_map: (1, C, H, W) 特征图
+        Returns:
+            sampled_feat: (N, C) 采样特征
+            valid_mask: (N,) 有效投影掩码
+        """
+        # 🎯 关键修复：优先使用传入内参，否则动态计算
+        Hf, Wf = feat_map.shape[2], feat_map.shape[3]
+        fx_feat, fy_feat, cx_feat, cy_feat = self._intrinsics_for_feat(Hf, Wf)
+
+        # 3D投影：相机坐标系 → 特征图像素坐标
         x, y, z = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
         
-        # 2. 视距裁剪：ScanNet室内场景合理深度范围 - 进一步放宽限制
-        # 从 0.02m-30m 进一步放宽到 0.01m-50m，几乎不限制深度
-        depth_valid = (z > 0.01) & (z < 50.0)
+        # 🔍 相机坐标诊断 - 降低输出频率
+        if self.debug and torch.rand(1).item() < 0.05:  # 5%概率输出
+            print(f"🔍 相机坐标诊断:")
+            print(f"   X范围: [{x.min():.3f}, {x.max():.3f}]")
+            print(f"   Y范围: [{y.min():.3f}, {y.max():.3f}]") 
+            print(f"   Z范围: [{z.min():.3f}, {z.max():.3f}]")
+            print(f"   内参: fx={fx_feat:.1f}, fy={fy_feat:.1f}, cx={cx_feat:.1f}, cy={cy_feat:.1f}")
         
-        # 3. 计算投影坐标  
-        u = fx * x / (z + 1e-8) + cx  # 添加小值避免除零
-        v = fy * y / (z + 1e-8) + cy
+        # 🛡️ 严格的深度过滤 - 提高阈值避免投影爆炸
+        min_depth = 0.5  # 提高最小深度阈值到0.5m
+        valid_z = (z > min_depth) & (z < self.max_depth)
         
-        # 4. 边界检查 - 修复边界包含问题
-        H, W = img_shape
-        # 使用<=来包含边界像素，但为采样安全留0.5像素边距
-        boundary_valid = (u >= 0.5) & (u <= W-0.5) & (v >= 0.5) & (v <= H-0.5)
+        # 只对有效深度的点进行投影计算，无效点设为边界外值
+        u_feat = torch.full_like(x, -1.0)  # 无效点设为-1
+        v_feat = torch.full_like(y, -1.0)  # 无效点设为-1
         
-        # 5. 组合所有条件
-        valid = depth_valid & boundary_valid
-        
-        # 6. 如果有效点太少，进一步放宽深度限制  
-        if valid.sum() < 300:  # 降低阈值到300个点
-            depth_valid_relaxed = (z > 0.005) & (z < 100.0)  # 极度放宽到0.005m-100m
-            valid = depth_valid_relaxed & boundary_valid
-            if self.debug:
-                print(f"🔍 深度极度放宽 - 初始有效点: {depth_valid.sum()}, 放宽后: {valid.sum()}")
+        # 只对有效深度的点进行投影
+        if valid_z.any():
+            valid_x, valid_y, valid_z_vals = x[valid_z], y[valid_z], z[valid_z]
+            u_valid = fx_feat * (valid_x / valid_z_vals) + cx_feat
+            v_valid = fy_feat * (valid_y / valid_z_vals) + cy_feat
             
-        # 7. 使用全部有效投影点，不施加人为限制
-        original_valid_count = valid.sum().item()
-        if self.debug:
-            print(f"✅ 使用全部有效投影: {original_valid_count}/{len(valid)} ({original_valid_count/len(valid)*100:.1f}%)")
+            # 检查投影结果是否合理（粗略范围检查）
+            reasonable_u = (u_valid > -1000) & (u_valid < 1000)  # 允许较大范围但排除极值
+            reasonable_v = (v_valid > -1000) & (v_valid < 1000)
+            reasonable_proj = reasonable_u & reasonable_v
+            
+            if self.debug and torch.rand(1).item() < 0.1:
+                unreasonable_count = (~reasonable_proj).sum().item()
+                if unreasonable_count > 0:
+                    print(f"⚠️ 投影异常: {unreasonable_count}/{len(u_valid)} 点投影坐标异常")
+                    print(f"   U异常范围: [{u_valid[~reasonable_u].min():.1f}, {u_valid[~reasonable_u].max():.1f}]" if (~reasonable_u).any() else "   U正常")
+                    print(f"   V异常范围: [{v_valid[~reasonable_v].min():.1f}, {v_valid[~reasonable_v].max():.1f}]" if (~reasonable_v).any() else "   V正常")
+            
+            # 只保留合理的投影结果
+            final_valid_mask = valid_z.clone()
+            final_valid_mask[valid_z] = reasonable_proj
+            
+            u_feat[final_valid_mask] = u_valid[reasonable_proj]
+            v_feat[final_valid_mask] = v_valid[reasonable_proj]
+            
+            # 更新有效深度掩码
+            valid_z = final_valid_mask
         
-        return valid, torch.stack([u, v], dim=-1)
+        # 边界检查：与测试脚本保持一致
+        valid_u = (u_feat >= 0) & (u_feat < Wf)
+        valid_v = (v_feat >= 0) & (v_feat < Hf)
+        
+        # 综合有效性判定
+        valid = valid_z & valid_u & valid_v
+        
+        # 🚨 关键调试：检查投影坐标分布（临时启用）
+        total_points = len(z)
+        depth_valid = valid_z.sum().item()
+        boundary_valid = valid.sum().item()
+        
+        # 坐标统计
+        u_min, u_max = u_feat.min().item(), u_feat.max().item()
+        v_min, v_max = v_feat.min().item(), v_feat.max().item()
+        z_min, z_max = z.min().item(), z.max().item()
+        
+        if total_points > 0 and boundary_valid < total_points * 0.8:  # 有效率低于80%时输出
+            print(f"🔍 投影坐标诊断({Hf}×{Wf}):")
+            print(f"   总点数: {total_points}")
+            print(f"   深度范围: [{z_min:.3f}, {z_max:.3f}]m, 有效深度: {depth_valid}/{total_points} ({100*depth_valid/total_points:.1f}%)")
+            print(f"   U坐标范围: [{u_min:.1f}, {u_max:.1f}], 目标[0, {Wf})")
+            print(f"   V坐标范围: [{v_min:.1f}, {v_max:.1f}], 目标[0, {Hf})")
+            print(f"   最终有效: {boundary_valid}/{total_points} ({100*boundary_valid/total_points:.1f}%)")
+                    
+        # 特征采样 - 使用align_corners确保一致性
+        uv_feat = torch.stack([u_feat, v_feat], dim=-1)  # (N, 2)
+        sampled_feat = self._sample_img_feat(feat_map, uv_feat, valid, align_corners=self.align_corners)
+        
+        return sampled_feat, valid
 
-    def _process_single(self, points: torch.Tensor, img: torch.Tensor, cam_meta: Dict,
-                        feat2d_map: Optional[torch.Tensor] = None,
-                        clip_global: Optional[torch.Tensor] = None):
-        """处理单帧数据，使用增强的CLIP和融合机制"""
+    def _process_single(self, points: torch.Tensor, img: torch.Tensor, cam_meta: Dict, sample_idx: int = 0):
+        """处理单帧数据，使用简化的数据流"""
         # 提取基础信息
-        xyz_depth = points[:, :3]  # DEPTH坐标系的原始坐标
+        xyz = points[:, :3].contiguous()  
+        dev = xyz.device
+        dtype = xyz.dtype
         
-        # 🎯 关键修复：使用pose逆变换将ScanNet传感器坐标转换为标准相机坐标
-        # 坐标变换：将点云从传感器坐标系转换到相机坐标系
-        xyz_cam_proj = None
-        xyz_world = xyz_depth # PE默认使用原始坐标
-
-        try:
-            if cam_meta.get('pose', None) is not None:
-                pose = cam_meta['pose']
-                if not torch.is_tensor(pose):
-                    pose = torch.from_numpy(pose).float().to(xyz_depth.device)
-
-                # 确保pose是4x4矩阵
-                if pose.dim() == 2 and pose.shape == (4, 4):
-                    # 🎯 关键修复：使用pose逆变换（你的完美解决方案）
-                    pose_inv = torch.inverse(pose)
-                    
-                    # 转换为齐次坐标并应用逆变换
-                    xyz_homo = torch.cat([xyz_depth, torch.ones(xyz_depth.shape[0], 1, device=xyz_depth.device)], dim=1)
-                    xyz_cam_homo = torch.mm(xyz_homo, pose_inv.T)
-                    xyz_cam_proj = xyz_cam_homo[:, :3]
-                    
-                    # 验证变换结果
-                    if self.debug:
-                        positive_z_ratio = (xyz_cam_proj[:, 2] > 0).float().mean().item()
-                        z_range = [xyz_cam_proj[:, 2].min().item(), xyz_cam_proj[:, 2].max().item()]
-                        print(f"🎯 pose逆变换成功: 正Z比例={positive_z_ratio:.1%}, Z范围=[{z_range[0]:.3f}, {z_range[1]:.3f}]")
-                else:
-                    if self.debug:
-                        print(f"⚠️ 无效的pose形状: {pose.shape}，跳过变换")
+        # 🔧 优化pose解析 - 直接提取当前样本的pose
+        pose_matrix = None
+        if isinstance(cam_meta, dict) and 'pose' in cam_meta:
+            pose_data = cam_meta['pose']
+            if isinstance(pose_data, list) and len(pose_data) > sample_idx:
+                # PKL文件中的pose是list，选择当前样本对应的pose
+                pose_matrix = pose_data[sample_idx]
+            elif isinstance(pose_data, (list, tuple, np.ndarray)) and len(pose_data) == 1:
+                # 单个pose的情况
+                pose_matrix = pose_data[0] if isinstance(pose_data, (list, tuple)) else pose_data
             else:
-                 if self.debug:
-                    print(f"⚠️ cam_meta中无pose信息，跳过变换")
+                # 直接使用pose_data
+                pose_matrix = pose_data
+        
+        if self.debug:
+            print(f"🔍 样本{sample_idx} pose矩阵类型: {type(pose_matrix)}")
+            if pose_matrix is not None:
+                if hasattr(pose_matrix, 'shape') and not isinstance(pose_matrix, (list, tuple)):
+                    print(f"🔍 pose矩阵形状: {pose_matrix.shape}")
+                elif isinstance(pose_matrix, (list, tuple)):
+                    print(f"🔍 pose矩阵长度: {len(pose_matrix)}")
 
-        except Exception as e:
+        # 🎯 坐标转换：世界坐标 → 相机坐标
+        if pose_matrix is None:
+            # 没有pose矩阵，直接使用原始坐标
+            xyz_cam_proj = xyz.clone()
             if self.debug:
-                print(f"❌ pose处理异常: {e}，跳过变换")
-        
-        # 如果任何步骤失败，xyz_cam_proj将保持为None
-        if xyz_cam_proj is None:
-            if self.debug:
-                print(f"🔧 使用原始坐标作为备用方案")
-            xyz_cam_proj = xyz_depth
-        
-        # 世界坐标仍用depth坐标（PE需要）
-        xyz_world = xyz_depth
-        
-        # 几何PE
-        bbox_size = torch.zeros_like(xyz_world)
-        pose_delta = torch.zeros(9, device=xyz_world.device, dtype=xyz_world.dtype)
-        height = xyz_world[:, 2:3]
-        pe = self.pe_mlp(build_geo_pe(xyz_world, bbox_size, pose_delta, height))
+                print(f"⚠️ 没有找到pose矩阵，使用原始坐标")
+        else:
+            try:
+                # 确保pose矩阵为torch张量
+                if not isinstance(pose_matrix, torch.Tensor):
+                    T_matrix = torch.as_tensor(pose_matrix, dtype=dtype, device=dev)
+                else:
+                    T_matrix = pose_matrix.to(dtype=dtype, device=dev)
 
-        # 3D分支
+                # 🔍 调试：检查矩阵属性
+                if self.debug:
+                    print(f"🔍 T_matrix形状: {T_matrix.shape}")
+                    print(f"🔍 T_matrix设备: {T_matrix.device}, 类型: {T_matrix.dtype}")
+                    det = torch.det(T_matrix).item()
+                    print(f"🔍 T_matrix行列式: {det}")
+                    if torch.isnan(T_matrix).any() or torch.isinf(T_matrix).any():
+                        print(f"⚠️ T_matrix包含NaN/Inf值")
+
+                # pose是C2W格式，求逆得到W2C变换矩阵
+                W2C = torch.inverse(T_matrix)
+
+                # 齐次坐标变换：世界坐标 → 相机坐标
+                xyz1 = torch.cat([xyz, torch.ones(xyz.shape[0], 1, device=dev, dtype=dtype)], dim=1)
+                xyz_cam_proj = (xyz1 @ W2C.t())[:, :3]
+
+                # 调试输出
+                if self.debug:
+                    z_cam = xyz_cam_proj[:, 2]
+                    neg_z = (z_cam < 0).sum().item()
+                    print(f"坐标转换完成: {xyz_cam_proj.shape}, 负深度点={neg_z}")
+
+            except (RuntimeError, torch.linalg.LinAlgError) as e:
+                # 矩阵求逆失败，直接使用原始坐标
+                xyz_cam_proj = xyz.clone()
+                if self.debug:
+                    print(f"坐标转换异常，使用原始坐标: {e}")
+                    print(f"🔍 异常详情: {type(e).__name__}: {str(e)}")
+        
+        # 3D分支始终使用世界坐标
+        xyz_world = xyz
+
+        # 3D分支：MinkUNet → 96d → Proj3D(96→256, LN inside) → Head3D(256→256, LN inside) → (不做L2)
         coords_int = torch.round(xyz_world / self.voxel_size).to(torch.int32)
         coords = torch.cat([torch.zeros(coords_int.size(0), 1, dtype=torch.int32, device=coords_int.device),
                              coords_int], dim=1)
@@ -996,398 +797,128 @@ class BiFusionEncoder(nn.Module):
         if feat3d.shape[0] != points.shape[0]:
             raise RuntimeError(f"3D features shape mismatch: got {feat3d.shape[0]}, expected {points.shape[0]}")
         
-        # 应用3D投影头：96维 -> 256维，并L2归一化
-        feat3d = self.proj_3d(feat3d)  # (N, 96) -> (N, 256)
-        feat3d = F.normalize(feat3d + 1e-8, dim=-1, eps=1e-8)  # L2归一化到单位球面
+        # 3D投影头：96维 -> 256维 (内含LN，不额外做L2)
+        feat3d = self.proj_3d(feat3d.float())  # (N, 96) -> (N, 256), 确保float类型
         
-        # 可选的TinySA或简单neck处理
-        if self.use_tiny_sa_3d:
-            feat3d = self.tiny_sa_neck(xyz_world, feat3d)
-        else:
-            feat3d = self.simple_neck(feat3d)
-            
-        feat3d = self.lin3d(feat3d)
-        feat3d = self.ln3d(feat3d)
+        # 统一Head：不做L2归一化
+        f3d = self.head3d(feat3d)  # (N, 256)
 
-        # 2D分支 - 使用Enhanced CLIP
-        if feat2d_map is None or clip_global is None:
-            with torch.no_grad():
-                amp_ctx = torch.cuda.amp.autocast(enabled=self.use_amp and img.is_cuda)
-                with amp_ctx:
-                    feat2d_map, clip_global = self.enhanced_clip(img.unsqueeze(0))
-                    if feat2d_map is not None:  # 添加None检查
-                        feat2d_map = feat2d_map.squeeze(0)  # Remove batch dim
+        # 🎯 2D特征处理：投影采样或零特征fallback
+        if xyz_cam_proj is None:
+            # 相机投影失败，使用零特征
+            print(f"⚠️ 相机投影失败，使用零特征")
+            feat2d_raw = f3d.new_zeros((f3d.shape[0], 256))
+            valid = f3d.new_zeros((f3d.shape[0],), dtype=torch.bool)
+            f2d = self.head2d(feat2d_raw)
 
-        # 投影采样 - 处理内参格式（修复ScanNet格式解析）
-        intr_raw = cam_meta['intrinsics']
-        
-        # 🔧 修复ScanNet内参格式解析，添加类型安全检查
-        if self.debug:
-            print(f"🔍 原始内参类型: {type(intr_raw)}, 长度: {len(intr_raw) if hasattr(intr_raw, '__len__') else 'N/A'}")
-            print(f"🔍 原始内参内容: {intr_raw}")
-            if isinstance(intr_raw, (list, tuple)) and len(intr_raw) == 4:
-                print(f"🔍 第一个元素类型: {type(intr_raw[0])}, 内容: {intr_raw[0]}")
-        
-        # 类型安全的内参处理
-        if isinstance(intr_raw, (list, tuple)) and len(intr_raw) == 4:
-            # ScanNet格式: [(fx_values...), (fy_values...), (cx_values...), (cy_values...)]
-            if all(isinstance(item, (list, tuple)) for item in intr_raw):
-                # 每个参数是多个相同值的元组，取第一个
-                fx = float(intr_raw[0][0])
-                fy = float(intr_raw[1][0]) 
-                cx = float(intr_raw[2][0])
-                cy = float(intr_raw[3][0])
-                if self.debug:
-                    print(f"🔧 ScanNet格式解析: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
-                intr = torch.tensor([fx, fy, cx, cy], dtype=xyz_cam_proj.dtype, device=xyz_cam_proj.device)
-            elif all(isinstance(item, (int, float)) for item in intr_raw):
-                # 标准格式: [fx, fy, cx, cy]
-                if self.debug:
-                    print(f"🔧 标准格式解析: {intr_raw}")
-                intr = torch.tensor(intr_raw, dtype=xyz_cam_proj.dtype, device=xyz_cam_proj.device)
-            else:
-                # 混合格式，逐个处理
-                values = []
-                for item in intr_raw:
-                    if isinstance(item, (list, tuple)) and len(item) > 0:
-                        values.append(float(item[0]))
-                    elif isinstance(item, (int, float)):
-                        values.append(float(item))
-                    else:
-                        values.append(577.870605)  # 默认值
-                intr = torch.tensor(values, dtype=xyz_cam_proj.dtype, device=xyz_cam_proj.device)
-        else:
-            # 转换为tensor后处理
-            if not torch.is_tensor(intr_raw):
-                intr_tensor = torch.as_tensor(intr_raw, dtype=xyz_cam_proj.dtype, device=xyz_cam_proj.device)
-            else:
-                intr_tensor = intr_raw
-            
-            # 使用类型转换确保Pylance理解这是tensor
-            intr_tensor = cast(torch.Tensor, intr_tensor)
-            
-            # 确保intrinsics是1D tensor (4,) - 增强处理逻辑
-            if intr_tensor.dim() == 2:  # (1, 4) 或 (B, 4)
-                if intr_tensor.shape[-1] == 4:
-                    intr = intr_tensor[0]  # 取第一个
-                elif intr_tensor.shape[0] == 4:
-                    intr = intr_tensor[:, 0] if intr_tensor.shape[1] == 1 else intr_tensor.flatten()
-                else:
-                    intr = intr_tensor.flatten()
-            elif intr_tensor.dim() == 0:  # 标量
-                # 使用默认ScanNet内参
-                intr = torch.tensor([577.870605, 577.870605, 319.5, 239.5], 
-                                  dtype=xyz_cam_proj.dtype, device=xyz_cam_proj.device)
-            elif intr_tensor.dim() > 2:  # 多维tensor，尝试展平
-                intr = intr_tensor.flatten()
-            else:
-                intr = intr_tensor
-        
-        # 确保是4个元素，如果不是则使用默认值
-        if intr.numel() != 4:
-            # 记录异常intrinsics用于调试
-            if intr.numel() == 1:
-                # 可能是错误的单值，使用默认值
-                intr = torch.tensor([577.870605, 577.870605, 319.5, 239.5], 
-                                  dtype=xyz_cam_proj.dtype, device=xyz_cam_proj.device)
-            elif intr.numel() > 4:
-                # 取前4个元素
-                intr = intr[:4]
-            else:
-                # 其他情况，抛出详细错误信息
-                raise ValueError(f"intrinsics异常: 期望4个元素[fx,fy,cx,cy], 实际得到{intr.numel()}个元素，"
-                               f"值为{intr.tolist() if intr.numel() <= 10 else '太多元素'}, "
-                               f"原始形状: {intr.shape}, cam_meta: {cam_meta}")
-        
-        # 最终验证
-        assert intr.numel() == 4, f"内参处理后仍然异常: {intr.shape}"
-        
-        # 🔍 调试cam_meta内容，寻找真实图像尺寸
-        if self.debug:
-            print(f"🔍 调试 cam_meta 内容: {list(cam_meta.keys())}")
-            if 'img_shape' in cam_meta:
-                print(f"🔍 发现 img_shape: {cam_meta['img_shape']}")
-            else:
-                print(f"🔍 cam_meta 完整内容: {cam_meta}")
-        
-        # 确保feat2d_map不为None
-        if feat2d_map is None:
-            # 如果feat2d_map仍然为None，创建默认的特征图（已经上采样到40×30）
-            feat2d_map = torch.zeros((256, 30, 40), dtype=xyz_cam_proj.dtype, device=xyz_cam_proj.device)
-        
-        # 💡 修复投影缩放问题：CLIP特征图是14x14，需要缩放内参
-        
-        # 🔧 关键修复：上采样CLIP特征图到合理分辨率
-        # 当前14×14 → 目标40×30 (stride=16对应分辨率)
-        if feat2d_map is not None:
-            original_h, original_w = feat2d_map.shape[-2:]
-        else:
-            # 默认CLIP特征图尺寸
-            original_h, original_w = 14, 14
-        
-        # 计算目标分辨率 (stride=16)
-        target_w = 640 // 16  # 40
-        target_h = 480 // 16  # 30
-        
-        if feat2d_map is not None and (original_h != target_h or original_w != target_w):
-            # 使用双线性插值上采样
-            feat2d_map = F.interpolate(
-                feat2d_map.unsqueeze(0),  # 添加batch维度
-                size=(target_h, target_w),
-                mode='bilinear',
-                align_corners=True
-            ).squeeze(0)  # 移除batch维度
-            
+        elif isinstance(cam_meta, dict) and cam_meta.get("clip_pix") is not None:
             if self.debug:
-                print(f"🔧 特征图上采样: {original_h}×{original_w} → {target_h}×{target_w}")
-        
-        # 使用上采样后的特征图尺寸
-        if feat2d_map is not None:
-            feat_h, feat_w = feat2d_map.shape[-2:]
+                print(f"🎯 使用预计算CLIP特征进行投影采样")
+            # 有有效投影和CLIP特征，进行投影采样
+            clip_data = cam_meta["clip_pix"]
+            
+            # 如果clip_data是list，根据sample_idx选择对应的特征
+            if isinstance(clip_data, list) and len(clip_data) > sample_idx:
+                selected_clip = clip_data[sample_idx]
+            elif isinstance(clip_data, (list, tuple)) and len(clip_data) == 1:
+                selected_clip = clip_data[0]
+            else:
+                selected_clip = clip_data
+            
+            # 确保selected_clip是tensor
+            if isinstance(selected_clip, torch.Tensor):
+                feat_map = selected_clip.to(device=dev, dtype=dtype)
+            else:
+                feat_map = torch.as_tensor(selected_clip, device=dev, dtype=dtype)
+                
+            feat_map = feat_map.float().unsqueeze(0)
+
+            # 投影采样
+            feat2d_raw, valid = self.unified_projection_and_sample(
+                xyz_cam=xyz_cam_proj,
+                feat_map=feat_map)
+
+            # 通道适配：512 → 256
+            if feat2d_raw.shape[-1] != 256:
+                self._ensure_precomp_adapter(feat2d_raw.shape[-1])
+                if self.precomp_adapter is not None:
+                    feat2d_raw = self.precomp_adapter(feat2d_raw)
+
+            f2d = self.head2d(feat2d_raw)
+
         else:
-            feat_h, feat_w = target_h, target_w
-        
-        # 🔧 使用正确的ScanNet图像尺寸：640x480
-        # 内参 cx=319.5, cy=239.5 对应 640x480 图像
-        original_w = 640
-        original_h = 480
-        
-        # 🔧 修复内参缩放：使用正确的ScanNet图像尺寸
-        # ScanNet标准：640×480，CLIP特征：40×30 (上采样后)
-        scale_x = feat_w / original_w  # 40 / 640 = 0.0625
-        scale_y = feat_h / original_h  # 30 / 480 = 0.0625
-        
-        # 缩放内参以匹配特征图尺寸
-        scaled_intr = intr.clone()
-        scaled_intr[0] *= scale_x  # fx: 577.87 → 36.12
-        scaled_intr[1] *= scale_y  # fy: 577.87 → 36.12  
-        scaled_intr[2] *= scale_x  # cx: 319.5 → 19.97
-        scaled_intr[3] *= scale_y  # cy: 239.5 → 14.97
-        
-        # 🔧 关键修复：调整主点坐标使其居中
-        # 理论上cx应该是feat_w/2=20, cy应该是feat_h/2=15
-        scaled_intr[2] = feat_w / 2.0  # cx: 修正为20.0
-        scaled_intr[3] = feat_h / 2.0  # cy: 修正为15.0
-        
-        if self.debug:
-            print(f"🔍 内参缩放 - 原始: fx={intr[0]:.1f}, fy={intr[1]:.1f}, cx={intr[2]:.1f}, cy={intr[3]:.1f}")
-            print(f"🔍 内参缩放 - 缩放: fx={scaled_intr[0]:.2f}, fy={scaled_intr[1]:.2f}, cx={scaled_intr[2]:.2f}, cy={scaled_intr[3]:.2f}")
-            print(f"🔍 内参缩放 - 比例: scale_x={scale_x:.6f}, scale_y={scale_y:.6f}")
-        
-        if self.debug:
-            print(f"🔍 投影调试 - 缩放内参: {scaled_intr.tolist()}")
-            print(f"🔍 投影调试 - 缩放比例: x={scale_x:.4f}, y={scale_y:.4f}")
-            print(f"🔍 投影调试 - 原始图像尺寸: {original_w}x{original_h} → 特征图尺寸: {feat_w}x{feat_h}")
-        
-        # 🔧 改进的投影机制：增加视距裁剪和空间优先级
-        valid, uv = self._improved_projection(xyz_cam_proj, scaled_intr, (feat_h, feat_w))
-        
-        # 🔍 调试投影问题
-        if self.debug:
-            with torch.no_grad():
-                z_values = xyz_cam_proj[:, 2]
-                print(f"🔍 投影调试 - 深度统计: min={z_values.min().item():.3f}, max={z_values.max().item():.3f}, "
-                      f"mean={z_values.mean().item():.3f}, 正深度比例={((z_values > 0).float().mean()*100):.1f}%")
-                print(f"🔍 投影调试 - 原始内参: {intr.tolist()}")
-                print(f"🔍 投影调试 - 缩放内参: {scaled_intr.tolist()}")
-                print(f"🔍 投影调试 - 缩放比例: x={scale_x:.4f}, y={scale_y:.4f}")
-                print(f"🔍 投影调试 - 原始图像尺寸: {original_w}x{original_h} → 特征图尺寸: {feat_w}x{feat_h}")
-                if valid.any():
-                    uv_valid = uv[valid]
-                    print(f"✅ 改进投影 - 有效投影: {valid.sum().item()}/{valid.numel()}, "
-                          f"uv范围: u[{uv_valid[:, 0].min().item():.1f}, {uv_valid[:, 0].max().item():.1f}], "
-                          f"v[{uv_valid[:, 1].min().item():.1f}, {uv_valid[:, 1].max().item():.1f}]")
-                else:
-                    print(f"🚨 改进投影 - 仍然无有效投影点！")
-        
-        sampled2d = xyz_cam_proj.new_zeros((xyz_cam_proj.shape[0], 256))  # 已经是256维，来自enhanced_clip的输出
-        if valid.any() and feat2d_map is not None:
-            # 确保uv和feat2d_map的数据类型匹配
-            if uv.dtype != feat2d_map.dtype:
-                uv = uv.to(feat2d_map.dtype)
-            f2d_vis = self.sample_img_feat(feat2d_map.unsqueeze(0), uv[valid])
-            sampled2d[valid] = f2d_vis.to(sampled2d.dtype)  # 确保输出类型一致
-        
-        # 2D特征后处理（已经是256维，无需额外投影）
-        feat2d = self.lin2d(sampled2d)  # 256 -> 256
-        feat2d = self.ln2d(feat2d)
-        # 应用L2归一化确保特征在单位球面
-        feat2d = F.normalize(feat2d + 1e-8, dim=-1, eps=1e-8)
+            # 缺少CLIP特征，使用零特征
+            print(f"⚠️ 缺少CLIP特征，使用零特征")
+            feat2d_raw = f3d.new_zeros((f3d.shape[0], 256))
+            valid = f3d.new_zeros((f3d.shape[0],), dtype=torch.bool)
+            f2d = self.head2d(feat2d_raw)
 
-        # 应用FiLM调制而非特征拼接
-        feat2d_modulated = self.film_modulation(feat2d, pe)
-        feat3d_modulated = self.film_modulation(feat3d, pe)
+        # 融合特征
+        f2d_batch = f2d.unsqueeze(0)
+        f3d_batch = f3d.unsqueeze(0)
+        valid_batch = valid.unsqueeze(0)
         
-        # 特征最终投影（不再需要PE拼接）
-        f2d_final = self.lin2d_final(feat2d_modulated)
-        f3d_final = self.lin3d_final(feat3d_modulated)
+        fused_batch, conf_batch = self.fusion_gate(f2d_batch, f3d_batch, valid_batch)
+        fused = fused_batch.squeeze(0)
+        conf = conf_batch.squeeze(0)
         
-        # 确保最终特征归一化到单位球面（在融合前）
-        f2d_final = F.normalize(f2d_final + 1e-8, dim=-1, eps=1e-8)
-        f3d_final = F.normalize(f3d_final + 1e-8, dim=-1, eps=1e-8)
+        # L2归一化
+        fused = F.normalize(fused, dim=-1)
+        
+        # 统计信息收集
+        if self._collect_fusion_stats:
+            self._collect_fusion_statistics(conf, valid, f2d, f3d)
+        self._log_key_metrics(valid, conf)
 
-        # 使用LiteFusionGate或Enhanced Gate进行融合
-        if self.use_lite_gate:
-            # 添加批量维度以适配LiteFusionGate
-            f2d_batch = f2d_final.unsqueeze(0)  # (1, N, 256)
-            f3d_batch = f3d_final.unsqueeze(0)  # (1, N, 256)
-            valid_batch = valid.unsqueeze(0)    # (1, N)
-            
-            fused_batch, conf_batch = self.fusion_gate(f2d_batch, f3d_batch, valid_batch)
-            fused = fused_batch.squeeze(0)      # (N, 256)
-            conf = conf_batch.squeeze(0)        # (N, 1)
-            
-            # 🔍 收集融合统计信息
-            if self._collect_fusion_stats:
-                self._collect_fusion_statistics(conf, valid, f2d_final, f3d_final)
-            
-        elif self.use_enhanced_gate:
-            fused, conf = self.fusion_gate(f2d_final, f3d_final, xyz_world, valid)
-            
-            # 🔍 收集融合统计信息
-            if self._collect_fusion_stats:
-                self._collect_fusion_statistics(conf, valid, f2d_final, f3d_final)
+        # 🔥 计算并保存融合平衡损失（用于主损失函数）
+        if self.training:
+            fusion_balance_loss = self.fusion_gate.compute_fusion_balance_loss(
+                conf, valid, target_ratio=0.4
+            )
+            # 保存到全局变量中，供损失函数获取
+            globals()['_current_fusion_balance_loss'] = fusion_balance_loss
         else:
-            # 回退到简单的gate机制
-            gate_input = torch.cat([f2d_final, f3d_final], dim=-1)
-            gate = self.gate_mlp(gate_input)
-            valid_weight = valid.float().unsqueeze(-1)
-            gate = gate * valid_weight + 0.2 * (1 - valid_weight)
-            fused = gate * f2d_final + (1 - gate) * f3d_final
-            conf = gate
-            
-            # 🔍 收集融合统计信息
-            if self._collect_fusion_stats:
-                self._collect_fusion_statistics(conf, valid, f2d_final, f3d_final)
+            globals()['_current_fusion_balance_loss'] = None
 
-        return fused, conf, pe, clip_global, valid
+        return fused, conf, valid
 
     def forward(self, points_list, imgs, cam_info):
-        """支持 List 或 batched Tensor 输入，统一返回 List 结果。"""
-        # 兼容性处理
+        """简化的forward函数：批量处理3D-2D融合"""
+        
+        # 1. 输入格式标准化
         if torch.is_tensor(points_list):
-            points_list = list(points_list)
+            points_list = list(points_list) if points_list.dim() == 3 else [points_list]
         if torch.is_tensor(imgs):
-            imgs = list(imgs)
+            imgs = list(imgs) if imgs.dim() == 4 else [imgs]
         
-        # 检查输入长度
-        n_points = len(points_list)
-        n_imgs = len(imgs)
+        batch_size = len(points_list)
+        if len(imgs) != batch_size:
+            raise RuntimeError(f"输入长度不匹配: points({len(points_list)}) != imgs({len(imgs)})")
         
-        # 基本长度检查（数据预处理器应该已经处理了tuple展开）
-        if n_points != n_imgs:
-            raise RuntimeError(f"Length mismatch after preprocessing: points_list ({n_points}) != imgs ({n_imgs})")
+        # 2. cam_info标准化
+        if cam_info is None or isinstance(cam_info, dict):
+            cam_info = [cam_info] * batch_size
+        elif len(cam_info) == 1:
+            cam_info = cam_info * batch_size
+        elif len(cam_info) != batch_size:
+            raise RuntimeError(f"cam_info长度({len(cam_info)})与batch_size({batch_size})不匹配")
         
-        # 处理cam_info格式
-        if isinstance(cam_info, dict):
-            # 单个字典，复制给所有样本
-            cam_info = [cam_info for _ in range(n_points)]
-        elif isinstance(cam_info, list):
-            # 已经是列表，确保长度匹配
-            if len(cam_info) != n_points:
-                # 如果长度不匹配，使用第一个元素填充
-                first_info = cam_info[0] if cam_info else {}
-                cam_info = [first_info for _ in range(n_points)]
-        else:
-            # 其他格式，使用默认值
-            default_info = {'intrinsics': [577.870605, 577.870605, 319.5, 239.5], 'extrinsics': None}
-            cam_info = [default_info for _ in range(n_points)]
-
-        # 最终长度验证
-        assert len(points_list) == len(imgs) == len(cam_info), \
-            f"Final length check failed: points={len(points_list)}, imgs={len(imgs)}, cam_info={len(cam_info)}"
-
-        # 批量CLIP处理（如果图像尺寸一致）
-        feat2d_maps, clip_globals = None, None
-        try:
-            if all(img.shape == imgs[0].shape for img in imgs):
-                imgs_batch = torch.stack(imgs, dim=0)
-                with torch.no_grad():
-                    amp_ctx = torch.cuda.amp.autocast(enabled=self.use_amp and imgs_batch.is_cuda)
-                    with amp_ctx:
-                        feat2d_maps, clip_globals = self.enhanced_clip(imgs_batch)
-        except Exception as e:
-            # 批量处理失败，回退到单独处理
-            feat2d_maps = clip_globals = None
-
-        # 逐样本处理
-        feat_fusion_list, conf_list, pe_list, clip_global_list, valid_mask_list = [], [], [], [], []
+        # 3. 逐样本处理
+        feat_fusion_list, conf_list, valid_mask_list = [], [], []
+        
         for idx, (pts, img, meta) in enumerate(zip(points_list, imgs, cam_info)):
-            try:
-                # 🔍 调试batch拆解过程
-                if self.debug and idx == 0:
-                    print(f"🔍 Forward拆解调试 - 第{idx}个样本:")
-                    print(f"   points形状: {pts.shape}")
-                    print(f"   img形状: {img.shape}")
-                    print(f"   meta类型: {type(meta)}")
-                    if isinstance(meta, dict):
-                        print(f"   meta键值: {list(meta.keys())}")
-                        for key, value in meta.items():
-                            if isinstance(value, (list, tuple, np.ndarray)):
-                                print(f"   meta[{key}]类型: {type(value)}, 长度: {len(value) if hasattr(value, '__len__') else 'N/A'}")
-                                if torch.is_tensor(value):
-                                    tensor_value = cast(torch.Tensor, value)
-                                    print(f"   meta[{key}]形状: {tensor_value.shape}")
-                                elif isinstance(value, np.ndarray):
-                                    ndarray_value = cast(np.ndarray, value)
-                                    print(f"   meta[{key}]形状: {ndarray_value.shape}")
-                                else:
-                                    print(f"   meta[{key}]形状: 非tensor/ndarray类型")
-                            else:
-                                print(f"   meta[{key}]类型: {type(value)}")
-                
-                # 确保meta是字典格式
-                if not isinstance(meta, dict):
-                    meta = {'intrinsics': [577.870605, 577.870605, 319.5, 239.5], 'extrinsics': None}
-                
-                # 🔧 关键修复：拆解meta内部的batch数据
-                meta_fixed = {}
-                for key, value in meta.items():
-                    if key in ['pose', 'extrinsics'] and isinstance(value, (list, tuple, np.ndarray)):
-                        if hasattr(value, '__len__') and len(value) > idx:
-                            # 🔧 关键修复：正确处理不同形状的batch数据
-                            if isinstance(value, np.ndarray) and value.ndim == 2 and value.shape == (4, 4):
-                                # 4x4变换矩阵保持完整，这是单个矩阵，不是batch
-                                meta_fixed[key] = value
-                                if self.debug and idx == 0:
-                                    print(f"🔧 保持{key}完整: 形状{value.shape}，单个4x4变换矩阵")
-                            elif isinstance(value, np.ndarray) and value.ndim == 3:
-                                # 3D数组: [batch_size, 4, 4] → 选择第idx个[4, 4]
-                                meta_fixed[key] = value[idx]
-                                if self.debug and idx == 0:
-                                    print(f"🔧 拆解{key}: 从形状{value.shape}中选择第{idx}个4x4矩阵")
-                            else:
-                                # 其他情况：list、tuple或其他格式，按索引拆解
-                                meta_fixed[key] = value[idx]
-                                if self.debug and idx == 0:
-                                    print(f"🔧 拆解{key}: 从长度{len(value)}的{type(value).__name__}中选择第{idx}个元素")
-                        else:
-                            meta_fixed[key] = value
-                    else:
-                        meta_fixed[key] = value
-                
-                # 确保intrinsics存在
-                if 'intrinsics' not in meta_fixed:
-                    meta_fixed['intrinsics'] = [577.870605, 577.870605, 319.5, 239.5]  # ScanNet默认内参
-                
-                fmap = feat2d_maps[idx:idx+1] if feat2d_maps is not None else None
-                cglb = clip_globals[idx] if clip_globals is not None else None
-                fused, conf, pe, clip_global, valid_mask = self._process_single(pts, img, meta_fixed, 
-                                                                  fmap.squeeze(0) if fmap is not None else None, 
-                                                                  cglb)
-                feat_fusion_list.append(fused)
-                conf_list.append(conf)
-                pe_list.append(pe)
-                clip_global_list.append(clip_global)
-                valid_mask_list.append(valid_mask)
+            # 简化meta信息处理：PKL文件是帧级组织，直接复制
+            meta_std = meta if meta is not None else {}
             
-            except Exception as e:
-                raise e  # 重新抛出异常，不要跳过样本
+            # 处理单个样本，传递样本索引
+            fused, conf, valid_mask = self._process_single(pts, img, meta_std, idx)
+            
+            feat_fusion_list.append(fused)
+            conf_list.append(conf)
+            valid_mask_list.append(valid_mask)
         
         return {
             'feat_fusion': feat_fusion_list,
             'conf_2d': conf_list,
-            'pe_xyz': pe_list,
-            'clip_global': clip_global_list,
-            'valid_projection_mask': valid_mask_list  # 新增有效投影掩码
+            'valid_projection_mask': valid_mask_list
         }

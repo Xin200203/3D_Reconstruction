@@ -28,6 +28,12 @@ from .scannet_dataset import ScanNetSegDataset_, ScanNet200SegDataset_, ScanNet2
 from .time_divided_transformer import TimeDividedTransformer
 from .bi_fusion_encoder import BiFusionEncoder
 from .bife_clip_loss import ClipConsCriterion
+
+# Training optimization components
+from .training_scheduler import ProgressScheduler
+from .param_groups import create_param_groups, ProgressiveFreezeManager
+from .cumulative_loss_recorder import EnhancedCumulativeLossRecorder
+from .optimized_training_hook import OptimizedTrainingHook
 # 将所有在 mmdet3d.registry.MODELS 中注册的模块同步到 mmengine.registry.MODELS，
 # 以便 mmengine 的 BaseModel 能够直接查询到自定义组件（如 Det3DDataPreprocessor_）。
 from mmdet3d.registry import MODELS as _M3D_MODELS  # noqa: E402
