@@ -5,19 +5,28 @@ tensorboard/
 vis_demo/results/
 output/
 outputs/
+work_dirs/
+experiments/
+checkpoints/
+wintermute_outputs/
+wintermute_logs/
 pose_centered/
 scannet*_instance_data/
 *.lmdb
+wandb/
+mlruns/
 
 ####################################
 # Data
 data/
 !data/**/meta_data/**
 !data/README*
+!data/**/.gitkeep
 
 ####################################
 # Large binary files
 *.pth
+*.pth.tar
 *.ckpt
 *.bin
 *.tar
@@ -41,6 +50,8 @@ pip-wheel-metadata/
 *.egg-info/
 *.egg
 MANIFEST
+*.a
+*.dll
 
 # third-party compiled dirs
 thirdparty/**/build/
@@ -53,6 +64,7 @@ thirdparty/**/*.o
 .pytest_cache/
 .mypy_cache/
 *.coverage
+coverage/
 
 ####################################
 # Env / tooling
@@ -61,9 +73,26 @@ thirdparty/**/*.o
 .vscode/
 .idea/
 *.log
+*.lock
+.cache/
+.pip/
+nohup.out
+
+####################################
+# Notebooks
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
 
 ####################################
 # OS
 .DS_Store
 Thumbs.db
 thirdparty/FastSAM
+
+####################################
+# Temporary / editor files
+*~
+*.swp
+*.swo
+*.tmp
+tmp/

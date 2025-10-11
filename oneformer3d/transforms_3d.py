@@ -1,9 +1,9 @@
+import math
 import numpy as np
 import scipy
 import torch
 from torch_scatter import scatter_mean
 from mmcv.transforms import BaseTransform
-import pdb
 from mmdet3d.registry import TRANSFORMS
 
 
@@ -532,3 +532,144 @@ class BboxCalculation(BaseTransform):
 class NoOperation(BaseTransform):
     def transform(self, input_dict):
         return input_dict
+def _as_numpy_matrix(mat, dtype=np.float32):
+    """Convert input to numpy 4x4 matrix."""
+    if mat is None:
+        return None
+    if isinstance(mat, np.ndarray):
+        return mat.astype(dtype)
+    if isinstance(mat, torch.Tensor):
+        return mat.detach().cpu().numpy().astype(dtype)
+    raise TypeError(f'Unsupported matrix type: {type(mat)}')
+
+
+def _compose_rigid_transform(results, transform):
+    """Compose and flag rigid transform."""
+    if 'rigid_transform' not in results:
+        results['rigid_transform'] = np.eye(4, dtype=np.float32)
+    results['rigid_transform'] = transform @ results['rigid_transform']
+    results['rigid_transform_applied'] = True
+
+
+def _apply_transform_to_points(points, matrix):
+    """Apply 3x3 rotation + translation to BasePoints or ndarray."""
+    rot = torch.from_numpy(matrix[:3, :3]).to(points.tensor.device, points.tensor.dtype)
+    trans = torch.from_numpy(matrix[:3, 3]).to(points.tensor.device, points.tensor.dtype)
+    coords = points.tensor[:, :3]
+    coords = coords @ rot.t()
+    coords = coords + trans
+    points.tensor[:, :3] = coords
+
+
+@TRANSFORMS.register_module()
+class InitRigidTransform(BaseTransform):
+    """Initialize rigid transform accumulator."""
+
+    def transform(self, results):
+        results['rigid_transform'] = np.eye(4, dtype=np.float32)
+        results['rigid_transform_applied'] = False
+        return results
+
+
+@TRANSFORMS.register_module()
+class RandomRotateAroundZWithPose(BaseTransform):
+    """Randomly rotate scene around Z axis while keeping pose aligned."""
+
+    def __init__(self, angle_range=(-math.pi, math.pi), prob=1.0):
+        self.angle_range = angle_range
+        self.prob = prob
+
+    def transform(self, results):
+        if np.random.rand() > self.prob:
+            return results
+
+        angle = np.random.uniform(self.angle_range[0], self.angle_range[1])
+        if abs(angle) < 1e-5:
+            return results
+
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        rot = np.array([[cos_a, -sin_a, 0.0],
+                        [sin_a,  cos_a, 0.0],
+                        [0.0,    0.0,   1.0]], dtype=np.float32)
+
+        transform = np.eye(4, dtype=np.float32)
+        transform[:3, :3] = rot
+
+        if 'points' in results:
+            _apply_transform_to_points(results['points'], transform)
+
+        _compose_rigid_transform(results, transform)
+        return results
+
+
+@TRANSFORMS.register_module()
+class RandomFlipWithPose(BaseTransform):
+    """Randomly flip scene along x/y axes with pose alignment."""
+
+    def __init__(self,
+                 flip_ratio_horizontal=0.5,
+                 flip_ratio_vertical=0.5):
+        self.flip_ratio_horizontal = flip_ratio_horizontal
+        self.flip_ratio_vertical = flip_ratio_vertical
+
+    @staticmethod
+    def _flip_matrix(axis):
+        transform = np.eye(4, dtype=np.float32)
+        transform[axis, axis] = -1.0
+        return transform
+
+    def transform(self, results):
+        flipped = False
+        if np.random.rand() < self.flip_ratio_horizontal:
+            transform = self._flip_matrix(0)
+            if 'points' in results:
+                _apply_transform_to_points(results['points'], transform)
+            _compose_rigid_transform(results, transform)
+            flipped = True
+
+        if np.random.rand() < self.flip_ratio_vertical:
+            transform = self._flip_matrix(1)
+            if 'points' in results:
+                _apply_transform_to_points(results['points'], transform)
+            _compose_rigid_transform(results, transform)
+            flipped = True
+
+        if flipped:
+            return results
+
+        # ensure flags exist even if no flip applied
+        if 'rigid_transform' not in results:
+            results['rigid_transform'] = np.eye(4, dtype=np.float32)
+            results['rigid_transform_applied'] = False
+        return results
+
+
+@TRANSFORMS.register_module()
+class ApplyRigidTransformToPose(BaseTransform):
+    """Apply accumulated rigid transform to pose and cam info."""
+
+    def transform(self, results):
+        transform = results.get('rigid_transform')
+        if transform is None or not results.get('rigid_transform_applied', False):
+            return results
+
+        transform = transform.astype(np.float32)
+
+        pose = results.get('pose')
+        if pose is not None:
+            pose_np = _as_numpy_matrix(pose)
+            results['pose'] = transform @ pose_np
+
+        cam_info = results.get('cam_info')
+        if cam_info is not None:
+            for cam in cam_info:
+                if cam is None:
+                    continue
+                if 'pose' in cam and cam['pose'] is not None:
+                    cam_pose = _as_numpy_matrix(cam['pose'])
+                    cam['pose'] = transform @ cam_pose
+
+        results['rigid_transform_applied'] = False
+        return results
+

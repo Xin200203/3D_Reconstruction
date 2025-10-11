@@ -19,9 +19,6 @@ from .img_backbone import point_sample
 import os
 from typing import Any, Dict, List, Tuple, Union, Optional, cast
 from mmengine import ConfigDict
-from .training_scheduler import ProgressScheduler
-from .param_groups import create_param_groups, ProgressiveFreezeManager
-from .cumulative_loss_recorder import EnhancedCumulativeLossRecorder
 
 @MODELS.register_module()
 class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
@@ -89,38 +86,11 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 else:
                     self.alpha_regularizers[reg_name] = None
         
-        # Training optimization components
-        self.training_optimization = training_optimization or {}
+        # Training optimization components (disabled in lightweight build)
+        self.training_optimization = training_optimization
         self.progress_scheduler = None
         self.progressive_freeze_manager = None
         self.enhanced_loss_recorder = None
-        
-        # Initialize optimization components if configuration provided
-        if self.training_optimization.get('enabled', True):
-            opt_config = self.training_optimization
-            
-            # Progress scheduler
-            scheduler_config = opt_config.get('progress_scheduler', {})
-            if scheduler_config.get('enabled', True):
-                self.progress_scheduler = ProgressScheduler(
-                    max_updates=scheduler_config.get('max_updates', 10000)
-                )
-                
-                # Inject progress scheduler into CLIP criterion
-                if self.clip_criterion is not None and hasattr(self.clip_criterion, 'set_progress_scheduler'):
-                    self.clip_criterion.set_progress_scheduler(self.progress_scheduler)
-            
-            # Progressive freeze manager will be initialized with model after creation
-            self.progressive_freeze_config = opt_config.get('progressive_freeze', {})
-            
-            # Enhanced loss recorder
-            recorder_config = opt_config.get('loss_recorder', {})
-            if recorder_config.get('enabled', True):
-                self.enhanced_loss_recorder = EnhancedCumulativeLossRecorder(
-                    output_file=recorder_config.get('output_file', 'work_dirs/enhanced_loss_records.jsonl'),
-                    window_size=recorder_config.get('window_size', 1000),
-                    log_interval=recorder_config.get('log_interval', 50)
-                )
         
         self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.voxel_size = voxel_size
@@ -129,33 +99,16 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.train_cfg = train_cfg
 
     def initialize_training_optimization(self):
-        """Initialize progressive freeze manager after model is fully constructed."""
-        if (hasattr(self, 'progressive_freeze_config') and 
-            self.progressive_freeze_config.get('enabled', False)):
-            self.progressive_freeze_manager = ProgressiveFreezeManager(self)
+        """Placeholder for compatibility; no-op in lightweight build."""
+        return None
 
     def get_param_groups(self, base_lr: float = 1e-4) -> List[Dict]:
-        """Get parameter groups for differential learning rates."""
-        return create_param_groups(
-            self,
-            base_lr=base_lr,
-            clip_backbone_lr_ratio=0.1,  # CLIP backbone gets 10% of base LR
-            clip_heads_lr_ratio=0.2,     # CLIP heads get 20% of base LR
-            backbone3d_lr_ratio=1.0,     # 3D backbone gets full base LR
-            decoder_lr_ratio=1.0,        # Decoder gets full base LR
-            base_weight_decay=0.05
-        )
+        """Return a single parameter group for default optimizer setup."""
+        return [{'params': self.parameters(), 'lr': base_lr}]
 
     def update_training_progress(self, step: int):
         """Update training progress and apply scheduled modifications."""
-        if self.progress_scheduler is not None:
-            self.progress_scheduler.current_step = step
-            
-            # Apply progressive freeze/unfreeze based on progress
-            if self.progressive_freeze_manager is not None:
-                progress = self.progress_scheduler.get_progress()
-                freeze_config = self._get_freeze_config_for_progress(progress)
-                self.progressive_freeze_manager.apply_freeze_schedule(freeze_config)
+        return None
 
     def _get_freeze_config_for_progress(self, progress: float) -> Dict[str, bool]:
         """Get freeze configuration based on training progress."""
@@ -392,44 +345,6 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             losses.update(tensor_stats)
         
         # Enhanced loss recording and anomaly detection
-        if self.enhanced_loss_recorder is not None:
-            # Calculate total loss (only summing tensor values)
-            tensor_losses = {k: v for k, v in losses.items() if isinstance(v, torch.Tensor)}
-            total_loss_value = float(sum(tensor_losses.values()))
-            
-            # Collect comprehensive metrics for monitoring
-            enhanced_metrics = {
-                'total_loss': total_loss_value,
-                'clip_loss': clip_loss_value,
-                'progress': self.progress_scheduler.get_progress() if self.progress_scheduler else 0.0,
-            }
-            
-            # Add fusion stats if available
-            if self.bi_encoder is not None and hasattr(self.bi_encoder, '_fusion_stats') and self.bi_encoder._fusion_stats:
-                fusion_stats = self.bi_encoder._fusion_stats
-                enhanced_metrics.update({
-                    'valid_ratio': fusion_stats.get('valid_ratio', 1.0),
-                    'cos_2d3d_mean': fusion_stats.get('cos_2d3d_mean', 0.0),
-                    'cos_2d3d_mean_ln': fusion_stats.get('cos_2d3d_mean_ln', 0.0)
-                })
-            
-            # Record with anomaly detection (mimicking hook interface)
-            try:
-                # Create a simplified runner-like object for the hook
-                class SimpleRunner:
-                    def __init__(self):
-                        self.iter = getattr(self, '_training_step', 0)
-                
-                runner_like = SimpleRunner()
-                self.enhanced_loss_recorder.after_train_iter(
-                    runner_like, 
-                    batch_idx=getattr(self, '_training_step', 0),
-                    outputs={'loss': enhanced_metrics['total_loss']}
-                )
-            except Exception as e:
-                # Fail silently for monitoring - don't break training
-                print(f"Warning: Enhanced loss recording failed: {e}")
-        
         return losses
 
     def predict(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], **kwargs) -> List[Any]:  # type: ignore[override]

@@ -3,7 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mmdet3d.registry import MODELS
 from typing import Optional
-from .training_scheduler import ProgressScheduler, coverage_aware_weight
+
+def _coverage_weight(valid_ratio: float, threshold: float, use_soft_gate: bool) -> float:
+    """Simple coverage-aware weighting."""
+    valid_ratio = float(max(0.0, min(1.0, valid_ratio)))
+    threshold = float(max(1e-6, threshold))
+    if use_soft_gate:
+        scaled = valid_ratio / threshold
+        return float(max(0.0, min(1.0, scaled)))
+    return 1.0 if valid_ratio >= threshold else 0.0
+
 
 @MODELS.register_module()
 class ClipConsCriterion(nn.Module):
@@ -41,9 +50,9 @@ class ClipConsCriterion(nn.Module):
         self.ramp_duration_progress = ramp_duration_progress
         self.coverage_threshold = coverage_threshold
         self.use_soft_coverage_gate = use_soft_coverage_gate
-        
-        # Progress scheduler will be injected from outside
-        self.progress_scheduler: Optional[ProgressScheduler] = None
+
+        # In lightweight build we do not wire progress scheduler
+        self.progress_scheduler: Optional[object] = None
         self.current_step = 0  # Fallback counter
         
         # For numerical stability
@@ -52,29 +61,22 @@ class ClipConsCriterion(nn.Module):
 
     def get_current_weight(self) -> float:
         """Calculate current loss weight using progress scheduler."""
-        if self.progress_scheduler is not None:
-            # Use injected progress scheduler for modern progress-based scheduling
-            base_weight = self.progress_scheduler.clip_weight_schedule(
-                self.final_loss_weight,
-                self.warmup_end_progress,
-                self.ramp_duration_progress
-            )
-            return base_weight
-        else:
-            # Fallback to legacy step-based scheduling
-            if self.current_step == 0:
-                return 0.0
-            # Simple linear ramp-up
-            progress = min(1.0, self.current_step / 4000.0)  # 4000 steps = full weight
-            return self.final_loss_weight * progress
+        if self.current_step == 0:
+            return 0.0
+        total_warmup_steps = max(1, int(self.warmup_end_progress * 4000))
+        total_ramp_steps = max(1, int(self.ramp_duration_progress * 4000))
+        if self.current_step <= total_warmup_steps:
+            return 0.0
+        ramp_progress = min(1.0, (self.current_step - total_warmup_steps) / total_ramp_steps)
+        return self.final_loss_weight * ramp_progress
     
     def step(self):
         """Call this after each training step to update internal counter."""
         self.current_step += 1
 
-    def set_progress_scheduler(self, scheduler: 'ProgressScheduler'):
-        """Inject progress scheduler for modern progress-based scheduling."""
-        self.progress_scheduler = scheduler
+    def set_progress_scheduler(self, scheduler):
+        """Compatibility shim – ignored in lightweight build."""
+        self.progress_scheduler = None
 
     def forward(self, feat_fusion, clip_feat_detach, valid_projection_mask=None):
         """Enhanced CLIP alignment loss computation with v1 optimizations.
@@ -159,11 +161,10 @@ class ClipConsCriterion(nn.Module):
         # Apply coverage-aware weighting
         num_batches = len(feat_fusion)
         avg_valid_ratio = total_valid_ratio / max(num_batches, 1e-8)
-        coverage_weight = coverage_aware_weight(
-            avg_valid_ratio, 
-            self.coverage_threshold, 
-            self.use_soft_coverage_gate
-        )
+        coverage_weight = _coverage_weight(
+            avg_valid_ratio,
+            self.coverage_threshold,
+            self.use_soft_coverage_gate)
         
         # Final weight combines schedule weight and coverage weight
         final_weight = current_weight * coverage_weight

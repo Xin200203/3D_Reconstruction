@@ -230,10 +230,6 @@ class Conv3DFusionModule(nn.Module):
 
         return output_sparse
 
-
-# LiteFusionGate类已删除 - 专门使用3D卷积融合
-
-
 @MODELS.register_module(name='BiFusionEncoder3DMV')
 class BiFusionEncoder(nn.Module):
     """Enhanced Bi-Fusion Encoder combining 2D CLIP visual features and 3D Sparse features.
@@ -533,25 +529,6 @@ class BiFusionEncoder(nn.Module):
         
         return extracted
 
-        # 🔧 修正：确保缩放方向正确
-        # 原始ScanNet: 640×480 (W×H)
-        # 特征图: Wf×Hf
-        scale_w = Wf / 640.0  # 宽度缩放
-        scale_h = Hf / 480.0  # 高度缩放
-
-        # 内参缩放：保持x/y方向对应关系
-        fx_feat = fx0 * scale_w  # x方向焦距随宽度缩放
-        fy_feat = fy0 * scale_h  # y方向焦距随高度缩放
-        cx_feat = cx0 * scale_w  # x方向主点随宽度缩放
-        cy_feat = cy0 * scale_h  # y方向主点随高度缩放
-
-        if self.debug:
-            print(f"🔧 内参缩放: 宽度缩放={scale_w:.3f}, 高度缩放={scale_h:.3f}")
-            print(f"🔧 计算结果: fx={fx_feat:.1f}, fy={fy_feat:.1f}, cx={cx_feat:.1f}, cy={cy_feat:.1f}")
-
-        return (fx_feat, fy_feat, cx_feat, cy_feat)
-
-
     def get_pose_pick_stats(self):
         """保留接口，当前实现不统计该信息。"""
         return {}
@@ -677,6 +654,7 @@ class BiFusionEncoder(nn.Module):
 
     def _extract_pose_matrix(self, cam_meta: Dict, sample_idx: int = 0):
         """从 cam_info 中提取单帧 pose 矩阵（cam2world）。"""
+        # !!!!!
         if not isinstance(cam_meta, dict):
             return None
 
@@ -759,11 +737,13 @@ class BiFusionEncoder(nn.Module):
                 clip_data = None
 
         if xyz_cam_proj is None or clip_data is None:
+            print("Missing xyz_cam_proj or clip_data; falling back to zero 2D features.")
             if clip_data is None:
                 warnings.warn("Missing clip_pix feature; falling back to zero 2D features.", stacklevel=2)
             feat2d_raw = torch.zeros((points.shape[0], 256), device=dev, dtype=torch.float32)
             valid = torch.zeros(points.shape[0], device=dev, dtype=torch.bool)
         else:
+            # !!!!
             if isinstance(clip_data, torch.Tensor):
                 feat_map = clip_data.to(device=dev, dtype=torch.float32)
             elif isinstance(clip_data, np.ndarray):
@@ -868,10 +848,9 @@ class BiFusionEncoder(nn.Module):
             monitor_stats = {}
             self._last_param_grad_norms = {}
 
-        # L2归一化确保特征稳定性，同时记录归一化前的幅度信息
+        # 记录融合特征原始幅值，便于监控
         fused_pre_norm = fused.detach()
-        fused = F.normalize(fused, dim=-1, eps=1e-6)
-        
+
         # 简化的统计信息收集
         if self._collect_fusion_stats:
             try:
@@ -885,8 +864,6 @@ class BiFusionEncoder(nn.Module):
                     monitor_stats['fused_mean_abs_raw'] = fused_pre_norm.abs().mean().item()
                     monitor_stats['fused_std_raw'] = fused_pre_norm.std().item()
                     monitor_stats['fused_norm_mean_raw'] = fused_pre_norm.norm(dim=-1).mean().item()
-                    monitor_stats['fused_mean_abs'] = fused.abs().mean().item()
-                    monitor_stats['fused_std'] = fused.std().item()
 
                 self._fusion_stats = {
                     'valid_ratio': valid_ratio,

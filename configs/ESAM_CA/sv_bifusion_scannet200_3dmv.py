@@ -85,8 +85,18 @@ train_pipeline = [
         use_color=True,
         load_dim=6,
         use_dim=[0, 1, 2, 3, 4, 5]),
+    dict(type='InitRigidTransform'),
+    dict(
+        type='RandomRotateAroundZWithPose',
+        angle_range=[-3.14, 3.14],
+        prob=1.0),
+    dict(
+        type='RandomFlipWithPose',
+        flip_ratio_horizontal=0.5,
+        flip_ratio_vertical=0.5),
     dict(type='LoadClipFeature', data_root=DATA_ROOT),
     dict(type='LoadSingleImageFromFile'),
+    dict(type='ApplyRigidTransformToPose'),
     dict(
         type='LoadAnnotations3D_',
         with_bbox_3d=False,
@@ -96,20 +106,6 @@ train_pipeline = [
         with_sp_mask_3d=True),
     dict(type='SwapChairAndFloor'),
     dict(type='PointSegClassMapping'),
-    
-    # 🚫 禁用所有几何增强 - 以下组件已注释，保持2D-3D投影关系准确
-    # dict(
-    #     type='RandomFlip3D',
-    #     sync_2d=False,
-    #     flip_ratio_bev_horizontal=0.5,
-    #     flip_ratio_bev_vertical=0.5),
-    # dict(
-    #     type='GlobalRotScaleTrans',
-    #     rot_range=[-3.14, 3.14],
-    #     scale_ratio_range=[0.8, 1.2],
-    #     translation_std=[0.1, 0.1, 0.1],
-    #     shift_height=False),
-    
     # 🎨 2D图像光度增强 (待实现)
     # 注：以下2D光度增强组件需要在oneformer3d/transforms_3d.py中实现后才能启用
     # dict(
