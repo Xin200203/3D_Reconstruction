@@ -19,9 +19,6 @@ mlruns/
 ####################################
 # Data
 data/
-!data/**/meta_data/**
-!data/README*
-!data/**/.gitkeep
 
 ####################################
 # Large binary files
