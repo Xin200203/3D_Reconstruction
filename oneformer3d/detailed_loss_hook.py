@@ -62,22 +62,30 @@ class DetailedLossMonitorHook(Hook):
         
         # 主要损失
         if 'loss' in log_vars:
-            loss_report['total_loss'] = log_vars['loss']
+            loss_report['total_loss'] = float(log_vars['loss'])
             
         # 语义损失
         for key in log_vars:
             if 'sem_loss' in key or 'semantic' in key:
-                loss_report[f'semantic_{key}'] = log_vars[key]
+                loss_report[f'semantic_{key}'] = float(log_vars[key])
                 
         # 实例损失
         for key in log_vars:
             if any(x in key for x in ['inst_loss', 'cls_loss', 'mask_bce_loss', 'mask_dice_loss', 'score_loss']):
-                loss_report[f'instance_{key}'] = log_vars[key]
+                loss_report[f'instance_{key}'] = float(log_vars[key])
                 
         # CLIP损失
         for key in log_vars:
             if 'clip' in key.lower():
-                loss_report[f'clip_{key}'] = log_vars[key]
+                loss_report[f'clip_{key}'] = float(log_vars[key])
+
+        # 2D / 对齐损失与监控
+        for key in log_vars:
+            if key.startswith('loss_2d_') or key in {'loss_align', 'loss_align_raw'}:
+                loss_report[key] = float(log_vars[key])
+        for key in ['supervised_pixel_ratio', 'cover_mean', 'cover_p95']:
+            if key in log_vars:
+                loss_report[key] = float(log_vars[key])
                 
         # 融合统计（直接从log_vars中提取）
         fusion_keys = [
@@ -108,7 +116,7 @@ class DetailedLossMonitorHook(Hook):
         ]
         for key in fusion_keys:
             if key in log_vars:
-                loss_report[key] = log_vars[key]
+                loss_report[key] = float(log_vars[key])
                 
         return loss_report
     

@@ -16,6 +16,7 @@ from .oneformer3d import ScanNetOneFormer3DMixin
 from .instance_merge import ins_merge_mat, ins_cat, ins_merge, OnlineMerge, GTMerge
 import numpy as np
 from .img_backbone import point_sample
+from .projection_utils import project_points_to_uv, splat_to_grid, SCANET_INTRINSICS
 import os
 from typing import Any, Dict, List, Tuple, Union, Optional, cast
 from mmengine import ConfigDict
@@ -58,6 +59,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                  pool=None,
                  decoder=None,
                  criterion=None,
+                 two_d_losses=None,
                  train_cfg=None,
                  test_cfg=None,
                  data_preprocessor=None,
@@ -73,7 +75,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.bi_encoder = MODELS.build(_cfg(bi_encoder, 'bi_encoder')) if bi_encoder is not None else None
         self.neck = MODELS.build(_cfg(neck, 'neck')) if neck is not None else None
         self.pool = MODELS.build(_cfg(pool, 'pool'))
-        self.decoder = MODELS.build(_cfg(decoder, 'decoder'))
+        decoder_cfg = _cfg(decoder, 'decoder')
+        self.decoder = MODELS.build(decoder_cfg)
         self.criterion = MODELS.build(_cfg(criterion, 'criterion'))
         self.clip_criterion = MODELS.build(_cfg(clip_criterion, 'clip_criterion')) if clip_criterion is not None else None
         
@@ -97,6 +100,34 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.num_classes = num_classes
         self.query_thr = query_thr
         self.train_cfg = train_cfg
+
+        # 2D supervision placeholders
+        self._two_d_hidden_dim = decoder_cfg.get('in_channels', 128)
+        self._num_semantic_classes_2d = decoder_cfg.get('num_semantic_classes', 0)
+        self.seg2d_head: Optional[nn.Module] = None
+        self.recon2d_head: Optional[nn.Module] = None
+        self._clip_channels: Optional[int] = None
+        default_two_d_cfg = {
+            'enable_recon': False,
+            'enable_seg': False,
+            'w_recon': 0.0,
+            'w_seg': 0.0,
+            'w_align': 0.0,
+            'recon_tau': 1.0,
+            'seg_conf': 1.0,
+            'depth_tol': 0.05,
+            'grid_hw': (60, 80),
+            'alpha_max': 1.0,
+            'alpha_warmup': 0,
+            'recon_warmup': 0,
+            'seg_warmup': 0,
+            'align_warmup': 0,
+        }
+        if two_d_losses is not None:
+            default_two_d_cfg.update(two_d_losses)
+        self.two_d_loss_cfg = default_two_d_cfg
+        self._loss_call_counter = 0
+        self._loss_call_counter = 0
 
     def initialize_training_optimization(self):
         """Placeholder for compatibility; no-op in lightweight build."""
@@ -129,12 +160,59 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         
         return config
 
+    def _ensure_2d_heads(self, clip_channels: Optional[int], device: torch.device) -> None:
+        hidden = self._two_d_hidden_dim
+
+        if self.two_d_loss_cfg.get('enable_seg', False) and self._num_semantic_classes_2d > 0:
+            if self.seg2d_head is None:
+                self.seg2d_head = nn.Sequential(
+                    nn.Conv2d(hidden, hidden, kernel_size=1),
+                    nn.GroupNorm(8, hidden),
+                    nn.GELU(),
+                    nn.Conv2d(hidden, self._num_semantic_classes_2d + 1, kernel_size=1)
+                ).to(device)
+
+        if self.two_d_loss_cfg.get('enable_recon', False):
+            if clip_channels is None:
+                return
+            if self.recon2d_head is None or self._clip_channels != clip_channels:
+                self._clip_channels = clip_channels
+                self.recon2d_head = nn.Sequential(
+                    nn.Conv2d(hidden, hidden, kernel_size=1),
+                    nn.GroupNorm(8, hidden),
+                    nn.GELU(),
+                    nn.Conv2d(hidden, clip_channels, kernel_size=1)
+                ).to(device)
+
     def extract_feat(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any]) -> Tuple[List[Any], List[torch.Tensor], Any]:  # type: ignore[override]
         """Extract features from sparse tensor."""
         if self.bi_encoder is not None and 'imgs' in batch_inputs_dict:
             # === BiFusion path ===
+            # 使 ElasticTransfrom 在 BiFusion 路径下也生效：
+            # 若存在 'elastic_coords'，将其替换到 points 的 xyz（世界坐标系）后再送入 bi_encoder。
+            points_list = batch_inputs_dict['points']
+            if 'elastic_coords' in batch_inputs_dict and isinstance(points_list, list):
+                replaced_points = []
+                elastic_list = batch_inputs_dict['elastic_coords']
+                for i in range(len(points_list)):
+                    pts = points_list[i]
+                    ec = elastic_list[i]
+                    if not torch.is_tensor(ec):
+                        ec = torch.as_tensor(ec, dtype=pts.dtype, device=pts.device)
+                    else:
+                        ec = ec.to(device=pts.device, dtype=pts.dtype)
+                    # ElasticTransfrom 产生的是体素坐标，需乘以 voxel_size 还原到世界坐标
+                    xyz_world = ec * self.voxel_size
+                    # 保留原有颜色等特征通道
+                    feats_rest = pts[:, 3:]
+                    pts_new = torch.cat([xyz_world, feats_rest], dim=1)
+                    replaced_points.append(pts_new)
+                points_for_encoder = replaced_points
+            else:
+                points_for_encoder = points_list
+
             encoder_out = self.bi_encoder(
-                batch_inputs_dict['points'],
+                points_for_encoder,
                 batch_inputs_dict['imgs'],
                 batch_inputs_dict['cam_info']
             )
@@ -145,7 +223,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             
             self._encoder_out = encoder_out  # cache for loss
             fused_list = encoder_out['feat_fusion']
-            all_xyz = [pts[:, :3] for pts in batch_inputs_dict['points']]
+            # 与送入 bi_encoder 的坐标保持一致（若替换为 elastic 后，这里也同步使用）
+            all_xyz = [pts[:, :3] for pts in points_for_encoder]
 
             # 基本长度检查（bi_encoder已经有详细验证）
             if len(fused_list) != len(batch_data_samples):
@@ -263,6 +342,9 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         ## Loss computation with v1 optimizations
         losses = self.criterion(x, gt_instances, gt_point_instances, None, self.decoder.mask_pred_mode)
         
+        self._loss_call_counter = getattr(self, '_loss_call_counter', 0) + 1
+        current_step = self._loss_call_counter
+
         # Enhanced CLIP consistency loss with progress-aware scheduling
         clip_loss_value = 0.0
         if self.clip_criterion is not None and hasattr(self, '_encoder_out'):
@@ -289,6 +371,259 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             )
             losses.update(dict(loss_clip=loss_clip))
             clip_loss_value = float(loss_clip) if isinstance(loss_clip, torch.Tensor) else loss_clip
+
+        two_d_cfg = getattr(self, 'two_d_loss_cfg', None)
+        if two_d_cfg is not None and hasattr(self, 'bi_encoder') and self.bi_encoder is not None:
+            base_device = next(self.parameters()).device
+
+            def _effective_weight(name: str, warm_name: str) -> float:
+                base = float(two_d_cfg.get(name, 0.0))
+                warm = max(int(two_d_cfg.get(warm_name, 0)), 0)
+                if warm > 0:
+                    return base * min(1.0, current_step / warm)
+                return base
+
+            w_recon_eff = _effective_weight('w_recon', 'recon_warmup')
+            w_seg_eff = _effective_weight('w_seg', 'seg_warmup')
+            w_align_eff = _effective_weight('w_align', 'align_warmup')
+            recon_enabled_cfg = bool(two_d_cfg.get('enable_recon', False)) and w_recon_eff > 0
+            seg_enabled_cfg = bool(two_d_cfg.get('enable_seg', False)) and w_seg_eff > 0 and self._num_semantic_classes_2d > 0
+            align_enabled_cfg = w_align_eff > 0
+
+            alpha_max = float(two_d_cfg.get('alpha_max', 1.0))
+            alpha_warmup = max(int(two_d_cfg.get('alpha_warmup', 0)), 0)
+            if alpha_warmup > 0:
+                alpha_factor = min(1.0, current_step / alpha_warmup)
+            else:
+                alpha_factor = 1.0
+            alpha_value = alpha_max * alpha_factor if (recon_enabled_cfg or seg_enabled_cfg or align_enabled_cfg) else 0.0
+            if hasattr(self.bi_encoder, 'set_alpha_2d'):
+                self.bi_encoder.set_alpha_2d(alpha_value)
+            losses['alpha_2d'] = torch.tensor(alpha_value, dtype=torch.float32, device=base_device)
+
+            if hasattr(self, '_encoder_out') and (recon_enabled_cfg or seg_enabled_cfg or align_enabled_cfg):
+                encoder_out = getattr(self, '_encoder_out', {})
+                feat_list = encoder_out.get('feat_fusion', [])
+                proj3d_list = encoder_out.get('proj_3d_points', [])
+                proj2d_list = encoder_out.get('proj_2d_points', [])
+                valid_masks = encoder_out.get('valid_projection_mask', [])
+                points_list = batch_inputs_dict.get('points', [])
+                cam_infos = batch_inputs_dict.get('cam_info', [])
+                num_samples = min(
+                    len(feat_list),
+                    len(proj3d_list),
+                    len(proj2d_list),
+                    len(valid_masks),
+                    len(points_list),
+                    len(batch_data_samples)
+                )
+                if num_samples > 0:
+                    if not cam_infos:
+                        cam_infos = [{} for _ in range(num_samples)]
+                    elif len(cam_infos) == 1 and num_samples > 1:
+                        cam_infos = [cam_infos[0] for _ in range(num_samples)]
+                    elif len(cam_infos) > num_samples:
+                        cam_infos = cam_infos[:num_samples]
+
+                    device = feat_list[0].device
+                    H, W = two_d_cfg.get('grid_hw', (60, 80))
+                    recon_tau = float(two_d_cfg.get('recon_tau', 1.0))
+                    seg_conf = float(two_d_cfg.get('seg_conf', 1.0))
+
+                    recon_cos_total = torch.zeros((), device=device)
+                    recon_mse_total = torch.zeros((), device=device)
+                    recon_total = torch.zeros((), device=device)
+                    recon_count = 0
+                    cover_mean_total = torch.zeros((), device=device)
+                    cover_count = 0
+
+                    seg_total = torch.zeros((), device=device)
+                    seg_count = 0
+                    supervised_pixel_ratio = torch.zeros((), device=device)
+
+                    align_total = torch.zeros((), device=device)
+                    align_count = 0
+
+                    for idx in range(num_samples):
+                        feat_pts = feat_list[idx]
+                        proj3d_pts = proj3d_list[idx]
+                        proj2d_pts = proj2d_list[idx]
+                        valid_mask = valid_masks[idx].to(feat_pts.device)
+                        pts = points_list[idx].to(feat_pts.device)
+                        xyz = pts[:, :3]
+                        cam_meta = cam_infos[idx] if idx < len(cam_infos) else {}
+
+                        pose = None
+                        if hasattr(self.bi_encoder, '_extract_pose_matrix'):
+                            pose = self.bi_encoder._extract_pose_matrix(cam_meta, sample_idx=0)
+                        if pose is None:
+                            continue
+
+                        xyz_cam = self.bi_encoder._transform_coordinates(xyz, pose)
+                        if xyz_cam is None:
+                            continue
+
+                        uv, proj_valid = project_points_to_uv(
+                            xyz_cam,
+                            (H, W),
+                            max_depth=getattr(self.bi_encoder, 'max_depth', 20.0),
+                            standard_intrinsics=getattr(self.bi_encoder, 'standard_scannet_intrinsics', SCANET_INTRINSICS)
+                        )
+                        proj_valid = proj_valid.to(feat_pts.device)
+                        combined_valid = proj_valid & valid_mask
+                        if not combined_valid.any():
+                            continue
+
+                        F2D, cover = splat_to_grid(
+                            uv=uv,
+                            z=xyz_cam[:, 2],
+                            feats=feat_pts,
+                            valid=combined_valid,
+                            H=H,
+                            W=W,
+                            mode='bilinear'
+                        )
+                        cover_mask = cover.squeeze(0) >= recon_tau
+
+                        clip_channels = None
+                        clip_pix = cam_meta.get('clip_pix') if isinstance(cam_meta, dict) else None
+                        if isinstance(clip_pix, (list, tuple)):
+                            clip_candidates = [c for c in clip_pix if c is not None]
+                            clip_pix = clip_candidates[0] if clip_candidates else None
+                        clip_tensor = None
+                        if isinstance(clip_pix, torch.Tensor):
+                            clip_tensor = clip_pix.to(device=feat_pts.device, dtype=F2D.dtype)
+                        elif isinstance(clip_pix, np.ndarray):
+                            clip_tensor = torch.from_numpy(clip_pix).to(device=feat_pts.device, dtype=F2D.dtype)
+                        if clip_tensor is not None:
+                            clip_channels = clip_tensor.shape[0]
+
+                        if recon_enabled_cfg and clip_tensor is not None and clip_tensor.shape[-2:] == (H, W):
+                            self._ensure_2d_heads(clip_channels, feat_pts.device)
+                            if self.recon2d_head is not None and cover_mask.any():
+                                pred = self.recon2d_head(F2D.unsqueeze(0))[0]
+                                mask_flat = cover_mask.view(-1)
+                                pred_flat = pred.view(pred.shape[0], -1)[:, mask_flat]
+                                target_flat = clip_tensor.view(clip_tensor.shape[0], -1)[:, mask_flat]
+                                if pred_flat.shape[1] > 0:
+                                    pred_norm = F.normalize(pred_flat.transpose(0, 1), dim=1)
+                                    target_norm = F.normalize(target_flat.transpose(0, 1), dim=1)
+                                    cos_loss = (1.0 - (pred_norm * target_norm).sum(dim=1).clamp(-1.0, 1.0)).mean()
+                                    mse_loss = F.mse_loss(pred_flat, target_flat)
+                                    combined_loss = 0.7 * cos_loss + 0.3 * mse_loss
+                                    recon_cos_total = recon_cos_total + cos_loss
+                                    recon_mse_total = recon_mse_total + mse_loss
+                                    recon_total = recon_total + combined_loss
+                                    recon_count += 1
+                                    cover_mean_total = cover_mean_total + cover_mask.float().mean()
+                                    cover_count += 1
+
+                        if seg_enabled_cfg:
+                            self._ensure_2d_heads(None, feat_pts.device)
+                            if self.seg2d_head is not None:
+                                labels = batch_data_samples[idx].gt_pts_seg.pts_semantic_mask.to(feat_pts.device)
+                                ignore_index = self._num_semantic_classes_2d
+                                label_valid = combined_valid & (labels != ignore_index)
+                                if label_valid.any():
+                                    rows = torch.round(uv[:, 1]).clamp(0, H - 1).long()
+                                    cols = torch.round(uv[:, 0]).clamp(0, W - 1).long()
+                                    flat = rows * W + cols
+                                    flat_valid = flat[label_valid]
+                                    labels_valid = labels[label_valid]
+                                    depths_valid = xyz_cam[:, 2][label_valid]
+                                    order = torch.argsort(depths_valid)
+                                    flat_sorted = flat_valid[order]
+                                    label_sorted = labels_valid[order]
+                                    keep_mask = torch.ones_like(flat_sorted, dtype=torch.bool)
+                                    keep_mask[1:] = flat_sorted[1:] != flat_sorted[:-1]
+                                    chosen_flat = flat_sorted[keep_mask]
+                                    chosen_label = label_sorted[keep_mask]
+                                    pseudo_label = torch.full((H * W,), ignore_index, device=feat_pts.device, dtype=torch.long)
+                                    pseudo_label[chosen_flat] = chosen_label
+                                    counts = torch.zeros(H * W, device=feat_pts.device)
+                                    counts.index_add_(0, flat_valid, torch.ones_like(flat_valid, dtype=torch.float32))
+                                seg_mask = counts >= seg_conf
+                                seg_mask = seg_mask.view(H, W)
+                                seg_mask = seg_mask & cover_mask
+                                if seg_mask.any():
+                                    logits_2d = self.seg2d_head(F2D.unsqueeze(0))[0]
+                                    ce_map = F.cross_entropy(
+                                        logits_2d.unsqueeze(0),
+                                        pseudo_label.view(1, H, W),
+                                        ignore_index=ignore_index,
+                                        reduction='none'
+                                    )[0]
+                                    seg_loss = ce_map[seg_mask].mean()
+                                    seg_total = seg_total + seg_loss
+                                    seg_count += 1
+                                    supervised_pixel_ratio = supervised_pixel_ratio + seg_mask.float().mean()
+
+                    if align_enabled_cfg:
+                        mask = valid_mask & torch.isfinite(proj3d_pts.sum(dim=1)) & torch.isfinite(proj2d_pts.sum(dim=1))
+                        if mask.any():
+                            proj3d_sel = F.normalize(proj3d_pts[mask], dim=1)
+                            proj2d_sel = F.normalize(proj2d_pts[mask], dim=1)
+                            cos_sim = (proj3d_sel * proj2d_sel).sum(dim=1).clamp(-1.0, 1.0)
+                            align_loss = (1.0 - cos_sim).mean()
+                            align_total = align_total + align_loss
+                            align_count += 1
+
+                if recon_enabled_cfg:
+                    if recon_count > 0:
+                        avg_cos = recon_cos_total / recon_count
+                        avg_mse = recon_mse_total / recon_count
+                        avg_recon = recon_total / recon_count
+                        losses['loss_2d_recon_cos'] = avg_cos
+                        losses['loss_2d_recon_mse'] = avg_mse
+                        losses['loss_2d_recon'] = avg_recon * w_recon_eff
+                        if cover_count > 0:
+                            losses['cover_mean'] = cover_mean_total / cover_count
+                    else:
+                        zero = torch.zeros((), device=device)
+                        losses.setdefault('loss_2d_recon_cos', zero)
+                        losses.setdefault('loss_2d_recon_mse', zero)
+                        losses.setdefault('loss_2d_recon', zero)
+                        losses.setdefault('cover_mean', zero)
+
+                if seg_enabled_cfg:
+                    if seg_count > 0:
+                        avg_seg = seg_total / seg_count
+                        losses['loss_2d_seg_ce'] = avg_seg * w_seg_eff
+                        losses['loss_2d_seg_ce_raw'] = avg_seg
+                        losses['supervised_pixel_ratio'] = supervised_pixel_ratio / seg_count
+                    else:
+                        zero = torch.zeros((), device=device)
+                        losses.setdefault('loss_2d_seg_ce', zero)
+                        losses.setdefault('loss_2d_seg_ce_raw', zero)
+                        losses.setdefault('supervised_pixel_ratio', zero)
+
+                if align_enabled_cfg:
+                    if align_count > 0:
+                        avg_align = align_total / align_count
+                        losses['loss_align_raw'] = avg_align
+                        losses['loss_align'] = avg_align * w_align_eff
+                    else:
+                        zero = torch.zeros((), device=device)
+                        losses.setdefault('loss_align', zero)
+                        losses.setdefault('loss_align_raw', zero)
+            else:
+                base_device = next(self.parameters()).device
+                zero = torch.zeros((), device=base_device)
+                if two_d_cfg.get('enable_recon', False):
+                    losses.setdefault('loss_2d_recon', zero)
+                    losses.setdefault('loss_2d_recon_cos', zero)
+                    losses.setdefault('loss_2d_recon_mse', zero)
+                    losses.setdefault('cover_mean', zero)
+                if two_d_cfg.get('enable_seg', False):
+                    losses.setdefault('loss_2d_seg_ce', zero)
+                    losses.setdefault('loss_2d_seg_ce_raw', zero)
+                    losses.setdefault('supervised_pixel_ratio', zero)
+                if two_d_cfg.get('w_align', 0.0) > 0:
+                    losses.setdefault('loss_align', zero)
+                    losses.setdefault('loss_align_raw', zero)
+        else:
+            if hasattr(self.bi_encoder, 'set_alpha_2d'):
+                self.bi_encoder.set_alpha_2d(0.0)
         
         # Alpha regularization losses (if enabled)
         if hasattr(self, 'alpha_regularizers') and self.alpha_regularizers:
@@ -419,9 +754,24 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         mask_pred = mask_pred[topk_idx]
         mask_pred_sigmoid = mask_pred.sigmoid()
 
+        # 兼容SP/P两种掩码域：若当前掩码不是点域，则将SP域掩码映射到点域
+        try:
+            if isinstance(superpoints, torch.Tensor):
+                n_raw = int(superpoints.numel())
+                n_mask_dim = int(mask_pred_sigmoid.shape[1])
+                # 如果掩码列数与原始点数不一致，且与超点数量一致，则按超点索引映射到点域
+                n_sp = int(superpoints.max().item()) + 1 if superpoints.numel() > 0 else 0
+                if n_mask_dim != n_raw and n_sp > 0 and n_mask_dim == n_sp:
+                    mask_pred_sigmoid = mask_pred_sigmoid[:, superpoints]
+        except Exception:
+            # 映射失败则保持原样，不中断推理
+            pass
+
         if self.test_cfg.get('obj_normalization', None):
-            mask_scores = (mask_pred_sigmoid * (mask_pred > 0)).sum(1) / \
-                ((mask_pred > 0).sum(1) + 1e-6)
+            # 使用概率阈值而非logits符号，提升稳定性
+            pos = (mask_pred_sigmoid >= 0.5).float()
+            denom = pos.sum(1).clamp_min(1e-6)
+            mask_scores = (mask_pred_sigmoid * pos).sum(1) / denom
             scores = scores * mask_scores
 
         if self.test_cfg.get('nms', None):
@@ -429,7 +779,6 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             scores, labels, mask_pred_sigmoid, _ = mask_matrix_nms(  # type: ignore[arg-type]
                 mask_pred_sigmoid, labels, scores, kernel=kernel)
 
-        mask_pred_sigmoid = mask_pred_sigmoid[:, ...]
         mask_pred = mask_pred_sigmoid > self.test_cfg.sp_score_thr
 
         # score_thr

@@ -393,6 +393,19 @@ class EnhancedTrainingHook(Hook):
         log_msg = f"\n{'='*80}\n"
         log_msg += f"📊 Enhanced Training Stats - Iter {self.iter_count}\n"
         log_msg += f"{'='*80}\n"
+
+        # Optimizer / LR 信息
+        lr_stats = {}
+        optim_wrapper = getattr(runner, 'optim_wrapper', None)
+        if optim_wrapper is not None and hasattr(optim_wrapper, 'optimizer'):
+            optimizer = optim_wrapper.optimizer
+            for idx, group in enumerate(optimizer.param_groups):
+                lr_stats[f'group{idx}'] = float(group.get('lr', 0.0))
+        if lr_stats:
+            log_msg += "⚙️  Optimizer / LR:\n"
+            for name, value in lr_stats.items():
+                log_msg += f"  lr/{name:<16}: {value:.6e}\n"
+            log_msg += "\n"
         
         # 1. 详细损失信息
         if detailed_losses:
@@ -444,6 +457,8 @@ class EnhancedTrainingHook(Hook):
         
         # 同时记录到tensorboard (如果有)
         if hasattr(runner, 'visualizer') and runner.visualizer is not None:
+            for lr_name, lr_val in lr_stats.items():
+                runner.visualizer.add_scalar(f'train/lr/{lr_name}', lr_val, self.iter_count)
             for loss_name, loss_value in detailed_losses.items():
                 if isinstance(loss_value, (int, float)):
                     runner.visualizer.add_scalar(f'train/detailed_loss/{loss_name}', 

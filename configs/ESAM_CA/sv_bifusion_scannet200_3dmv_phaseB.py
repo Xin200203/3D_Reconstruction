@@ -1,7 +1,7 @@
-# Enhanced Bi-Fusion（Category-Agnostic，ScanNet200-SV）- 3DMV架构版本
-# 🔥 3DMV式3D卷积融合：基于Conv3DFusionModule实现空间一致性的2D-3D特征融合
-# 完全独立的BiFusion配置，无TinySA依赖，维度匹配优化
-# 禁用几何增强，保留光度增强，维护2D-3D投影关系准确性
+# Enhanced Bi-Fusion（Category-Agnostic，ScanNet200-SV）- 3DMV架构版本（Phase B：接入2D）
+# 目的：
+# - 在Phase A稳住3D表征的基础上，接入2D语义（带warmup）
+# - 仅保留与位姿一致的刚体增强，避免投影错配
 
 _base_ = [
     'mmdet3d::_base_/default_runtime.py',
@@ -10,10 +10,10 @@ _base_ = [
 
 custom_imports = dict(imports=[
     'oneformer3d', 
-    'oneformer3d.bi_fusion_encoder_3dmv',  # 🔥 导入3DMV式BiFusion编码器
+    'oneformer3d.bi_fusion_encoder_3dmv',
     'oneformer3d.partial_load_hook',
     'oneformer3d.detailed_loss_hook',
-    'oneformer3d.enhanced_training_hook'  # 🔥 导入增强训练监控Hook
+    'oneformer3d.enhanced_training_hook'
 ])
 
 # ======== 类别和维度设置 ========
@@ -76,7 +76,7 @@ class_names = [
     'calendar', 'poster', 'potted plant', 'luggage', 'mattress'
 ]
 
-# ======== 数据管道 ========
+# ======== 数据管道（Phase B：仅保留刚体WithPose） ========
 train_pipeline = [
     dict(
         type='LoadPointsFromFile',
@@ -106,36 +106,6 @@ train_pipeline = [
         with_sp_mask_3d=True),
     dict(type='SwapChairAndFloor'),
     dict(type='PointSegClassMapping'),
-    # 🎨 2D图像光度增强 (待实现)
-    # 注：以下2D光度增强组件需要在oneformer3d/transforms_3d.py中实现后才能启用
-    # dict(
-    #     type='PhotometricDistortion2D',
-    #     brightness_delta=32,
-    #     contrast_range=(0.5, 1.5),
-    #     saturation_range=(0.5, 1.5),
-    #     hue_delta=18,
-    #     prob=0.8
-    # ),
-    # dict(
-    #     type='GaussianNoise2D',
-    #     sigma_range=(0, 25),
-    #     prob=0.3
-    # ),
-    # dict(
-    #     type='GaussianBlur2D', 
-    #     kernel_size_range=(3, 7),
-    #     sigma_range=(0.1, 2.0),
-    #     prob=0.2
-    # ),
-    # dict(
-    #     type='RandomGrayscale2D',
-    #     prob=0.1
-    # ),
-    # dict(
-    #     type='JPEGCompression2D',
-    #     quality_range=(75, 95),
-    #     prob=0.2
-    # ),
     dict(
         type='NormalizePointsColor_',
         color_mean=color_mean,
@@ -146,21 +116,12 @@ train_pipeline = [
         num_classes=num_semantic_classes,
         stuff_classes=[0, 1],
         merge_non_stuff_cls=False),
-    
-    # 🚫 禁用弹性变形 - 保持3D几何结构不变
-    # dict(
-    #     type='ElasticTransfrom',
-    #     gran=[6, 20],
-    #     mag=[40, 160],
-    #     voxel_size=0.02,
-    #     p=0.2),
     dict(
         type='Pack3DDetInputs_',
         keys=[
             'points', 'imgs', 'cam_info', 'clip_pix', 'clip_global', 
             'gt_labels_3d', 'pts_semantic_mask', 'pts_instance_mask',
             'sp_pts_mask', 'gt_sp_masks'
-            # 移除 'elastic_coords' 因为不再使用弹性变形
         ])
 ]
 
@@ -205,15 +166,14 @@ test_pipeline = [
         keys=['points', 'imgs', 'cam_info', 'clip_pix', 'clip_global', 'sp_pts_mask'])
 ]
 
-# ======== 模型配置 ========
+# ======== 模型配置（与Phase A通道保持一致） ========
 model = dict(
     type='ScanNet200MixFormer3D',
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     voxel_size=0.02,
     num_classes=num_instance_classes_eval,
     query_thr=0.5,
-    
-    # 传统backbone配置（为了满足模型初始化要求，实际不使用）
+
     backbone=dict(
         type='Res16UNet34C',
         in_channels=3,
@@ -222,32 +182,20 @@ model = dict(
             dilations=[1, 1, 1, 1],
             conv1_kernel_size=5,
             bn_momentum=0.02)),
-    
-    # 使用3DMV式BiFusionEncoder替代传统backbone+neck组合
+
     bi_encoder=dict(
         type='BiFusionEncoder3DMV',
         voxel_size=0.02,
-        
-        # 🔥 3D卷积融合配置（3DMV架构）
-        conv3d_output_dim=128,  # 3D卷积融合输出维度，与pool.channel_proj保持一致
-        # 新增：3D卷积融合中的Dropout比例（Phase A可设0.0，Phase B/C建议0.1）
-        conv3d_dropout=0.1,
-        
-        # 特征域配置（仅支持60×80预计算特征）
-        feat_space="precomp_60x80",
+        conv3d_output_dim=128,
+        conv3d_dropout=0.1,  # Phase B：适度正则
+        feat_space='precomp_60x80',
         use_precomp_2d=True,
-        
-        # 其他配置
         use_amp=True,
-        
-        # 调试输出控制
-        debug=False,  # 🔥 临时启用详细调试模式，用于分析投影问题
+        debug=False,
     ),
-    
-    # 几何感知池化
+
     pool=dict(type='GeoAwarePooling', channel_proj=128),
-    
-    # 查询解码器
+
     decoder=dict(
         type='ScanNetMixQueryDecoder',
         num_layers=3,
@@ -271,7 +219,7 @@ model = dict(
         fix_attention=True,
         objectness_flag=False),
 
-    # 2D 对齐与像素监督（Phase B 所需，带 warmup）
+    # Phase B：启用2D监督（带warmup）
     two_d_losses=dict(
         enable_recon=True,
         enable_seg=True,
@@ -288,8 +236,7 @@ model = dict(
         seg_warmup=1000,
         align_warmup=1000,
     ),
-    
-    # Enhanced损失函数配置
+
     criterion=dict(
         type='ScanNetMixedCriterion',
         num_semantic_classes=num_semantic_classes,
@@ -313,7 +260,7 @@ model = dict(
             fix_dice_loss_weight=True,
             iter_matcher=True,
             fix_mean_loss=True)),
-    
+
     train_cfg=dict(),
     test_cfg=dict(
         topk_insts=100,
@@ -397,7 +344,7 @@ val_evaluator = dict(
     metric_meta=metric_meta)
 test_evaluator = val_evaluator
 
-# ======== 训练配置 ========
+# ======== 训练配置（Phase B） ========
 optim_wrapper = dict(
     clip_grad=dict(max_norm=10, norm_type=2),
     optimizer=dict(type='AdamW', lr=0.00005, weight_decay=0.05),
@@ -407,30 +354,22 @@ param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
 
 custom_hooks = [
     dict(type='EmptyCacheHook', after_iter=True),
-    
-    # 增强训练监控Hook
     dict(
         type='EnhancedTrainingHook',
         log_interval=50,
         grad_monitor_interval=50,
         detailed_stats=True
     ),
-    
-    # 原有详细损失监控Hook
     dict(
         type='DetailedLossMonitorHook',
         log_interval=50,
         collect_grad_norm=True,
         collect_clip_stats=True
     ),
-    
-    # NaN检测Hook
     dict(
         type='NaNDetectionHook',
         check_interval=50
     ),
-    
-    # 加载3D预训练权重 - 更新为Mask3D权重路径
     dict(
         type='PartialLoadHook',
         pretrained='/home/nebula/xxy/ESAM/work_dirs/tmp/mask3d_scannet200.pth',
@@ -453,15 +392,12 @@ default_hooks = dict(
         out_suffix='.log'
     ))
 
-# ======== 训练调度 ========
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
-# ======== 日志配置 - 禁用TensorBoard解决Python 3.8兼容性问题 ========
 log_processor = dict(type='LogProcessor', window_size=1, by_epoch=True)
 
-# 禁用TensorBoard相关组件
 vis_backends = [
     dict(type='LocalVisBackend'),
 ]
@@ -470,3 +406,4 @@ visualizer = dict(
     type='Det3DLocalVisualizer',
     vis_backends=vis_backends,
     name='visualizer')
+

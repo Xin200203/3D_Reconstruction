@@ -31,7 +31,8 @@ class Conv3DFusionModule(nn.Module):
                  feat2d_dim: int = 256,     # 2D特征维度（CLIP投影后）
                  output_dim: int = 128,     # 最终输出维度
                  enable_debug: bool = False,
-                 collect_gradient_stats: bool = True):
+                 collect_gradient_stats: bool = True,
+                 dropout: float = 0.1):
         super().__init__()
         
         self.feat3d_dim = feat3d_dim
@@ -39,65 +40,66 @@ class Conv3DFusionModule(nn.Module):
         self.output_dim = output_dim
         self.enable_debug = enable_debug
         self.collect_gradient_stats = collect_gradient_stats
+        self.dropout = float(max(0.0, min(1.0, dropout)))
         
         # 仿照3DMV的features3d：处理3D几何特征 (96 → 64维)
         self.features3d = nn.Sequential(
             # 第一阶段：特征扩展和空间感知
             ME.MinkowskiConvolution(feat3d_dim, 64, kernel_size=3, stride=1, dimension=3),
-            ME.MinkowskiBatchNorm(64),
+            ME.MinkowskiBatchNorm(64, momentum=0.02),
             ME.MinkowskiReLU(True),
             # 1x1x1精炼卷积：提取更抽象的特征表示
             ME.MinkowskiConvolution(64, 64, kernel_size=1, dimension=3),
-            ME.MinkowskiBatchNorm(64),
+            ME.MinkowskiBatchNorm(64, momentum=0.02),
             ME.MinkowskiReLU(True),
-            ME.MinkowskiDropout(0.1),
+            ME.MinkowskiDropout(self.dropout),
             
             # 第二阶段：保持64维，进一步特征抽象
             ME.MinkowskiConvolution(64, 64, kernel_size=3, stride=1, dimension=3),
-            ME.MinkowskiBatchNorm(64),
+            ME.MinkowskiBatchNorm(64, momentum=0.02),
             ME.MinkowskiReLU(True),
             ME.MinkowskiConvolution(64, 64, kernel_size=1, dimension=3),
-            ME.MinkowskiBatchNorm(64),
+            ME.MinkowskiBatchNorm(64, momentum=0.02),
             ME.MinkowskiReLU(True),
-            ME.MinkowskiDropout(0.1)
+            ME.MinkowskiDropout(self.dropout)
         )
         
         # 仿照3DMV的features2d：处理投影后的2D特征 (256 → 32维)
         self.features2d = nn.Sequential(
             # 第一阶段：维度压缩 256 → 64
             ME.MinkowskiConvolution(feat2d_dim, 64, kernel_size=3, stride=1, dimension=3),
-            ME.MinkowskiBatchNorm(64),
+            ME.MinkowskiBatchNorm(64, momentum=0.02),
             ME.MinkowskiReLU(True),
             # 1x1x1精炼卷积
             ME.MinkowskiConvolution(64, 64, kernel_size=1, dimension=3),
-            ME.MinkowskiBatchNorm(64),
+            ME.MinkowskiBatchNorm(64, momentum=0.02),
             ME.MinkowskiReLU(True),
-            ME.MinkowskiDropout(0.1),
+            ME.MinkowskiDropout(self.dropout),
             
             # 第二阶段：进一步压缩 64 → 32
             ME.MinkowskiConvolution(64, 32, kernel_size=3, stride=1, dimension=3),
-            ME.MinkowskiBatchNorm(32),
+            ME.MinkowskiBatchNorm(32, momentum=0.02),
             ME.MinkowskiReLU(True),
             ME.MinkowskiConvolution(32, 32, kernel_size=1, dimension=3),
-            ME.MinkowskiBatchNorm(32),
+            ME.MinkowskiBatchNorm(32, momentum=0.02),
             ME.MinkowskiReLU(True),
-            ME.MinkowskiDropout(0.1)
+            ME.MinkowskiDropout(self.dropout)
         )
         
         # 仿照3DMV的features：多模态特征融合 (96维=64+32 → 128维)
         self.features_fusion = nn.Sequential(
             # 融合阶段：处理concatenated特征
             ME.MinkowskiConvolution(96, 128, kernel_size=3, stride=1, dimension=3),
-            ME.MinkowskiBatchNorm(128),
+            ME.MinkowskiBatchNorm(128, momentum=0.02),
             ME.MinkowskiReLU(True),
             # 1x1x1精炼卷积：深层特征抽象
             ME.MinkowskiConvolution(128, 128, kernel_size=1, dimension=3),
-            ME.MinkowskiBatchNorm(128),
+            ME.MinkowskiBatchNorm(128, momentum=0.02),
             ME.MinkowskiReLU(True),
             ME.MinkowskiConvolution(128, output_dim, kernel_size=1, dimension=3),
-            ME.MinkowskiBatchNorm(output_dim),
+            ME.MinkowskiBatchNorm(output_dim, momentum=0.02),
             ME.MinkowskiReLU(True),
-            ME.MinkowskiDropout(0.1)
+            ME.MinkowskiDropout(self.dropout)
         )
         
         self._last_monitor = {}
@@ -179,8 +181,11 @@ class Conv3DFusionModule(nn.Module):
                         self._grad_feature_norms[f'grad_norm_{name}'] = grad.detach().norm().item()
                 return hook
 
-            f3d_feats.register_hook(_capture('feat3d'))
-            f2d_aligned.register_hook(_capture('feat2d'))
+            # 仅在需要梯度时注册hook，避免在eval/无梯度时抛出异常
+            if f3d_feats.requires_grad:
+                f3d_feats.register_hook(_capture('feat3d'))
+            if f2d_aligned.requires_grad:
+                f2d_aligned.register_hook(_capture('feat2d'))
 
         if self.collect_gradient_stats:
             def _capture(name):
@@ -270,12 +275,14 @@ class BiFusionEncoder(nn.Module):
                  use_precomp_2d: bool = True,            # 默认启用预计算特征
                  # 🔥 3D卷积融合配置（专门使用Conv3D）
                  conv3d_output_dim: int = 256,           # 3D卷积融合输出维度，默认256保持兼容
+                 conv3d_dropout: float = 0.1,            # 3D卷积融合中的Dropout比例（可为0关闭）
                  # 调试模式控制
                  debug: bool = False,
                  collect_gradient_stats: bool = True,
+                 freeze_2d_branch: bool = False,
                  **kwargs):  # 接收其他未知参数
         super().__init__()
-        
+        self.freeze_2d_branch = freeze_2d_branch
         # 🔧 修复：如果voxel_size是字典（config传入错误），提取或使用默认值
         if isinstance(voxel_size, dict):
             print(f"⚠️ 警告: voxel_size传入了字典，使用默认值0.02")
@@ -302,20 +309,24 @@ class BiFusionEncoder(nn.Module):
         self.backbone3d = Res16UNet34C(in_channels=3, out_channels=96, config=cfg_backbone, D=3)
         
         # 🔥 3D卷积融合模块：专门使用Conv3D融合
+        self.alpha_2d = 0.0
         self.conv3d_fusion = Conv3DFusionModule(
             feat3d_dim=96,          # MinkUNet输出维度
             feat2d_dim=256,         # 2D特征维度（适配后）
             output_dim=self.conv3d_output_dim,  # 可配置输出维度
             enable_debug=self.debug,
-            collect_gradient_stats=collect_gradient_stats
+            collect_gradient_stats=collect_gradient_stats,
+            dropout=float(max(0.0, min(1.0, conv3d_dropout)))
         )
-        self.cos_proj3d = nn.Linear(64, 32, bias=False)
-        self.cos_proj2d = nn.Identity()
-        for p in self.cos_proj3d.parameters():
-            p.requires_grad_(False)
-        with torch.no_grad():
-            self.cos_proj3d.weight.zero_()
-            self.cos_proj3d.weight[:, :32] = torch.eye(32)
+        self.align_dim = 64
+        self.cos_proj3d = nn.Sequential(
+            nn.Linear(64, self.align_dim),
+            nn.LayerNorm(self.align_dim)
+        )
+        self.cos_proj2d = nn.Sequential(
+            nn.Linear(32, self.align_dim),
+            nn.LayerNorm(self.align_dim)
+        )
         if self.debug:
             print(f"🔧 初始化3D卷积融合模块: 输出维度={self.conv3d_output_dim}")
         
@@ -348,6 +359,28 @@ class BiFusionEncoder(nn.Module):
 
         if self._collect_gradient_stats:
             self._register_grad_param_hooks()
+
+        if self.freeze_2d_branch:
+            self._freeze_2d_parameters()
+
+    def _freeze_2d_parameters(self):
+        """Freeze 2D projection branch during Phase A."""
+        modules_to_freeze = []
+        if hasattr(self.conv3d_fusion, 'features2d'):
+            modules_to_freeze.append(self.conv3d_fusion.features2d)
+        modules_to_freeze.append(self.cos_proj2d)
+        for module in modules_to_freeze:
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad = False
+        # features_fusion 也会接收到2D支路输出，此处不冻结以保留学习能力。
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_2d_branch and mode:
+            # 再次施加冻结，避免外部 train() 调用恢复 2D 分支 BN/权重
+            self._freeze_2d_parameters()
+        return self
     
     def _print_config_summary(self):
         """打印当前配置摘要"""
@@ -716,6 +749,8 @@ class BiFusionEncoder(nn.Module):
         """处理单帧 2D-3D 融合流程。"""
         xyz = points[:, :3].contiguous()
         dev = xyz.device
+        proj3d_points = None
+        proj2d_points = None
 
         pose_matrix = self._extract_pose_matrix(cam_meta, sample_idx=sample_idx)
         xyz_cam_proj = self._transform_coordinates(xyz, pose_matrix)
@@ -765,6 +800,16 @@ class BiFusionEncoder(nn.Module):
                     debug=self.debug,
                     debug_prefix=f'[BiFusion3DMV] sample={sample_idx}'
                 )
+                # 投影有效率过低告警（可能由位姿/内参与分辨率错配引起）
+                try:
+                    valid_ratio_local = float(valid.float().mean().item())
+                    if valid_ratio_local < 0.1:
+                        warnings.warn(
+                            f"Low projection valid ratio: {valid_ratio_local:.3f} (sample={sample_idx})."
+                            " Check pose/intrinsics/resolution consistency.",
+                            stacklevel=2)
+                except Exception:
+                    pass
                 if feat2d_raw.shape[-1] != 256:
                     self._ensure_precomp_adapter(feat2d_raw.shape[-1])
                     feat2d_raw = self.precomp_adapter(feat2d_raw) if self.precomp_adapter else feat2d_raw
@@ -776,6 +821,19 @@ class BiFusionEncoder(nn.Module):
                 valid,
                 reference_sparse=feat3d_sparse
             )
+
+            if self.alpha_2d < 1.0:
+                scale = float(max(0.0, min(1.0, self.alpha_2d)))
+                if scale == 0.0:
+                    scaled = feat2d_sparse.features.new_zeros(feat2d_sparse.features.shape)
+                else:
+                    scaled = feat2d_sparse.features * scale
+                feat2d_sparse = ME.SparseTensor(
+                    features=scaled,
+                    coordinate_map_key=feat2d_sparse.coordinate_map_key,
+                    coordinate_manager=feat2d_sparse.coordinate_manager,
+                    tensor_stride=feat2d_sparse.tensor_stride
+                )
 
             cos_mean = 0.0
             try:
@@ -795,11 +853,11 @@ class BiFusionEncoder(nn.Module):
             monitor_stats = getattr(self.conv3d_fusion, '_last_monitor', {}).copy()
             feat_dict = getattr(self.conv3d_fusion, '_last_feats', None)
             if feat_dict is not None:
+                proj3d_points = self.cos_proj3d(feat_dict['f3d_feats'])
+                proj2d_points = self.cos_proj2d(feat_dict['f2d_feats'])
                 with torch.no_grad():
-                    proj3d = self.cos_proj3d(feat_dict['f3d_feats'].detach().to(self.cos_proj3d.weight.device))
-                    proj2d = self.cos_proj2d(feat_dict['f2d_feats'].detach().to(self.cos_proj3d.weight.device))
-                    proj3d_ln = F.layer_norm(proj3d, proj3d.shape[-1:])
-                    proj2d_ln = F.layer_norm(proj2d, proj2d.shape[-1:])
+                    proj3d_ln = F.layer_norm(proj3d_points.detach(), proj3d_points.shape[-1:])
+                    proj2d_ln = F.layer_norm(proj2d_points.detach(), proj2d_points.shape[-1:])
                     monitor_stats['cos_2d3d_mean_ln'] = F.cosine_similarity(proj3d_ln, proj2d_ln, dim=1).mean().item()
             else:
                 monitor_stats = monitor_stats or {}
@@ -829,6 +887,24 @@ class BiFusionEncoder(nn.Module):
                 else:
                     fused = fused[:, :self.conv3d_output_dim]
 
+            # 数值稳定性检查：若出现 NaN/Inf，告警并用3D-only回退
+            if not torch.isfinite(fused).all():
+                warnings.warn("Fused features contain NaN/Inf; falling back to 3D-only features for this sample.", stacklevel=2)
+                fallback_3d = self._extract_features_from_sparse(feat3d_sparse, xyz, points.shape[0])
+                if fallback_3d.shape[-1] != self.conv3d_output_dim:
+                    if fallback_3d.shape[-1] < self.conv3d_output_dim:
+                        padding = torch.zeros(
+                            fallback_3d.shape[0],
+                            self.conv3d_output_dim - fallback_3d.shape[-1],
+                            device=fallback_3d.device,
+                            dtype=fallback_3d.dtype
+                        )
+                        fused = torch.cat([fallback_3d, padding], dim=-1)
+                    else:
+                        fused = fallback_3d[:, :self.conv3d_output_dim]
+                else:
+                    fused = fallback_3d
+
             valid_ratio = valid.float().mean().item()
             conf_value = max(0.3, min(0.9, valid_ratio))
             conf = torch.full((points.shape[0], 1), conf_value, device=dev, dtype=torch.float32)
@@ -837,9 +913,28 @@ class BiFusionEncoder(nn.Module):
                 print(f"[BiFusion3DMV] sample={sample_idx} valid_ratio={valid_ratio:.3f} cos_mean={cos_mean:.3f}")
 
         except Exception as e:
-            warnings.warn(f"Conv3D fusion failed; using zero fallback. Details: {e}", stacklevel=2)
-            fused = torch.zeros((points.shape[0], self.conv3d_output_dim), device=dev, dtype=torch.float32)
-            conf = torch.full((points.shape[0], 1), 0.1, device=dev, dtype=torch.float32)
+            warnings.warn(f"Conv3D fusion failed; using 3D-only fallback. Details: {e}", stacklevel=2)
+            # 用3D主干特征回退，避免将全零特征送入解码器导致预测退化
+            fallback_3d = self._extract_features_from_sparse(feat3d_sparse, xyz, points.shape[0])
+            # 调整维度至 conv3d_output_dim
+            if fallback_3d.shape[-1] != self.conv3d_output_dim:
+                if fallback_3d.shape[-1] < self.conv3d_output_dim:
+                    padding = torch.zeros(
+                        fallback_3d.shape[0],
+                        self.conv3d_output_dim - fallback_3d.shape[-1],
+                        device=fallback_3d.device,
+                        dtype=fallback_3d.dtype
+                    )
+                    fused = torch.cat([fallback_3d, padding], dim=-1)
+                else:
+                    fused = fallback_3d[:, :self.conv3d_output_dim]
+            else:
+                fused = fallback_3d
+            conf = torch.full((points.shape[0], 1), 0.5, device=dev, dtype=torch.float32)
+            # 关键：当需要构造稀疏张量时，特征行数必须与活跃点数一致
+            n_active_fallback = int(feat3d_sparse.features.shape[0])
+            proj3d_points = torch.zeros((n_active_fallback, self.align_dim), device=dev, dtype=torch.float32)
+            proj2d_points = torch.zeros((n_active_fallback, self.align_dim), device=dev, dtype=torch.float32)
             self.conv3d_fusion._last_monitor = {}
             self.conv3d_fusion._last_feats = None
             self.conv3d_fusion._prev_grad_stats = {}
@@ -851,7 +946,7 @@ class BiFusionEncoder(nn.Module):
         # 记录融合特征原始幅值，便于监控
         fused_pre_norm = fused.detach()
 
-        # 简化的统计信息收集
+        # 简化的统计信息收集（同时记录 pre-gate 与 post-gate 指标，post-gate 能反映 α 对2D分支的实际抑制程度）
         if self._collect_fusion_stats:
             try:
                 valid_ratio = valid.float().mean().item()
@@ -859,6 +954,15 @@ class BiFusionEncoder(nn.Module):
                 
                 feat3d_norm = feat3d_sparse.features.norm(dim=-1).clamp_min(1e-6).mean().item()
                 norm_ratio = feat2d_norm / max(feat3d_norm, 1e-6)
+
+                # 记录post-gate（经过 α 门控后的）2D范数与比值
+                try:
+                    feat2d_post = feat2d_sparse.features
+                    feat2d_norm_post = feat2d_post.norm(dim=-1).clamp_min(1e-6).mean().item()
+                    norm_ratio_post = feat2d_norm_post / max(feat3d_norm, 1e-6)
+                except Exception:
+                    feat2d_norm_post = 0.0
+                    norm_ratio_post = 0.0
 
                 with torch.no_grad():
                     monitor_stats['fused_mean_abs_raw'] = fused_pre_norm.abs().mean().item()
@@ -870,8 +974,10 @@ class BiFusionEncoder(nn.Module):
                     'valid_points_ratio': valid_ratio,
                     'avg_confidence': conf_value,
                     'norm_ratio_2d_over_3d': norm_ratio,
+                    'norm_ratio_2d_over_3d_post': norm_ratio_post,
                     'cos_2d3d_mean': cos_mean,
                     'norm_2d_mean': feat2d_norm,
+                    'norm_2d_mean_post': feat2d_norm_post,
                     'norm_3d_mean': feat3d_norm
                 }
                 self._fusion_stats.update(monitor_stats)
@@ -882,7 +988,44 @@ class BiFusionEncoder(nn.Module):
                 if self.debug:
                     print(f"⚠️ 统计收集失败: {e}")
         
-        return fused, conf, valid
+        # 在构建稀疏张量前，确保特征长度与坐标映射一致；如不一致，直接报错
+        n_active = int(feat3d_sparse.features.shape[0])
+        if proj3d_points is None or proj3d_points.shape[0] != n_active:
+            got = -1 if proj3d_points is None else int(proj3d_points.shape[0])
+            warnings.warn(
+                f"proj3d_points invalid for SparseTensor (got rows={got}, active={n_active});"
+                " filling zeros aligned to active coordinates.",
+                stacklevel=2)
+            proj3d_points = torch.zeros((n_active, self.align_dim), device=dev, dtype=torch.float32)
+        proj3d_sparse = ME.SparseTensor(
+            features=proj3d_points,
+            coordinate_map_key=feat3d_sparse.coordinate_map_key,
+            coordinate_manager=feat3d_sparse.coordinate_manager,
+            tensor_stride=feat3d_sparse.tensor_stride
+        )
+        proj3d_points = self._extract_features_from_sparse(proj3d_sparse, xyz, points.shape[0])
+
+        if proj2d_points is None or proj2d_points.shape[0] != n_active:
+            got = -1 if proj2d_points is None else int(proj2d_points.shape[0])
+            warnings.warn(
+                f"proj2d_points invalid for SparseTensor (got rows={got}, active={n_active});"
+                " filling zeros aligned to active coordinates.",
+                stacklevel=2)
+            proj2d_points = torch.zeros((n_active, self.align_dim), device=dev, dtype=torch.float32)
+        proj2d_sparse = ME.SparseTensor(
+            features=proj2d_points,
+            coordinate_map_key=feat3d_sparse.coordinate_map_key,
+            coordinate_manager=feat3d_sparse.coordinate_manager,
+            tensor_stride=feat3d_sparse.tensor_stride
+        )
+        proj2d_points = self._extract_features_from_sparse(proj2d_sparse, xyz, points.shape[0])
+
+        return fused, conf, valid, proj3d_points, proj2d_points
+
+
+    def set_alpha_2d(self, value: float) -> None:
+        """Set 2D branch gating value between 0 and 1."""
+        self.alpha_2d = float(max(0.0, min(1.0, value)))
 
     def forward(self, points_list, imgs, cam_info):
         """简化的forward函数：批量处理3D-2D融合"""
@@ -921,20 +1064,26 @@ class BiFusionEncoder(nn.Module):
         
         # 3. 逐样本处理
         feat_fusion_list, conf_list, valid_mask_list = [], [], []
+        proj3d_list, proj2d_list = [], []
         
         for idx, (pts, img, meta) in enumerate(zip(points_list, imgs, cam_info)):
             # 简化meta信息处理：PKL文件是帧级组织，直接复制
             meta_std = meta if meta is not None else {}
             
             # 处理单个样本，传递样本索引
-            fused, conf, valid_mask = self._process_single(pts, img, meta_std, idx)
+            fused, conf, valid_mask, proj3d_pts, proj2d_pts = self._process_single(pts, img, meta_std, idx)
             
             feat_fusion_list.append(fused)
             conf_list.append(conf)
             valid_mask_list.append(valid_mask)
+            proj3d_list.append(proj3d_pts)
+            proj2d_list.append(proj2d_pts)
         
         return {
             'feat_fusion': feat_fusion_list,
             'conf_2d': conf_list,
-            'valid_projection_mask': valid_mask_list
+            'valid_projection_mask': valid_mask_list,
+            'proj_3d_points': proj3d_list,
+            'proj_2d_points': proj2d_list,
+            'alpha_2d': float(self.alpha_2d)
         }

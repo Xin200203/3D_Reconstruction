@@ -5,13 +5,16 @@ from os import path as osp  # 从 os.path 模块导入路径操作并重命名�
 import random  # 导入 random 模块，用于生成随机数（当前脚本未直接使用）
 import numpy as np  # 导入 numpy 并简写为 np，进行数值计算
 import torch  # 导入 PyTorch 深度学习框架
+from typing import Optional
 import mmengine  # 导入 mmengine，MM 引擎的通用工具
 from mmdet3d.apis import init_model  # 从 mmdet3d.apis 导入 init_model，用于初始化检测模型
 from mmdet3d.registry import DATASETS  # 导入 DATASETS 注册表，用于构建数据集
 from mmengine.dataset import Compose, pseudo_collate  # 导入 Compose（拼接数据处理流程）和 pseudo_collate（伪批量打包函数）
+from pathlib import Path
+from tools.update_infos_to_v2 import get_empty_standard_data_info, clear_data_info_unused_keys
 import open3d as o3d  # 导入 open3d 库，用于点云可视化
 from PIL import Image  # 从 Pillow 库导入 Image，用于图像读取
-from utils.vis_utils import vis_pointcloud,Vis_color  # 从自定义可视化工具中导入 vis_pointcloud 与 Vis_color
+from vis_demo.utils.vis_utils import vis_pointcloud,Vis_color  # 从自定义可视化工具中导入 vis_pointcloud 与 Vis_color
 
 import sys  # 导入 sys 模块，用于修改 Python 运行时环境
 current_path = os.path.abspath(__file__)  # 获取当前脚本绝对路径
@@ -19,43 +22,159 @@ sys.path.append(os.path.dirname(os.path.dirname(current_path)))  # 将项目根�
 
 class DataConverter(object):  # 定义数据转换器类，用于将原始数据转换为模型可用格式
     def __init__(self, root_path, cfg):  # 构造函数，接收数据根目录与配置文件
-        self.root_dir = root_path  # 保存数据根目录
-        self.split_dir = osp.join(root_path)  # （预留）数据划分目录，此处等于 root_dir
-        
+        # 收集候选数据根目录，优先使用 CLI 提供的 root_path
+        candidates = []
+        def _resolve_case(path: str) -> Optional[str]:
+            if not path:
+                return None
+            abs_path = osp.abspath(path)
+            if osp.isdir(abs_path):
+                return abs_path
+            parts = abs_path.split(osp.sep)
+            current = osp.sep if abs_path.startswith(osp.sep) else parts[0]
+            start_idx = 1 if abs_path.startswith(osp.sep) else 0
+            if start_idx == 0:
+                if not osp.isdir(current):
+                    return None
+            for part in parts[start_idx:]:
+                if not part:
+                    continue
+                try:
+                    entries = os.listdir(current)
+                except FileNotFoundError:
+                    return None
+                match = None
+                for entry in entries:
+                    if entry.lower() == part.lower():
+                        match = entry
+                        break
+                if match is None:
+                    return None
+                current = osp.join(current, match)
+            return current if osp.isdir(current) else None
+
+        def _add(path):
+            resolved = _resolve_case(path)
+            if resolved and resolved not in candidates:
+                candidates.append(resolved)
+
+        _add(root_path)
+        _add(getattr(cfg, 'data_root', None))
+        # 使用数据集仅为了调用 `parse_data_info`，因此即使是验证集也足够
         # 使用数据集仅为了调用 `parse_data_info`，因此即使是验证集也足够
         self.dataset = DATASETS.build(cfg.val_dataloader.dataset)  # 通过注册表构建数据集实例
+        _add(getattr(self.dataset, 'data_root', None))
+
+        self.root_dir = None
+        for path in candidates:
+            if path and osp.isdir(path):
+                self.root_dir = osp.abspath(path)
+                break
+        if self.root_dir is None:
+            raise FileNotFoundError(
+                f"无法找到可用的数据根目录，请检查 --data_root 或配置中的 data_root，候选: {candidates}")
+
+        if hasattr(self.dataset, 'data_root'):
+            self.dataset.data_root = self.root_dir
+
+        self.split_dir = self.root_dir
+
+    @staticmethod
+    def _sort_key(fname: str, scene_idx: str) -> int:
+        """提取文件名中的数字后缀用于排序；若匹配不到，回退为0。
+        支持 '7.bin' 或 'sceneXXXX_YY_7.bin' 两种命名。
+        """
+        base = osp.splitext(osp.basename(fname))[0]
+        if base.startswith(scene_idx + '_') and '_' in base:
+            tail = base.split('_')[-1]
+        else:
+            tail = base
+        return int(tail) if tail.isdigit() else 0
+
+    def _gather_scene_files(self, base_dir: str, scene_idx: str, expect_ext: str) -> list:
+        """同时兼容两种目录结构：
+        1) 分目录：base_dir/<scene_idx>/<k>.ext
+        2) 扁平化：base_dir/<scene_idx>_<k>.ext
+        返回相对 base_dir 的文件名列表（仅文件名，用于后续路径拼接）。
+        """
+        subdir = osp.join(base_dir, scene_idx)
+        files = []
+        if osp.isdir(subdir):
+            # 结构1：分目录
+            for f in os.listdir(subdir):
+                if f.endswith(expect_ext):
+                    files.append(f)
+            files.sort(key=lambda x: self._sort_key(x, scene_idx))
+            return [osp.join(scene_idx, f) for f in files]
+        # 结构2：扁平化：在 base_dir 下匹配前缀
+        try:
+            for f in os.listdir(base_dir):
+                if f.startswith(scene_idx + '_') and f.endswith(expect_ext):
+                    files.append(f)
+        except FileNotFoundError:
+            pass
+        files.sort(key=lambda x: self._sort_key(x, scene_idx))
+        return files
     
-    def get_axis_align_matrix(self, idx):  # 读取坐标对齐矩阵（ScanNet 专用）
-        matrix_file = osp.join(self.root_dir, 'axis_align_matrix',  # 构造矩阵文件路径
-                               f'{idx}.npy')
-        mmengine.check_file_exist(matrix_file)  # 检查文件是否存在
-        return np.load(matrix_file)  # 加载并返回矩阵
+    def get_axis_align_matrix(self, idx):  # 读取坐标对齐矩阵（最小实现：恒等变换）
+        # 按你的要求：当前阶段不使用该量，保持最小可运行实现
+        return np.eye(4, dtype=np.float32)
 
-    def process_single_scene(self, sample_idx):  # 处理单个场景，生成符合 pipeline 的数据字典
-        ## Data process
-        info = dict()  # 初始化信息字典
-        pc_info = {'num_features': 6, 'lidar_idx': sample_idx}  # 点云信息，6 维特征（XYZRGB）
-        info['point_cloud'] = pc_info  # 填入信息字典
-        files = os.listdir(osp.join(self.root_dir, 'points', sample_idx))  # 列出当前场景所有点云分片文件
-        files.sort(key=lambda x: int(x.split('/')[-1][:-4]))  # 按文件名中的数字进行排序
-        # 下面将各类文件路径保存到 info 中，供 pipeline 使用
-        info['pts_paths'] = [osp.join('points', sample_idx, file) for file in files]  # 点云块路径
-        info['super_pts_paths'] = [osp.join('super_points', sample_idx, file) for file in files]  # 超像素点云路径
-        info['pts_instance_mask_paths'] = [osp.join('instance_mask', sample_idx, file) for file in files]  # 实例 mask 路径
-        info['pts_semantic_mask_paths'] = [osp.join('semantic_mask', sample_idx, file) for file in files]  # 语义 mask 路径
-        # 根据数据集不同，构造对应的图像路径及特殊信息
-        if 'scannet' in self.root_dir:
-            info['img_paths'] = [osp.join('2D', sample_idx, 'color', file.replace('bin','jpg')) for file in files]  # ScanNet 图像路径
-            axis_align_matrix = self.get_axis_align_matrix(sample_idx)  # 读取坐标对齐矩阵
-            info['axis_align_matrix'] = axis_align_matrix.tolist()  # 保存为 list，json 兼容
-        elif '3RScan' in self.root_dir:
-            info['img_paths'] = [osp.join('3RScan', sample_idx, 'sequence','frame-' + file.split('.')[0].zfill(6) + '.color.jpg') for file in files]  # 3RScan 图像路径
-        elif 'scenenn' in self.root_dir:
-            info['img_paths'] = [osp.join('SceneNN', sample_idx, 'image','image'+file.split('.')[0].zfill(5)+'.png') for file in files]  # SceneNN 图像路径
+    def process_single_scene(self, sample_idx):  # 处理单个场景，生成符合 pipeline 的数据字典（SV 标准 v2 格式）
+        pc_info = {'num_features': 6, 'lidar_idx': sample_idx}
+        # 收集点云块（优先 .bin，回退 .npy）
+        pts_rel_files = self._gather_scene_files(osp.join(self.root_dir, 'points'), sample_idx, '.bin')
+        if len(pts_rel_files) == 0:
+            pts_rel_files = self._gather_scene_files(osp.join(self.root_dir, 'points'), sample_idx, '.npy')
+        if len(pts_rel_files) == 0:
+            raise FileNotFoundError(f"未找到场景 {sample_idx} 的点云块，请检查数据根目录 {self.root_dir}/points")
+        first_rel = pts_rel_files[0]
+        first_base = osp.basename(first_rel)
+        # 对应的 mask/super points（若结构不一致，则尝试 .npy）
+        inst_rel_files = self._gather_scene_files(osp.join(self.root_dir, 'instance_mask'), sample_idx, osp.splitext(first_base)[1] or '.bin')
+        if len(inst_rel_files) == 0:
+            inst_rel_files = self._gather_scene_files(osp.join(self.root_dir, 'instance_mask'), sample_idx, '.npy')
+        sem_rel_files = self._gather_scene_files(osp.join(self.root_dir, 'semantic_mask'), sample_idx, osp.splitext(first_base)[1] or '.bin')
+        if len(sem_rel_files) == 0:
+            sem_rel_files = self._gather_scene_files(osp.join(self.root_dir, 'semantic_mask'), sample_idx, '.npy')
+        super_rel_files = self._gather_scene_files(osp.join(self.root_dir, 'super_points'), sample_idx, osp.splitext(first_base)[1] or '.bin')
+        if len(super_rel_files) == 0:
+            super_rel_files = self._gather_scene_files(osp.join(self.root_dir, 'super_points'), sample_idx, '.npy')
 
-        ## Dataset process
-        info = self.dataset.parse_data_info(info)  # 通过数据集的 parse_data_info 进一步处理
-        return info  # 返回处理后的信息
+        inst_base = Path(inst_rel_files[0]).name if inst_rel_files else Path(first_base).name
+        sem_base = Path(sem_rel_files[0]).name if sem_rel_files else Path(first_base).name
+        super_base = Path(super_rel_files[0]).name if super_rel_files else Path(first_base).name
+        # 推导单帧图像路径（仅用于可视化叠图）
+        k = osp.splitext(first_base)[0]
+        if k.startswith(sample_idx + '_') and '_' in k:
+            k = k.split('_')[-1]
+        img_rel = osp.join('2D', sample_idx, 'color', f'{k}.jpg')
+        clip_rel = osp.join('clip_feat', sample_idx, f'{k}.pt')
+        # 标准 v2 data_info
+        data_info = get_empty_standard_data_info()
+        data_info['lidar_points']['num_pts_feats'] = pc_info['num_features']
+        # 仅放文件名，parse_data_info 会拼接 data_root / data_prefix
+        base_name = Path(first_base).name
+        data_info['lidar_points']['lidar_path'] = base_name
+        data_info['pts_semantic_mask_path'] = sem_base
+        data_info['pts_instance_mask_path'] = inst_base
+        data_info['super_pts_path'] = super_base
+        if img_rel is not None:
+            data_info['img_path'] = img_rel
+        if clip_rel is not None:
+            data_info['clip_feat_path'] = clip_rel
+            data_info['clip_feat_paths'] = [clip_rel]
+        data_info, _ = clear_data_info_unused_keys(data_info)
+        # 交给数据集做绝对路径拼接
+        data_info = self.dataset.parse_data_info(data_info)
+        # 兼容下游：补充列表形式的 img_paths
+        if 'img_path' in data_info and 'img_paths' not in data_info:
+            data_info['img_paths'] = [data_info['img_path']]
+        if clip_rel is not None and 'clip_feat_paths' not in data_info:
+            data_info['clip_feat_paths'] = [clip_rel]
+        if clip_rel is not None and 'clip_feat_path' not in data_info:
+            data_info['clip_feat_path'] = clip_rel
+        return data_info
         
         
 # ------------------------------ 推理函数 ----------------------------------

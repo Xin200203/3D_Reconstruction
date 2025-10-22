@@ -115,3 +115,125 @@ def unified_projection_and_sample(xyz_cam: torch.Tensor,
     )
     sampled = sample_img_feat(feat_map, uv_feat, valid, align_corners=align_corners)
     return sampled, valid
+
+
+def splat_to_grid(uv: torch.Tensor,
+                  z: torch.Tensor,
+                  feats: torch.Tensor,
+                  valid: torch.Tensor,
+                  H: int,
+                  W: int,
+                  mode: str = 'bilinear',
+                  depth_tol: float = 0.05) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rasterize点特征到像素网格。
+
+    Args:
+        uv: (N, 2) 像素坐标 (u, v)。
+        z:  (N,) 深度值。
+        feats: (N, C) 点特征。
+        valid: (N,) bool，表示该点是否有效。
+        H, W: 输出特征图高/宽。
+        mode: 'bilinear'（默认）或 'zbuf'。
+        depth_tol: z-buffer 模式下的深度容差。
+
+    Returns:
+        Tuple[Tensor, Tensor]: (C, H, W) 的融合特征，以及 (1, H, W) 的覆盖权重。
+    """
+    if feats.numel() == 0:
+        return feats.new_zeros((feats.shape[1], H, W)), feats.new_zeros((1, H, W))
+
+    device = feats.device
+    dtype = feats.dtype
+    C = feats.shape[1]
+
+    valid = valid if valid is not None else torch.ones_like(z, dtype=torch.bool)
+    idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+    if idx.numel() == 0:
+        return feats.new_zeros((C, H, W)), feats.new_zeros((1, H, W))
+
+    uv_valid = uv[idx]
+    z_valid = z[idx]
+    feats_valid = feats[idx]
+
+    if mode.lower() not in ('bilinear', 'zbuf'):
+        raise ValueError(f"Unsupported splat mode: {mode}")
+
+    if mode.lower() == 'bilinear':
+        x = uv_valid[:, 0]
+        y = uv_valid[:, 1]
+        x0 = torch.floor(x)
+        y0 = torch.floor(y)
+        dx = x - x0
+        dy = y - y0
+
+        x0 = x0.clamp(0, W - 1).long()
+        y0 = y0.clamp(0, H - 1).long()
+        x1 = (x0 + 1).clamp(0, W - 1)
+        y1 = (y0 + 1).clamp(0, H - 1)
+
+        w00 = (1.0 - dx) * (1.0 - dy)
+        w01 = (1.0 - dx) * dy
+        w10 = dx * (1.0 - dy)
+        w11 = dx * dy
+
+        grids = []
+        covers = []
+        accum_feat = feats_valid.new_zeros((H * W, C))
+        accum_cover = feats_valid.new_zeros((H * W,))
+
+        weights = (w00, w01, w10, w11)
+        xs = (x0, x0, x1, x1)
+        ys = (y0, y1, y0, y1)
+
+        flat_size = H * W
+        for w, xx, yy in zip(weights, xs, ys):
+            w = w.clamp(min=0.0)
+            flat_idx = (yy * W + xx).long()
+            accum_feat.index_add_(0, flat_idx, feats_valid * w.unsqueeze(1))
+            accum_cover.index_add_(0, flat_idx, w)
+
+        F2D = accum_feat.t().reshape(C, H, W)
+        cover = accum_cover.view(1, H, W)
+        return F2D, cover
+
+    # z-buffer
+    x = uv_valid[:, 0]
+    y = uv_valid[:, 1]
+    cols = torch.round(x).clamp(0, W - 1).long()
+    rows = torch.round(y).clamp(0, H - 1).long()
+    flat_idx = (rows * W + cols).long()
+
+    flat_size = H * W
+    device = feats_valid.device
+
+    if hasattr(torch.Tensor, 'scatter_reduce_'):
+        depth_init = torch.full((flat_size,), float('inf'), device=device, dtype=z_valid.dtype)
+        depth_min = depth_init.scatter_reduce(0, flat_idx, z_valid, reduce='amin', include_self=True)
+    else:
+        depth_min_cpu = torch.full((flat_size,), float('inf'), device='cpu', dtype=z_valid.dtype)
+        flat_cpu = flat_idx.cpu()
+        z_cpu = z_valid.cpu()
+        for pixel, depth in zip(flat_cpu.tolist(), z_cpu.tolist()):
+            if depth < depth_min_cpu[pixel]:
+                depth_min_cpu[pixel] = depth
+        depth_min = depth_min_cpu.to(z_valid.device)
+
+    min_depth = depth_min[flat_idx]
+    depth_mask = torch.isfinite(min_depth) & ((z_valid - min_depth).abs() <= depth_tol)
+
+    if not depth_mask.any():
+        return feats.new_zeros((C, H, W)), feats.new_zeros((1, H, W))
+
+    flat_idx = flat_idx[depth_mask]
+    feats_valid = feats_valid[depth_mask]
+    depth_counts = torch.ones_like(z_valid[depth_mask])
+
+    accum_feat = feats_valid.new_zeros((flat_size, C))
+    accum_cover = feats_valid.new_zeros((flat_size,))
+
+    accum_feat.index_add_(0, flat_idx, feats_valid)
+    accum_cover.index_add_(0, flat_idx, depth_counts)
+
+    cover = accum_cover.view(1, H, W)
+    F2D = (accum_feat / accum_cover.clamp_min(1.0).unsqueeze(1)).t().reshape(C, H, W)
+    return F2D, cover
