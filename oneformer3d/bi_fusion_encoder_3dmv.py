@@ -86,6 +86,13 @@ class Conv3DFusionModule(nn.Module):
             ME.MinkowskiDropout(self.dropout)
         )
         
+        # 3D-only 阶段的通道扩展：将 3D 分支 64 通道扩展到 96 通道（head64 + shadow32）
+        self.expand3d_64to96 = nn.Sequential(
+            ME.MinkowskiConvolution(64, 96, kernel_size=1, dimension=3),
+            ME.MinkowskiBatchNorm(96, momentum=0.02),
+            ME.MinkowskiReLU(True)
+        )
+
         # 仿照3DMV的features：多模态特征融合 (96维=64+32 → 128维)
         self.features_fusion = nn.Sequential(
             # 融合阶段：处理concatenated特征
@@ -125,10 +132,24 @@ class Conv3DFusionModule(nn.Module):
         
         # 分别处理3D和2D特征：模仿3DMV的双分支设计
         f3d_processed = self.features3d(feat3d_sparse)      # 96 → 64维
-        f2d_processed = self.features2d(feat2d_sparse)      # 256 → 32维
-        
-        f3d_feats = f3d_processed.features
-        f2d_feats = f2d_processed.features
+        f3d_feats = f3d_processed.features                  # (N, 64)
+
+        # 将 3D 64 通道扩展到 96 通道（head64 + shadow32）
+        proj96_sparse = self.expand3d_64to96(f3d_processed)  # (N, 96)
+        proj96_feats = proj96_sparse.features
+        head64 = proj96_feats[:, :64]
+        shadow32 = proj96_feats[:, 64:]
+
+        # 读取 alpha（若未设置则视为 0.0）
+        alpha = float(getattr(self, 'alpha_for_blend', 0.0))
+
+        # 仅当 alpha > 0 时才计算 2D 分支，避免 Phase A 额外开销
+        if alpha > 0.0:
+            f2d_processed = self.features2d(feat2d_sparse)  # (N, 32)
+            f2d_feats = f2d_processed.features
+        else:
+            f2d_processed = None
+            f2d_feats = None
 
         if self.enable_debug:
             print(f"🔍 分支处理后: 3D特征{f3d_feats.shape}, 2D特征{f2d_feats.shape}")
@@ -139,9 +160,14 @@ class Conv3DFusionModule(nn.Module):
             monitor['feat3d_std'] = f3d_feats.std().item()
             monitor['feat3d_nonzero_ratio'] = (f3d_feats.abs() > 1e-3).float().mean().item()
 
-            monitor['feat2d_mean_abs'] = f2d_feats.abs().mean().item()
-            monitor['feat2d_std'] = f2d_feats.std().item()
-            monitor['feat2d_nonzero_ratio'] = (f2d_feats.abs() > 1e-3).float().mean().item()
+            if f2d_feats is not None:
+                monitor['feat2d_mean_abs'] = f2d_feats.abs().mean().item()
+                monitor['feat2d_std'] = f2d_feats.std().item()
+                monitor['feat2d_nonzero_ratio'] = (f2d_feats.abs() > 1e-3).float().mean().item()
+            else:
+                monitor['feat2d_mean_abs'] = 0.0
+                monitor['feat2d_std'] = 0.0
+                monitor['feat2d_nonzero_ratio'] = 0.0
 
         if self.collect_gradient_stats:
             prev_norms = getattr(self, '_grad_feature_norms', None)
@@ -151,24 +177,29 @@ class Conv3DFusionModule(nn.Module):
             self._prev_grad_stats = {}
         
         # 特征拼接：在通道维度concat (64+32=96维)
-        # 捕捉3D坐标顺序并对齐2D特征
+        # 捕捉3D坐标顺序并对齐2D特征（或使用 shadow32）
         coord_manager = f3d_processed.coordinate_manager
         coords3d = f3d_processed.C.float()
 
-        try:
-            f2d_aligned = f2d_processed.features_at_coordinates(coords3d)
-        except RuntimeError as err:
-            if self.enable_debug:
-                print(f"⚠️ features_at_coordinates 异常: {err}")
-            f2d_aligned = f3d_processed.features.new_zeros(
-                f3d_processed.features.shape[0], f2d_processed.features.shape[1])
+        if alpha > 0.0 and f2d_processed is not None:
+            try:
+                # 将 2D 分支特征按照 3D 活跃坐标顺序对齐
+                f2d_aligned = f2d_processed.features_at_coordinates(coords3d)
+            except RuntimeError as err:
+                if self.enable_debug:
+                    print(f"⚠️ features_at_coordinates 异常: {err}")
+                f2d_aligned = f3d_processed.features.new_zeros(
+                    f3d_processed.features.shape[0], 32)
 
-        if not torch.isfinite(f2d_aligned).all():
-            invalid_mask = ~torch.isfinite(f2d_aligned)
-            if self.enable_debug:
-                invalid_count = invalid_mask.sum().item()
-                print(f"⚠️ 对齐后的2D特征出现NaN/Inf，已置零，数量: {invalid_count}")
-            f2d_aligned = f2d_aligned.masked_fill(invalid_mask, 0)
+            if not torch.isfinite(f2d_aligned).all():
+                invalid_mask = ~torch.isfinite(f2d_aligned)
+                if self.enable_debug:
+                    invalid_count = invalid_mask.sum().item()
+                    print(f"⚠️ 对齐后的2D特征出现NaN/Inf，已置零，数量: {invalid_count}")
+                f2d_aligned = f2d_aligned.masked_fill(invalid_mask, 0)
+        else:
+            # Phase A 或 alpha=0：不使用 2D 分支
+            f2d_aligned = None
 
         if self.collect_gradient_stats:
             def _capture(name):
@@ -184,7 +215,7 @@ class Conv3DFusionModule(nn.Module):
             # 仅在需要梯度时注册hook，避免在eval/无梯度时抛出异常
             if f3d_feats.requires_grad:
                 f3d_feats.register_hook(_capture('feat3d'))
-            if f2d_aligned.requires_grad:
+            if f2d_aligned is not None and f2d_aligned.requires_grad:
                 f2d_aligned.register_hook(_capture('feat2d'))
 
         if self.collect_gradient_stats:
@@ -202,17 +233,28 @@ class Conv3DFusionModule(nn.Module):
 
             if f3d_feats.requires_grad:
                 f3d_feats.register_hook(_capture('feat3d'))
-            if f2d_aligned.requires_grad:
+            if f2d_aligned is not None and f2d_aligned.requires_grad:
                 f2d_aligned.register_hook(_capture('feat2d'))
 
-        # 存储对齐后的特征快照，便于调试监控
+        # 记录监控信息；具体特征快照在后续构建 tail32 后统一存储
         self._last_monitor = monitor
-        self._last_feats = {
-            'f3d_feats': f3d_feats.detach(),
-            'f2d_feats': f2d_aligned.detach()
-        }
 
-        manual_features = torch.cat([f3d_feats, f2d_aligned], dim=1)
+        # 构造 tail32：Phase A 使用 shadow32；Phase B 使用 shadow32 与 f2d_aligned 的线性混合
+        if f2d_aligned is None:
+            tail32 = shadow32
+        else:
+            # 保证形状匹配 (N, 32)
+            if f2d_aligned.shape[1] != 32:
+                if self.enable_debug:
+                    print(f"⚠️ f2d_aligned 通道维不为32，当前 {f2d_aligned.shape[1]}，将截断或补零")
+                if f2d_aligned.shape[1] > 32:
+                    f2d_aligned = f2d_aligned[:, :32]
+                else:
+                    pad = f2d_aligned.new_zeros(f2d_aligned.size(0), 32 - f2d_aligned.size(1))
+                    f2d_aligned = torch.cat([f2d_aligned, pad], dim=1)
+            tail32 = (1.0 - alpha) * shadow32 + alpha * f2d_aligned
+
+        manual_features = torch.cat([head64, tail32], dim=1)
         if self.collect_gradient_stats and manual_features.requires_grad:
             manual_features.register_hook(_capture('fusion'))
         fused_sparse = ME.SparseTensor(
@@ -228,7 +270,13 @@ class Conv3DFusionModule(nn.Module):
         output_sparse = self.features_fusion(fused_sparse)
 
         self._last_monitor = monitor
-        self._last_feats = {'f3d_feats': f3d_feats, 'f2d_feats': f2d_feats}
+        # 记录融合前用于相似度的特征（保持键名不变）。若无2D，则用 shadow32 代替，用于上层统计。
+        if f2d_feats is None:
+            # 伪造一个与 tail32 同形的特征供上层取用
+            f2d_record = tail32.detach()
+        else:
+            f2d_record = f2d_feats.detach()
+        self._last_feats = {'f3d_feats': f3d_feats, 'f2d_feats': f2d_record}
 
         if self.enable_debug:
             print(f"🔍 Conv3D融合输出: {output_sparse.features.shape}")
@@ -848,6 +896,11 @@ class BiFusionEncoder(nn.Module):
             except Exception as err:
                 warnings.warn(f"Failed to compute feature similarity: {err}", stacklevel=2)
 
+            # 将 alpha 传递给融合模块，用于 Phase A/B 下的 tail32 构造策略
+            try:
+                self.conv3d_fusion.alpha_for_blend = float(self.alpha_2d)
+            except Exception:
+                pass
             fused_sparse = self.conv3d_fusion(feat3d_sparse, feat2d_sparse)
 
             monitor_stats = getattr(self.conv3d_fusion, '_last_monitor', {}).copy()

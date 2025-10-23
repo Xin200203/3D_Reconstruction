@@ -109,8 +109,7 @@ train_pipeline = [
     dict(
         type='NormalizePointsColor_',
         color_mean=color_mean,
-        color_std=color_std,
-        clamp_range=[-3.0, 3.0]),
+        color_std=color_std),
     dict(
         type='AddSuperPointAnnotations',
         num_classes=num_semantic_classes,
@@ -153,8 +152,7 @@ test_pipeline = [
             dict(
                 type='NormalizePointsColor_',
                 color_mean=color_mean,
-                color_std=color_std,
-                clamp_range=[-3.0, 3.0]),
+                color_std=color_std),
             dict(
                 type='AddSuperPointAnnotations',
                 num_classes=num_semantic_classes,
@@ -350,7 +348,10 @@ optim_wrapper = dict(
     optimizer=dict(type='AdamW', lr=0.00005, weight_decay=0.05),
     type='OptimWrapper')
 
-param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
+param_scheduler = dict(
+    type='CosineAnnealingLR',
+    T_max=128,
+    eta_min=1e-6)
 
 custom_hooks = [
     dict(type='EmptyCacheHook', after_iter=True),
@@ -406,4 +407,3 @@ visualizer = dict(
     type='Det3DLocalVisualizer',
     vis_backends=vis_backends,
     name='visualizer')
-

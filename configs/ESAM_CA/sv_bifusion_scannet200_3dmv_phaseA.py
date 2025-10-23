@@ -360,7 +360,7 @@ optim_wrapper = dict(
 
 param_scheduler = dict(
     type='CosineAnnealingLR',
-    T_max=60,
+    T_max=128,
     eta_min=1e-6)
 
 custom_hooks = [
@@ -381,6 +381,7 @@ custom_hooks = [
         type='NaNDetectionHook',
         check_interval=50
     ),
+
     dict(
         type='PartialLoadHook',
         pretrained='/home/nebula/xxy/ESAM/work_dirs/tmp/mask3d_scannet200.pth',
@@ -403,7 +404,7 @@ default_hooks = dict(
         out_suffix='.log'
     ))
 
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=60, val_interval=5)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
