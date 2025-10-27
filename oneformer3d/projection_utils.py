@@ -171,10 +171,12 @@ def splat_to_grid(uv: torch.Tensor,
         x1 = (x0 + 1).clamp(0, W - 1)
         y1 = (y0 + 1).clamp(0, H - 1)
 
-        w00 = (1.0 - dx) * (1.0 - dy)
-        w01 = (1.0 - dx) * dy
-        w10 = dx * (1.0 - dy)
-        w11 = dx * dy
+        # 统一 dtype，避免 AMP 下 half/float 混用导致 index_add_ 报错
+        target_dtype = feats_valid.dtype
+        w00 = ((1.0 - dx) * (1.0 - dy)).to(target_dtype)
+        w01 = ((1.0 - dx) * dy).to(target_dtype)
+        w10 = (dx * (1.0 - dy)).to(target_dtype)
+        w11 = (dx * dy).to(target_dtype)
 
         grids = []
         covers = []
@@ -226,7 +228,7 @@ def splat_to_grid(uv: torch.Tensor,
 
     flat_idx = flat_idx[depth_mask]
     feats_valid = feats_valid[depth_mask]
-    depth_counts = torch.ones_like(z_valid[depth_mask])
+    depth_counts = torch.ones_like(z_valid[depth_mask], dtype=feats_valid.dtype)
 
     accum_feat = feats_valid.new_zeros((flat_size, C))
     accum_cover = feats_valid.new_zeros((flat_size,))

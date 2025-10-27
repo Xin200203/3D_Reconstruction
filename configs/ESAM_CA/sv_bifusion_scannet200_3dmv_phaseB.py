@@ -16,6 +16,10 @@ custom_imports = dict(imports=[
     'oneformer3d.enhanced_training_hook'
 ])
 
+# 从 Phase A 最优权重继续训练（避免再次覆写 3D 主干）
+load_from = '/home/nebula/xxy/3D_Reconstruction/work_dirs/phaseA_run2/best_all_ap_50%_epoch_115.pth'
+resume = False
+
 # ======== 类别和维度设置 ========
 num_instance_classes = 1
 num_semantic_classes = 200
@@ -185,7 +189,8 @@ model = dict(
         type='BiFusionEncoder3DMV',
         voxel_size=0.02,
         conv3d_output_dim=128,
-        conv3d_dropout=0.1,  # Phase B：适度正则
+        # Phase B - S1：先关闭 Dropout，提升稳定性，后续阶段再逐步增加
+        conv3d_dropout=0.0,
         feat_space='precomp_60x80',
         use_precomp_2d=True,
         use_amp=True,
@@ -218,21 +223,22 @@ model = dict(
         objectness_flag=False),
 
     # Phase B：启用2D监督（带warmup）
+    # Phase B - S1：温和接入 2D，弱对齐 + 更长 warmup，alpha 先到 0.6
     two_d_losses=dict(
         enable_recon=True,
         enable_seg=True,
         w_recon=0.01,
-        w_seg=0.01,
-        w_align=0.02,
+        w_seg=0.005,
+        w_align=0.005,
         recon_tau=1.0,
         seg_conf=1.0,
         depth_tol=0.05,
         grid_hw=(60, 80),
-        alpha_max=1.0,
-        alpha_warmup=1000,
-        recon_warmup=1000,
-        seg_warmup=1000,
-        align_warmup=1000,
+        alpha_max=0.6,
+        alpha_warmup=3000,
+        recon_warmup=3000,
+        seg_warmup=3000,
+        align_warmup=3000,
     ),
 
     criterion=dict(
@@ -345,7 +351,19 @@ test_evaluator = val_evaluator
 # ======== 训练配置（Phase B） ========
 optim_wrapper = dict(
     clip_grad=dict(max_norm=10, norm_type=2),
-    optimizer=dict(type='AdamW', lr=0.00005, weight_decay=0.05),
+    # Phase B - S1：学习率调回到 1e-4，更利于接口层适配
+    optimizer=dict(type='AdamW', lr=0.0001, weight_decay=0.05),
+    # 冻结模块（通过 paramwise_cfg 将 lr/decay 置 0）：
+    # - bi_encoder.backbone3d.*
+    # - bi_encoder.conv3d_fusion.features3d.*
+    # - decoder.*
+    paramwise_cfg=dict(
+        custom_keys={
+            'bi_encoder.backbone3d': dict(lr_mult=0.0, decay_mult=0.0),
+            'bi_encoder.conv3d_fusion.features3d': dict(lr_mult=0.0, decay_mult=0.0),
+            'decoder': dict(lr_mult=0.0, decay_mult=0.0),
+        }
+    ),
     type='OptimWrapper')
 
 param_scheduler = dict(
@@ -370,13 +388,6 @@ custom_hooks = [
     dict(
         type='NaNDetectionHook',
         check_interval=50
-    ),
-    dict(
-        type='PartialLoadHook',
-        pretrained='/home/nebula/xxy/ESAM/work_dirs/tmp/mask3d_scannet200.pth',
-        submodule='bi_encoder.backbone3d',
-        prefix_replace=('backbone\\.', 'bi_encoder.backbone3d.'),
-        strict=False
     )
 ]
 

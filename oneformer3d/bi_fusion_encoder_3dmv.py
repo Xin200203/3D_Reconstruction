@@ -130,12 +130,23 @@ class Conv3DFusionModule(nn.Module):
         if self.enable_debug:
             print(f"🔍 Conv3D融合输入: 3D特征{feat3d_sparse.features.shape}, 2D特征{feat2d_sparse.features.shape}")
         
-        # 分别处理3D和2D特征：模仿3DMV的双分支设计
-        f3d_processed = self.features3d(feat3d_sparse)      # 96 → 64维
+        # 为避免 AMP 将稀疏卷积分支转为 half，强制禁用 autocast，确保 kernel/in_feat dtype 一致（float32）
+        import contextlib
+        from torch.cuda.amp import autocast
+        # 3D 分支
+        with autocast(enabled=False):
+            f3d_in = feat3d_sparse
+            if f3d_in.features.dtype != torch.float32:
+                f3d_in = ME.SparseTensor(features=f3d_in.features.float(),
+                                         coordinate_map_key=f3d_in.coordinate_map_key,
+                                         coordinate_manager=f3d_in.coordinate_manager,
+                                         tensor_stride=f3d_in.tensor_stride)
+            f3d_processed = self.features3d(f3d_in)      # 96 → 64维
         f3d_feats = f3d_processed.features                  # (N, 64)
 
         # 将 3D 64 通道扩展到 96 通道（head64 + shadow32）
-        proj96_sparse = self.expand3d_64to96(f3d_processed)  # (N, 96)
+        with autocast(enabled=False):
+            proj96_sparse = self.expand3d_64to96(f3d_processed)  # (N, 96)
         proj96_feats = proj96_sparse.features
         head64 = proj96_feats[:, :64]
         shadow32 = proj96_feats[:, 64:]
@@ -145,8 +156,15 @@ class Conv3DFusionModule(nn.Module):
 
         # 仅当 alpha > 0 时才计算 2D 分支，避免 Phase A 额外开销
         if alpha > 0.0:
-            f2d_processed = self.features2d(feat2d_sparse)  # (N, 32)
-            f2d_feats = f2d_processed.features
+            with autocast(enabled=False):
+                f2d_in = feat2d_sparse
+                if f2d_in.features.dtype != torch.float32:
+                    f2d_in = ME.SparseTensor(features=f2d_in.features.float(),
+                                              coordinate_map_key=f2d_in.coordinate_map_key,
+                                              coordinate_manager=f2d_in.coordinate_manager,
+                                              tensor_stride=f2d_in.tensor_stride)
+                f2d_processed = self.features2d(f2d_in)  # (N, 32)
+                f2d_feats = f2d_processed.features
         else:
             f2d_processed = None
             f2d_feats = None
@@ -255,6 +273,9 @@ class Conv3DFusionModule(nn.Module):
             tail32 = (1.0 - alpha) * shadow32 + alpha * f2d_aligned
 
         manual_features = torch.cat([head64, tail32], dim=1)
+        # 确保与 Minkowski 特征 dtype 对齐（通常为 float32）
+        if manual_features.dtype != f3d_processed.features.dtype:
+            manual_features = manual_features.to(f3d_processed.features.dtype)
         if self.collect_gradient_stats and manual_features.requires_grad:
             manual_features.register_hook(_capture('fusion'))
         fused_sparse = ME.SparseTensor(
@@ -267,7 +288,14 @@ class Conv3DFusionModule(nn.Module):
             print(f"🔍 手动特征拼接成功: {fused_sparse.features.shape}")
 
         # 最终融合卷积：96 → output_dim维
-        output_sparse = self.features_fusion(fused_sparse)
+        with autocast(enabled=False):
+            fin = fused_sparse
+            if fin.features.dtype != torch.float32:
+                fin = ME.SparseTensor(features=fin.features.float(),
+                                       coordinate_map_key=fin.coordinate_map_key,
+                                       coordinate_manager=fin.coordinate_manager,
+                                       tensor_stride=fin.tensor_stride)
+            output_sparse = self.features_fusion(fin)
 
         self._last_monitor = monitor
         # 记录融合前用于相似度的特征（保持键名不变）。若无2D，则用 shadow32 代替，用于上层统计。
@@ -808,6 +836,9 @@ class BiFusionEncoder(nn.Module):
             [torch.zeros(coords_int.size(0), 1, dtype=torch.int32, device=coords_int.device), coords_int],
             dim=1)
         feats = points[:, 3:6].contiguous()
+        # AMP 下确保 Minkowski 输入特征为 float32，避免 kernel 与 in_feat dtype 不一致
+        if feats.dtype != torch.float32:
+            feats = feats.to(torch.float32)
         field = ME.TensorField(coordinates=coords, features=feats)
         feat3d_sparse = self.backbone3d(field.sparse())
 
