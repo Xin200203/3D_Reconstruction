@@ -54,11 +54,29 @@ def ThreeRScan_data_prep(root_path, info_prefix, out_dir, workers):
     info_val_path = osp.join(out_dir, f'{info_prefix}_oneformer3d_infos_val.pkl')
     update_pkl_infos(info_prefix, out_dir=out_dir, pkl_path=info_val_path)
 
+def _img_to_clip_relpath(img_path: str) -> str:
+    """将 2D 图像路径转换为 clip 特征相对路径，移除 color 目录。
+
+    例：2D/scene0001_00/color/0.jpg -> clip_feat/scene0001_00/0.pt
+    """
+    p = Path(img_path)
+    parts = list(p.parts)
+    if '2D' in parts:
+        idx = parts.index('2D')
+        tail = parts[idx + 1:]  # scene.../color/xxx.jpg
+    else:
+        tail = parts
+    # 去掉 color 目录
+    tail = [x for x in tail if x != 'color']
+    rel = Path('clip_feat').joinpath(*tail).with_suffix('.pt')
+    return str(rel)
+
+
 def _add_clip_paths_to_pkl(pkl_path: str, data_root: str, suffix: str = '_clip'):
     """在 pkl 的每条记录中加入 clip_feat 路径字段。
 
     对 SV 记录新增 ``clip_feat_path`` (str)，对 MV 记录新增 ``clip_feat_paths`` (list[str])。
-    路径按照 ``2D -> clip_feat``、``.jpg -> .pt`` 规则转换。
+    路径按照 ``2D -> clip_feat``、去掉 color 目录、``.jpg -> .pt`` 规则转换。
     
     支持不同采样频率:
     - SV: 200间隔采样 (每200帧取一个，对应的CLIP特征已按此频率软链接)
@@ -99,7 +117,7 @@ def _add_clip_paths_to_pkl(pkl_path: str, data_root: str, suffix: str = '_clip')
                     frame_num = int(frame_str)
                     # 检查是否符合采样间隔（MV应该是40的倍数）
                     if frame_num % sampling_interval == 0:
-                        feat_path = img_path.replace('2D', 'clip_feat').replace('.jpg', '.pt')
+                        feat_path = _img_to_clip_relpath(img_path)
                         feat_paths.append(feat_path)
                 except ValueError:
                     print(f"[add_clip_paths] 无法解析帧号: {img_path}")
@@ -124,7 +142,7 @@ def _add_clip_paths_to_pkl(pkl_path: str, data_root: str, suffix: str = '_clip')
                 frame_num = int(frame_str)
                 # 检查是否符合采样间隔（SV应该是200的倍数）
                 if frame_num % sampling_interval == 0:
-                    feat_path = img_path.replace('2D', 'clip_feat').replace('.jpg', '.pt')
+                    feat_path = _img_to_clip_relpath(img_path)
                     rec['clip_feat_path'] = feat_path
                     updated += 1
                 else:

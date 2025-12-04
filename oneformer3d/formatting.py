@@ -163,6 +163,14 @@ class Pack3DDetInputs_(Pack3DDetInputs):
         packed_results = dict()
         packed_results['data_samples'] = data_sample
         packed_results['inputs'] = inputs
+
+        # 轻量调试：仅前几次打印 inputs 键，确认 cam_info 是否被打包
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        if self._debug_count < 3:
+            print(f"[Pack3DDetInputs_] keys={self.keys}, inputs_keys={list(inputs.keys())}")
+            self._debug_count += 1
+
         return packed_results
 
 

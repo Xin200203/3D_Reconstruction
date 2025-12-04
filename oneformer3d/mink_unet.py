@@ -270,8 +270,10 @@ class Res16UNetBase(BaseModule):
                  out_channels,
                  config,
                  D=3,
+                 dino_dim=None,  # 可选：DINO 通道数，提供则启用 2D 注入
                  **kwargs):
         self.D = D
+        self.dino_dim = dino_dim
         super().__init__()
         self.network_initialization(in_channels, out_channels, config, D)
         self.weight_initialization()
@@ -514,7 +516,59 @@ class Res16UNetBase(BaseModule):
         #     D=D)
         self.relu = MinkowskiReLU(inplace=True)
 
-    def forward(self, x, memory=None):
+        # 若提供 dino_dim，则为各解码层准备 1x1 投影（用于后续 2D 注入）
+        self.use_dino = self.dino_dim is not None
+        if self.use_dino:
+            self.dino_proj_8 = ME.MinkowskiConvolution(
+                in_channels=self.dino_dim, out_channels=self.PLANES[4],
+                kernel_size=1, stride=1, bias=False, dimension=D)
+            self.dino_proj_4 = ME.MinkowskiConvolution(
+                in_channels=self.dino_dim, out_channels=self.PLANES[5],
+                kernel_size=1, stride=1, bias=False, dimension=D)
+            self.dino_proj_2 = ME.MinkowskiConvolution(
+                in_channels=self.dino_dim, out_channels=self.PLANES[6],
+                kernel_size=1, stride=1, bias=False, dimension=D)
+            self.dino_proj_1 = ME.MinkowskiConvolution(
+                in_channels=self.dino_dim, out_channels=self.PLANES[7],
+                kernel_size=1, stride=1, bias=False, dimension=D)
+
+    def _inject_dino(self, out, dino_feat, proj):
+        """对上采样分支添加 2D 特征（通道已由 proj 调整到匹配维度）。
+        仅在 dino_feat 不为 None 时执行，加法不改变原有结构。
+        """
+        if dino_feat is None:
+            return out
+        dino_proj = proj(dino_feat)
+        # 将 dino 特征对齐到当前 out 的坐标上
+        dino_feats_on_out = dino_proj.features_at_coordinates(out.coordinates.float())
+        # 确保特征维度一致
+        if dino_feats_on_out.shape != out.features.shape:
+            # 维度不一致时直接跳过注入，避免破坏主干
+            return out
+        new_features = out.features + dino_feats_on_out
+        # SparseTensor 的 features 属性是只读的，这里通过构造一个新的 SparseTensor 返回
+        return ME.SparseTensor(
+            features=new_features,
+            coordinate_map_key=out.coordinate_map_key,
+            tensor_stride=out.tensor_stride,
+            coordinate_manager=out.coordinate_manager
+        )
+
+    def forward(self, x, dino_feats=None, memory=None):
+        """dino_feats: 可选 list/tuple，期望顺序 [s1, s2, s4, s8, s16]
+        解码注入逻辑：
+          - 仅在 self.use_dino 且提供 dino_feats 时生效；
+          - 在各 convtr+BN+ReLU 后，对上采样分支加法注入（1x1 投影对齐通道）；
+          - 随后仍保持原始 skip concat，不改变 U-Net 主干结构。
+        """
+        dino_s1 = dino_s2 = dino_s4 = dino_s8 = None
+        if self.use_dino and dino_feats is not None and len(dino_feats) >= 4:
+            # build_sparse_fpn 返回 [s1, s2, s4, s8, s16]
+            dino_s1 = dino_feats[0]
+            dino_s2 = dino_feats[1]
+            dino_s4 = dino_feats[2]
+            dino_s8 = dino_feats[3]
+
         out = self.conv0p1s1(x)
         out = self.bn0(out)
         out_p1 = self.relu(out)
@@ -552,6 +606,8 @@ class Res16UNetBase(BaseModule):
         out = self.convtr4p16s2(out)
         out = self.bntr4(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s8, self.dino_proj_8)
         out = me.cat(out, out_b3p8)
         out = self.block5(out)
 
@@ -559,6 +615,8 @@ class Res16UNetBase(BaseModule):
         out = self.convtr5p8s2(out)
         out = self.bntr5(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s4, self.dino_proj_4)
         out = me.cat(out, out_b2p4)
         out = self.block6(out)
 
@@ -566,6 +624,8 @@ class Res16UNetBase(BaseModule):
         out = self.convtr6p4s2(out)
         out = self.bntr6(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s2, self.dino_proj_2)
         out = me.cat(out, out_b1p2)
         out = self.block7(out)
 
@@ -573,6 +633,8 @@ class Res16UNetBase(BaseModule):
         out = self.convtr7p2s2(out)
         out = self.bntr7(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s1, self.dino_proj_1)
         out = me.cat(out, out_p1)
         out = self.block8(out)
 
@@ -581,7 +643,14 @@ class Res16UNetBase(BaseModule):
 class Res16UNetBase_FF(Res16UNetBase):
     """Base class for Minkowski U-Net."""
 
-    def forward(self, x, f=None, memory=None):
+    def forward(self, x, f=None, dino_feats=None, memory=None):
+        dino_s1 = dino_s2 = dino_s4 = dino_s8 = None
+        if self.use_dino and dino_feats is not None and len(dino_feats) >= 4:
+            dino_s1 = dino_feats[0]
+            dino_s2 = dino_feats[1]
+            dino_s4 = dino_feats[2]
+            dino_s8 = dino_feats[3]
+
         out = self.conv0p1s1(x)
         out = self.bn0(out)
         out_p1 = self.relu(out)
@@ -621,6 +690,8 @@ class Res16UNetBase_FF(Res16UNetBase):
         out = self.convtr4p16s2(out)
         out = self.bntr4(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s8, self.dino_proj_8)
         out = me.cat(out, out_b3p8)
         out = self.block5(out)
 
@@ -628,6 +699,8 @@ class Res16UNetBase_FF(Res16UNetBase):
         out = self.convtr5p8s2(out)
         out = self.bntr5(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s4, self.dino_proj_4)
         out = me.cat(out, out_b2p4)
         out = self.block6(out)
 
@@ -635,6 +708,8 @@ class Res16UNetBase_FF(Res16UNetBase):
         out = self.convtr6p4s2(out)
         out = self.bntr6(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s2, self.dino_proj_2)
         out = me.cat(out, out_b1p2)
         out = self.block7(out)
 
@@ -642,6 +717,8 @@ class Res16UNetBase_FF(Res16UNetBase):
         out = self.convtr7p2s2(out)
         out = self.bntr7(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s1, self.dino_proj_1)
         out = me.cat(out, out_p1)
         out = self.block8(out)
 

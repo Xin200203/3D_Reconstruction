@@ -37,6 +37,10 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
         inputs, data_samples = data['inputs'], data['data_samples']
         batch_inputs = dict()
 
+        # 调试：观察经过 collate 后的 inputs 键，便于确认 cam_info 是否存在
+        if os.environ.get('DEBUG_CAMINFO_INPUTS') == '1':
+            print(f"[Det3DDataPreprocessor_] inputs keys after collate: {list(inputs.keys())}")
+
         if 'points' in inputs:
             batch_inputs['points'] = inputs['points']
 
@@ -186,6 +190,16 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
         
         if 'img_path' in inputs:
             batch_inputs['img_path'] = inputs['img_path']
+
+        # 关键修复：即使没有 imgs，也要把 cam_info 透传给模型（用于 DINO 投影等）
+        if 'cam_info' in inputs and 'cam_info' not in batch_inputs:
+            batch_inputs['cam_info'] = inputs['cam_info']
+            if os.environ.get('DEBUG_CAMINFO_INPUTS') == '1':
+                print(f"[Det3DDataPreprocessor_] propagate cam_info without imgs, len={len(inputs['cam_info']) if isinstance(inputs['cam_info'], list) else 1}")
+
+        if os.environ.get('DEBUG_CAMINFO_INPUTS') == '1':
+            print(f"[Det3DDataPreprocessor_] batch_inputs keys: {list(batch_inputs.keys())}")
+
         return {'inputs': batch_inputs, 'data_samples': data_samples}
 
     def _process_single_image(self, img, idx):

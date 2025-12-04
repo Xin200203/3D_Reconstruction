@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_scatter import scatter_mean, scatter
+from torch_scatter import scatter_mean
 import MinkowskiEngine as ME
 import pointops
 import pdb, time
@@ -13,11 +13,11 @@ from mmdet3d.structures.bbox_3d import get_proj_mat_by_coord_type
 from mmengine.structures import InstanceData
 from .mask_matrix_nms import mask_matrix_nms
 from .oneformer3d import ScanNetOneFormer3DMixin
-from .instance_merge import ins_merge_mat, ins_cat, ins_merge, OnlineMerge, GTMerge
+from .instance_merge import ins_merge_mat, ins_cat, ins_merge, OnlineMerge
 import numpy as np
 from .img_backbone import point_sample
-from .projection_utils import project_points_to_uv, splat_to_grid, SCANET_INTRINSICS
-import os
+from .projection_utils import project_points_to_uv, SCANET_INTRINSICS, sample_img_feat
+from .dino_sparse_fpn import build_sparse_fpn
 from typing import Any, Dict, List, Tuple, Union, Optional, cast
 from mmengine import ConfigDict
 
@@ -49,17 +49,11 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                  voxel_size,
                  num_classes,
                  query_thr,
-                 img_backbone=None,
                  backbone=None,
-                 bi_encoder=None,
-                 clip_criterion=None,
-                 alpha_regularizers=None,  # NEW: Alpha regularization
-                 training_optimization=None,  # NEW: Training optimization config
                  neck=None,
                  pool=None,
                  decoder=None,
                  criterion=None,
-                 two_d_losses=None,
                  train_cfg=None,
                  test_cfg=None,
                  data_preprocessor=None,
@@ -67,67 +61,19 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        if img_backbone is not None:
-            self.img_backbone = MODELS.build(_cfg(img_backbone, 'img_backbone'))
-        else:
-            self.img_backbone = None
         self.backbone = MODELS.build(_cfg(backbone, 'backbone'))
-        self.bi_encoder = MODELS.build(_cfg(bi_encoder, 'bi_encoder')) if bi_encoder is not None else None
         self.neck = MODELS.build(_cfg(neck, 'neck')) if neck is not None else None
         self.pool = MODELS.build(_cfg(pool, 'pool'))
         decoder_cfg = _cfg(decoder, 'decoder')
         self.decoder = MODELS.build(decoder_cfg)
         self.criterion = MODELS.build(_cfg(criterion, 'criterion'))
-        self.clip_criterion = MODELS.build(_cfg(clip_criterion, 'clip_criterion')) if clip_criterion is not None else None
-        
-        # Alpha regularizers (optional)
-        self.alpha_regularizers = {}
-        if alpha_regularizers is not None:
-            for reg_name, reg_config in alpha_regularizers.items():
-                if reg_config is not None:
-                    self.alpha_regularizers[reg_name] = MODELS.build(_cfg(reg_config, f'alpha_{reg_name}'))
-                else:
-                    self.alpha_regularizers[reg_name] = None
-        
-        # Training optimization components (disabled in lightweight build)
-        self.training_optimization = training_optimization
-        self.progress_scheduler = None
-        self.progressive_freeze_manager = None
-        self.enhanced_loss_recorder = None
-        
         self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.voxel_size = voxel_size
         self.num_classes = num_classes
         self.query_thr = query_thr
         self.train_cfg = train_cfg
-
-        # 2D supervision placeholders
-        self._two_d_hidden_dim = decoder_cfg.get('in_channels', 128)
-        self._num_semantic_classes_2d = decoder_cfg.get('num_semantic_classes', 0)
-        self.seg2d_head: Optional[nn.Module] = None
-        self.recon2d_head: Optional[nn.Module] = None
-        self._clip_channels: Optional[int] = None
-        default_two_d_cfg = {
-            'enable_recon': False,
-            'enable_seg': False,
-            'w_recon': 0.0,
-            'w_seg': 0.0,
-            'w_align': 0.0,
-            'recon_tau': 1.0,
-            'seg_conf': 1.0,
-            'depth_tol': 0.05,
-            'grid_hw': (60, 80),
-            'alpha_max': 1.0,
-            'alpha_warmup': 0,
-            'recon_warmup': 0,
-            'seg_warmup': 0,
-            'align_warmup': 0,
-        }
-        if two_d_losses is not None:
-            default_two_d_cfg.update(two_d_losses)
-        self.two_d_loss_cfg = default_two_d_cfg
-        self._loss_call_counter = 0
-        self._loss_call_counter = 0
+        # DINO 调试计数（限制打印次数）
+        self._dino_debug_count = 0
 
     def initialize_training_optimization(self):
         """Placeholder for compatibility; no-op in lightweight build."""
@@ -160,107 +106,92 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         
         return config
 
-    def _ensure_2d_heads(self, clip_channels: Optional[int], device: torch.device) -> None:
-        hidden = self._two_d_hidden_dim
-
-        if self.two_d_loss_cfg.get('enable_seg', False) and self._num_semantic_classes_2d > 0:
-            if self.seg2d_head is None:
-                self.seg2d_head = nn.Sequential(
-                    nn.Conv2d(hidden, hidden, kernel_size=1),
-                    nn.GroupNorm(8, hidden),
-                    nn.GELU(),
-                    nn.Conv2d(hidden, self._num_semantic_classes_2d + 1, kernel_size=1)
-                ).to(device)
-
-        if self.two_d_loss_cfg.get('enable_recon', False):
-            if clip_channels is None:
-                return
-            if self.recon2d_head is None or self._clip_channels != clip_channels:
-                self._clip_channels = clip_channels
-                self.recon2d_head = nn.Sequential(
-                    nn.Conv2d(hidden, hidden, kernel_size=1),
-                    nn.GroupNorm(8, hidden),
-                    nn.GELU(),
-                    nn.Conv2d(hidden, clip_channels, kernel_size=1)
-                ).to(device)
-
     def extract_feat(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any]) -> Tuple[List[Any], List[torch.Tensor], Any]:  # type: ignore[override]
         """Extract features from sparse tensor."""
-        if self.bi_encoder is not None and 'imgs' in batch_inputs_dict:
-            # === BiFusion path ===
-            # 使 ElasticTransfrom 在 BiFusion 路径下也生效：
-            # 若存在 'elastic_coords'，将其替换到 points 的 xyz（世界坐标系）后再送入 bi_encoder。
-            points_list = batch_inputs_dict['points']
-            if 'elastic_coords' in batch_inputs_dict and isinstance(points_list, list):
-                replaced_points = []
-                elastic_list = batch_inputs_dict['elastic_coords']
-                for i in range(len(points_list)):
-                    pts = points_list[i]
-                    ec = elastic_list[i]
-                    if not torch.is_tensor(ec):
-                        ec = torch.as_tensor(ec, dtype=pts.dtype, device=pts.device)
-                    else:
-                        ec = ec.to(device=pts.device, dtype=pts.dtype)
-                    # ElasticTransfrom 产生的是体素坐标，需乘以 voxel_size 还原到世界坐标
-                    xyz_world = ec * self.voxel_size
-                    # 保留原有颜色等特征通道
-                    feats_rest = pts[:, 3:]
-                    pts_new = torch.cat([xyz_world, feats_rest], dim=1)
-                    replaced_points.append(pts_new)
-                points_for_encoder = replaced_points
+        # === DINO FPN 构建（单帧）===
+        dino_feats: Optional[List[ME.SparseTensor]] = None
+        # 轻量调试：查看关键键以及 cam_info 类型/长度
+        if self._dino_debug_count < 5:
+            cam_info_field = batch_inputs_dict.get('cam_info', None)
+            if isinstance(cam_info_field, list):
+                cam_len = len(cam_info_field)
+            elif cam_info_field is None:
+                cam_len = 0
             else:
-                points_for_encoder = points_list
+                cam_len = 1
+            has_keys = {
+                'dino_fpn': 'dino_fpn' in batch_inputs_dict,
+                'dino_feats': 'dino_feats' in batch_inputs_dict,
+                'dino_point_feats': 'dino_point_feats' in batch_inputs_dict,
+                'clip_pix': batch_inputs_dict.get('clip_pix', None) is not None,
+                'cam_info': cam_len > 0,
+            }
+            clip_shape = None
+            clip_val = batch_inputs_dict.get('clip_pix', None)
+            if isinstance(clip_val, list):
+                clip_val = clip_val[0] if len(clip_val) > 0 else None
+            if torch.is_tensor(clip_val):
+                clip_shape = clip_val.shape
+            print(f"[DINO][debug] keys={has_keys}, clip_shape={clip_shape}, cam_info_type={type(cam_info_field)}, cam_len={cam_len}")
+            self._dino_debug_count += 1
+        if 'dino_fpn' in batch_inputs_dict:
+            try:
+                dino_feats = batch_inputs_dict['dino_fpn']
+                if self._dino_debug_count < 3:
+                    print(f"[DINO] use provided dino_fpn (single-frame)")
+                    self._dino_debug_count += 1
+            except Exception:
+                dino_feats = None
+        elif 'dino_feats' in batch_inputs_dict:
+            try:
+                dino_feats = batch_inputs_dict['dino_feats']
+                if self._dino_debug_count < 3:
+                    print(f"[DINO] use provided dino_feats (single-frame)")
+                    self._dino_debug_count += 1
+            except Exception:
+                dino_feats = None
 
-            encoder_out = self.bi_encoder(
-                points_for_encoder,
-                batch_inputs_dict['imgs'],
-                batch_inputs_dict['cam_info']
-            )
-            
-            # Add clip_global from batch_inputs to encoder_out for loss computation
-            if 'clip_global' in batch_inputs_dict:
-                encoder_out['clip_global'] = batch_inputs_dict['clip_global']
-            
-            self._encoder_out = encoder_out  # cache for loss
-            fused_list = encoder_out['feat_fusion']
-            # 与送入 bi_encoder 的坐标保持一致（若替换为 elastic 后，这里也同步使用）
-            all_xyz = [pts[:, :3] for pts in points_for_encoder]
+        if dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
+            try:
+                coords_list, feats_list = [], []
+                for b_idx, pts in enumerate(batch_inputs_dict['points']):
+                    xyz = pts[:, :3]
+                    feats_2d = batch_inputs_dict['dino_point_feats'][b_idx]
+                    # 注意：sparse_collate 会自动添加 batch 维，这里只需要 (N, 3) 体素坐标
+                    coords = (xyz / self.voxel_size).floor().to(torch.int32)
+                    coords_list.append(coords.to(device=xyz.device))
+                    feats_list.append(feats_2d.to(device=xyz.device))
+                coords_batch, feats_batch = ME.utils.sparse_collate(coords_list, feats_list, device=feats_list[0].device)
+                dino_feats = build_sparse_fpn(coords_batch, feats_batch)
+                if self._dino_debug_count < 3:
+                    shapes = [x.shape for x in dino_feats]
+                    strides = [x.tensor_stride for x in dino_feats]
+                    print(f"[DINO] build from dino_point_feats, shapes={shapes}, strides={strides}")
+                    self._dino_debug_count += 1
+            except Exception as e:
+                if self._dino_debug_count < 3:
+                    print(f"[DINO][error] build from dino_point_feats failed: {e}")
+                    self._dino_debug_count += 1
+                dino_feats = None
 
-            # 基本长度检查（bi_encoder已经有详细验证）
-            if len(fused_list) != len(batch_data_samples):
-                raise RuntimeError(f"Fused features length {len(fused_list)} != batch samples {len(batch_data_samples)}")
+        if dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
+            try:
+                dino_feats = self._build_dino_fpn_from_clip(batch_inputs_dict)
+                if dino_feats is not None and self._dino_debug_count < 3:
+                    shapes = [x.shape for x in dino_feats]
+                    strides = [x.tensor_stride for x in dino_feats]
+                    print(f"[DINO] build from clip_pix, shapes={shapes}, strides={strides}")
+                    self._dino_debug_count += 1
+            except Exception as e:
+                if self._dino_debug_count < 3:
+                    print(f"[DINO][error] build from clip_pix failed: {e}")
+                    self._dino_debug_count += 1
+                dino_feats = None
 
-            # concatenate all fused features
-            x = torch.cat(fused_list, dim=0)
+        if dino_feats is None and self._dino_debug_count < 3:
+            print("[DINO] no dino_feats used (single-frame)")
+            self._dino_debug_count += 1
 
-            # superpoint pooling
-            sp_pts_masks, n_super_points = [], []
-            for i, data_sample in enumerate(batch_data_samples):
-                sp_pts_mask = data_sample.gt_pts_seg.sp_pts_mask
-                sp_pts_masks.append(sp_pts_mask + sum(n_super_points))
-                n_super_points.append(sp_pts_mask.max() + 1)
-            sp_idx = torch.cat(sp_pts_masks)
-
-            x, all_xyz_w = self.pool(x, sp_idx, all_xyz, with_xyz=False)
-
-            # split per sample features
-            features = []
-            for i in range(len(n_super_points)):
-                begin = sum(n_super_points[:i])
-                end = sum(n_super_points[:i + 1])
-                features.append(x[begin: end])
-
-            point_features = [torch.cat([c, f], dim=-1) for c, f in zip(all_xyz, fused_list)]
-
-            return features, point_features, all_xyz_w
-
-        # === Original path ===
-        # 如果提供了图像骨干网络，则先提取图像特征（仅占位，避免 OptionalCall 报错）
-        with torch.no_grad():
-            if self.img_backbone is not None and 'img_path' in batch_inputs_dict:
-                _ = self.img_backbone(batch_inputs_dict['img_path'])  # type: ignore[operator]
-        img_metas = [batch_data_sample.img_metas.copy() for batch_data_sample in batch_data_samples]
-        
         # construct tensor field
         coordinates, features = [], []
         for i in range(len(batch_inputs_dict['points'])):
@@ -278,7 +209,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         field = ME.TensorField(coordinates=coordinates, features=features)
 
         # forward of backbone and neck
-        x = self.backbone(field.sparse())
+        x = self.backbone(field.sparse(), dino_feats=dino_feats)
         if self.with_neck:
             assert self.neck is not None
             x = self.neck(x)
@@ -303,25 +234,124 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             features.append(x[begin: end])
         return features, point_features, all_xyz_w
 
+    def _build_dino_fpn_from_clip(self, batch_inputs_dict: Dict[str, Any]):
+        """从 clip_pix + cam_info 在线投影获取点级 DINO，并构建稀疏 FPN（单帧版）。"""
+        points_list = batch_inputs_dict.get('points', None)
+        clip = batch_inputs_dict.get('clip_pix', None)
+        cam_info_list = batch_inputs_dict.get('cam_info', None)
+        if points_list is None or clip is None or cam_info_list is None:
+            if self._dino_debug_count < 3:
+                print(f"[DINO][warn] skip build_from_clip: points={points_list is not None}, clip={clip is not None}, cam_info={cam_info_list is not None}")
+                self._dino_debug_count += 1
+            return None
+
+        # 统一采样对齐策略：align_corners=False 与 grid_sample 配套，避免半像素偏移
+        align_corners = False
+
+        if isinstance(cam_info_list, list):
+            cam_metas = cam_info_list
+        else:
+            cam_metas = [cam_info_list]
+        # clip_pix 单帧：Tensor(C,H,W) 或 list 单元素
+        if isinstance(clip, list):
+            clip_tensor = clip[0] if len(clip) > 0 else None
+        else:
+            clip_tensor = clip
+        if clip_tensor is None:
+            if self._dino_debug_count < 3:
+                print("[DINO][warn] clip_tensor is None")
+                self._dino_debug_count += 1
+            return None
+        if not torch.is_tensor(clip_tensor):
+            clip_tensor = torch.as_tensor(clip_tensor)
+        clip_tensor = clip_tensor.to(device=points_list[0].device)
+        C, Hf, Wf = clip_tensor.shape
+
+        coords_list, feats_list = [], []
+        for b_idx, pts in enumerate(points_list):
+            if b_idx >= len(cam_metas):
+                continue
+            cam_meta = cam_metas[b_idx] if isinstance(cam_metas, list) else cam_metas
+            xyz = pts[:, :3]
+
+            # 统一使用标准 ScanNet 内参，避免 cam_info 中不同格式的 intrinsics 带来不确定性
+            intr = SCANET_INTRINSICS
+            max_depth = cam_meta.get('max_depth', 20.0) if isinstance(cam_meta, dict) else 20.0
+            pose = None
+            if isinstance(cam_meta, dict):
+                pose = cam_meta.get('pose') or cam_meta.get('extrinsics')
+
+            # 世界 -> 相机
+            if pose is not None:
+                pose_t = torch.as_tensor(pose, device=xyz.device, dtype=xyz.dtype)
+                if pose_t.shape == (4, 4):
+                    try:
+                        w2c = torch.linalg.inv(pose_t)
+                    except Exception:
+                        w2c = torch.inverse(pose_t)
+                    xyz_h = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=1)
+                    xyz_cam = (w2c @ xyz_h.t()).t()[:, :3]
+                else:
+                    xyz_cam = xyz
+            else:
+                xyz_cam = xyz
+
+            try:
+                uv_feat, valid = project_points_to_uv(
+                    xyz_cam,
+                    (Hf, Wf),
+                    max_depth=max_depth,
+                    standard_intrinsics=intr
+                )
+                sampled = sample_img_feat(clip_tensor.unsqueeze(0), uv_feat, valid, align_corners=align_corners)
+                sampled = sampled.to(pts.device)
+            except Exception as e:
+                if self._dino_debug_count < 3:
+                    print(f"[DINO][error] projection/sample failed: {e}")
+                    self._dino_debug_count += 1
+                continue
+
+            # 注意：sparse_collate 会自动添加 batch 维，这里只使用 (N, 3) 体素坐标
+            coords = (xyz / self.voxel_size).floor().to(torch.int32)
+            coords_list.append(coords)
+            feats_list.append(sampled)
+
+        if not coords_list:
+            return None
+        # 调试：观察 collate 前各块形状
+        if self._dino_debug_count < 5:
+            try:
+                print(f"[DINO][debug] build_from_clip before collate: "
+                      f"n_chunks={len(coords_list)}, "
+                      f"coords0={coords_list[0].shape}, feats0={feats_list[0].shape}")
+            except Exception:
+                pass
+        try:
+            coords_batch, feats_batch = ME.utils.sparse_collate(
+                coords_list, feats_list, device=feats_list[0].device)
+            if self._dino_debug_count < 5:
+                print(f"[DINO][debug] after sparse_collate: "
+                      f"coords_batch={coords_batch.shape}, feats_batch={feats_batch.shape}")
+            fpn = build_sparse_fpn(coords_batch, feats_batch)
+            if self._dino_debug_count < 5:
+                shapes = [x.shape for x in fpn]
+                strides = [x.tensor_stride for x in fpn]
+                print(f"[DINO][debug] FPN built: shapes={shapes}, strides={strides}")
+            return fpn
+        except Exception as e:
+            if self._dino_debug_count < 5:
+                print(f"[DINO][error] sparse_collate/build_sparse_fpn failed: {repr(e)}")
+            return None
+
     def _forward(self, *args, **kwargs) -> Any:  # type: ignore[override]
         """Implement abstract method of Base3DDetector."""
         pass
 
     def loss(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], **kwargs) -> Dict[str, torch.Tensor]:  # type: ignore[override]
-        """Calculate losses from a batch of inputs dict and data samples.
-
-        Args:
-            batch_inputs_dict (dict): The model input dict which include
-                `points` key.
-            batch_data_samples (List[:obj:`Det3DDataSample`]): The Data
-                Samples. It includes information such as
-                `gt_instances_3d` and `gt_sem_seg_3d`.
-        Returns:
-            dict: A dictionary of loss components.
-        """
-        ## Backbone
+        """Calculate losses from a batch of inputs dict and data samples."""
+        # Backbone
         x, point_features, all_xyz_w = self.extract_feat(batch_inputs_dict, batch_data_samples)
-        ## GT-prepare
+        # GT preparation
         gt_instances = [s.gt_instances_3d for s in batch_data_samples]
         gt_point_instances = []
         for i in range(len(gt_instances)):
@@ -336,351 +366,11 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             gt_point.p_masks = ins
             gt_point_instances.append(gt_point)
         queries, gt_instances, *_ = self._select_queries(x, gt_instances)
-        ## Decoder
+        # Decoder
         super_points = ([bds.gt_pts_seg.sp_pts_mask for bds in batch_data_samples], all_xyz_w)
         x = self.decoder(x=x, queries=queries, sp_feats=x, p_feats=point_features, super_points=super_points)
-        ## Loss computation with v1 optimizations
-        losses = self.criterion(x, gt_instances, gt_point_instances, None, self.decoder.mask_pred_mode)
-        
-        self._loss_call_counter = getattr(self, '_loss_call_counter', 0) + 1
-        current_step = self._loss_call_counter
-
-        # Enhanced CLIP consistency loss with progress-aware scheduling
-        clip_loss_value = 0.0
-        if self.clip_criterion is not None and hasattr(self, '_encoder_out'):
-            # Update step counter for CLIP criterion
-            self.clip_criterion.step()
-            
-            # Update training progress if scheduler is available
-            if self.progress_scheduler is not None:
-                self.progress_scheduler.step()
-            
-            # Use valid projection mask for point-level consistency
-            valid_mask = None
-            if (self.bi_encoder is not None and 
-                hasattr(self.bi_encoder, '_debug_stats') and 
-                self.bi_encoder._debug_stats):
-                # Extract valid projection masks from debug stats if available
-                valid_mask = [torch.tensor(stats.get('valid_points', []), dtype=torch.bool, device=self._encoder_out['feat_fusion'][0].device) 
-                             for stats in self.bi_encoder._debug_stats]
-            
-            loss_clip = self.clip_criterion(
-                self._encoder_out['feat_fusion'], 
-                self._encoder_out['clip_global'],
-                valid_projection_mask=valid_mask
-            )
-            losses.update(dict(loss_clip=loss_clip))
-            clip_loss_value = float(loss_clip) if isinstance(loss_clip, torch.Tensor) else loss_clip
-
-        two_d_cfg = getattr(self, 'two_d_loss_cfg', None)
-        if two_d_cfg is not None and hasattr(self, 'bi_encoder') and self.bi_encoder is not None:
-            base_device = next(self.parameters()).device
-
-            def _effective_weight(name: str, warm_name: str) -> float:
-                base = float(two_d_cfg.get(name, 0.0))
-                warm = max(int(two_d_cfg.get(warm_name, 0)), 0)
-                if warm > 0:
-                    return base * min(1.0, current_step / warm)
-                return base
-
-            w_recon_eff = _effective_weight('w_recon', 'recon_warmup')
-            w_seg_eff = _effective_weight('w_seg', 'seg_warmup')
-            w_align_eff = _effective_weight('w_align', 'align_warmup')
-            recon_enabled_cfg = bool(two_d_cfg.get('enable_recon', False)) and w_recon_eff > 0
-            seg_enabled_cfg = bool(two_d_cfg.get('enable_seg', False)) and w_seg_eff > 0 and self._num_semantic_classes_2d > 0
-            align_enabled_cfg = w_align_eff > 0
-
-            alpha_max = float(two_d_cfg.get('alpha_max', 1.0))
-            alpha_warmup = max(int(two_d_cfg.get('alpha_warmup', 0)), 0)
-            if alpha_warmup > 0:
-                alpha_factor = min(1.0, current_step / alpha_warmup)
-            else:
-                alpha_factor = 1.0
-            alpha_value = alpha_max * alpha_factor if (recon_enabled_cfg or seg_enabled_cfg or align_enabled_cfg) else 0.0
-            if hasattr(self.bi_encoder, 'set_alpha_2d'):
-                self.bi_encoder.set_alpha_2d(alpha_value)
-            losses['alpha_2d'] = torch.tensor(alpha_value, dtype=torch.float32, device=base_device)
-
-            if hasattr(self, '_encoder_out') and (recon_enabled_cfg or seg_enabled_cfg or align_enabled_cfg):
-                encoder_out = getattr(self, '_encoder_out', {})
-                feat_list = encoder_out.get('feat_fusion', [])
-                proj3d_list = encoder_out.get('proj_3d_points', [])
-                proj2d_list = encoder_out.get('proj_2d_points', [])
-                valid_masks = encoder_out.get('valid_projection_mask', [])
-                points_list = batch_inputs_dict.get('points', [])
-                cam_infos = batch_inputs_dict.get('cam_info', [])
-                num_samples = min(
-                    len(feat_list),
-                    len(proj3d_list),
-                    len(proj2d_list),
-                    len(valid_masks),
-                    len(points_list),
-                    len(batch_data_samples)
-                )
-                if num_samples > 0:
-                    if not cam_infos:
-                        cam_infos = [{} for _ in range(num_samples)]
-                    elif len(cam_infos) == 1 and num_samples > 1:
-                        cam_infos = [cam_infos[0] for _ in range(num_samples)]
-                    elif len(cam_infos) > num_samples:
-                        cam_infos = cam_infos[:num_samples]
-
-                    device = feat_list[0].device
-                    H, W = two_d_cfg.get('grid_hw', (60, 80))
-                    recon_tau = float(two_d_cfg.get('recon_tau', 1.0))
-                    seg_conf = float(two_d_cfg.get('seg_conf', 1.0))
-
-                    recon_cos_total = torch.zeros((), device=device)
-                    recon_mse_total = torch.zeros((), device=device)
-                    recon_total = torch.zeros((), device=device)
-                    recon_count = 0
-                    cover_mean_total = torch.zeros((), device=device)
-                    cover_count = 0
-
-                    seg_total = torch.zeros((), device=device)
-                    seg_count = 0
-                    supervised_pixel_ratio = torch.zeros((), device=device)
-
-                    align_total = torch.zeros((), device=device)
-                    align_count = 0
-
-                    for idx in range(num_samples):
-                        feat_pts = feat_list[idx]
-                        proj3d_pts = proj3d_list[idx]
-                        proj2d_pts = proj2d_list[idx]
-                        valid_mask = valid_masks[idx].to(feat_pts.device)
-                        pts = points_list[idx].to(feat_pts.device)
-                        xyz = pts[:, :3]
-                        cam_meta = cam_infos[idx] if idx < len(cam_infos) else {}
-
-                        pose = None
-                        if hasattr(self.bi_encoder, '_extract_pose_matrix'):
-                            pose = self.bi_encoder._extract_pose_matrix(cam_meta, sample_idx=0)
-                        if pose is None:
-                            continue
-
-                        xyz_cam = self.bi_encoder._transform_coordinates(xyz, pose)
-                        if xyz_cam is None:
-                            continue
-
-                        uv, proj_valid = project_points_to_uv(
-                            xyz_cam,
-                            (H, W),
-                            max_depth=getattr(self.bi_encoder, 'max_depth', 20.0),
-                            standard_intrinsics=getattr(self.bi_encoder, 'standard_scannet_intrinsics', SCANET_INTRINSICS)
-                        )
-                        proj_valid = proj_valid.to(feat_pts.device)
-                        combined_valid = proj_valid & valid_mask
-                        if not combined_valid.any():
-                            continue
-
-                        F2D, cover = splat_to_grid(
-                            uv=uv,
-                            z=xyz_cam[:, 2],
-                            feats=feat_pts,
-                            valid=combined_valid,
-                            H=H,
-                            W=W,
-                            mode='bilinear'
-                        )
-                        cover_mask = cover.squeeze(0) >= recon_tau
-
-                        clip_channels = None
-                        clip_pix = cam_meta.get('clip_pix') if isinstance(cam_meta, dict) else None
-                        if isinstance(clip_pix, (list, tuple)):
-                            clip_candidates = [c for c in clip_pix if c is not None]
-                            clip_pix = clip_candidates[0] if clip_candidates else None
-                        clip_tensor = None
-                        if isinstance(clip_pix, torch.Tensor):
-                            clip_tensor = clip_pix.to(device=feat_pts.device, dtype=F2D.dtype)
-                        elif isinstance(clip_pix, np.ndarray):
-                            clip_tensor = torch.from_numpy(clip_pix).to(device=feat_pts.device, dtype=F2D.dtype)
-                        if clip_tensor is not None:
-                            clip_channels = clip_tensor.shape[0]
-
-                        if recon_enabled_cfg and clip_tensor is not None and clip_tensor.shape[-2:] == (H, W):
-                            self._ensure_2d_heads(clip_channels, feat_pts.device)
-                            if self.recon2d_head is not None and cover_mask.any():
-                                pred = self.recon2d_head(F2D.unsqueeze(0))[0]
-                                mask_flat = cover_mask.view(-1)
-                                pred_flat = pred.view(pred.shape[0], -1)[:, mask_flat]
-                                target_flat = clip_tensor.view(clip_tensor.shape[0], -1)[:, mask_flat]
-                                if pred_flat.shape[1] > 0:
-                                    pred_norm = F.normalize(pred_flat.transpose(0, 1), dim=1)
-                                    target_norm = F.normalize(target_flat.transpose(0, 1), dim=1)
-                                    cos_loss = (1.0 - (pred_norm * target_norm).sum(dim=1).clamp(-1.0, 1.0)).mean()
-                                    mse_loss = F.mse_loss(pred_flat, target_flat)
-                                    combined_loss = 0.7 * cos_loss + 0.3 * mse_loss
-                                    recon_cos_total = recon_cos_total + cos_loss
-                                    recon_mse_total = recon_mse_total + mse_loss
-                                    recon_total = recon_total + combined_loss
-                                    recon_count += 1
-                                    cover_mean_total = cover_mean_total + cover_mask.float().mean()
-                                    cover_count += 1
-
-                        if seg_enabled_cfg:
-                            self._ensure_2d_heads(None, feat_pts.device)
-                            if self.seg2d_head is not None:
-                                labels = batch_data_samples[idx].gt_pts_seg.pts_semantic_mask.to(feat_pts.device)
-                                ignore_index = self._num_semantic_classes_2d
-                                label_valid = combined_valid & (labels != ignore_index)
-                                if label_valid.any():
-                                    rows = torch.round(uv[:, 1]).clamp(0, H - 1).long()
-                                    cols = torch.round(uv[:, 0]).clamp(0, W - 1).long()
-                                    flat = rows * W + cols
-                                    flat_valid = flat[label_valid]
-                                    labels_valid = labels[label_valid]
-                                    depths_valid = xyz_cam[:, 2][label_valid]
-                                    order = torch.argsort(depths_valid)
-                                    flat_sorted = flat_valid[order]
-                                    label_sorted = labels_valid[order]
-                                    keep_mask = torch.ones_like(flat_sorted, dtype=torch.bool)
-                                    keep_mask[1:] = flat_sorted[1:] != flat_sorted[:-1]
-                                    chosen_flat = flat_sorted[keep_mask]
-                                    chosen_label = label_sorted[keep_mask]
-                                    pseudo_label = torch.full((H * W,), ignore_index, device=feat_pts.device, dtype=torch.long)
-                                    pseudo_label[chosen_flat] = chosen_label
-                                    counts = torch.zeros(H * W, device=feat_pts.device)
-                                    counts.index_add_(0, flat_valid, torch.ones_like(flat_valid, dtype=torch.float32))
-                                seg_mask = counts >= seg_conf
-                                seg_mask = seg_mask.view(H, W)
-                                seg_mask = seg_mask & cover_mask
-                                if seg_mask.any():
-                                    logits_2d = self.seg2d_head(F2D.unsqueeze(0))[0]
-                                    ce_map = F.cross_entropy(
-                                        logits_2d.unsqueeze(0),
-                                        pseudo_label.view(1, H, W),
-                                        ignore_index=ignore_index,
-                                        reduction='none'
-                                    )[0]
-                                    seg_loss = ce_map[seg_mask].mean()
-                                    seg_total = seg_total + seg_loss
-                                    seg_count += 1
-                                    supervised_pixel_ratio = supervised_pixel_ratio + seg_mask.float().mean()
-
-                    if align_enabled_cfg:
-                        mask = valid_mask & torch.isfinite(proj3d_pts.sum(dim=1)) & torch.isfinite(proj2d_pts.sum(dim=1))
-                        if mask.any():
-                            proj3d_sel = F.normalize(proj3d_pts[mask], dim=1)
-                            proj2d_sel = F.normalize(proj2d_pts[mask], dim=1)
-                            cos_sim = (proj3d_sel * proj2d_sel).sum(dim=1).clamp(-1.0, 1.0)
-                            align_loss = (1.0 - cos_sim).mean()
-                            align_total = align_total + align_loss
-                            align_count += 1
-
-                if recon_enabled_cfg:
-                    if recon_count > 0:
-                        avg_cos = recon_cos_total / recon_count
-                        avg_mse = recon_mse_total / recon_count
-                        avg_recon = recon_total / recon_count
-                        losses['loss_2d_recon_cos'] = avg_cos
-                        losses['loss_2d_recon_mse'] = avg_mse
-                        losses['loss_2d_recon'] = avg_recon * w_recon_eff
-                        if cover_count > 0:
-                            losses['cover_mean'] = cover_mean_total / cover_count
-                    else:
-                        zero = torch.zeros((), device=device)
-                        losses.setdefault('loss_2d_recon_cos', zero)
-                        losses.setdefault('loss_2d_recon_mse', zero)
-                        losses.setdefault('loss_2d_recon', zero)
-                        losses.setdefault('cover_mean', zero)
-
-                if seg_enabled_cfg:
-                    if seg_count > 0:
-                        avg_seg = seg_total / seg_count
-                        losses['loss_2d_seg_ce'] = avg_seg * w_seg_eff
-                        losses['loss_2d_seg_ce_raw'] = avg_seg
-                        losses['supervised_pixel_ratio'] = supervised_pixel_ratio / seg_count
-                    else:
-                        zero = torch.zeros((), device=device)
-                        losses.setdefault('loss_2d_seg_ce', zero)
-                        losses.setdefault('loss_2d_seg_ce_raw', zero)
-                        losses.setdefault('supervised_pixel_ratio', zero)
-
-                if align_enabled_cfg:
-                    if align_count > 0:
-                        avg_align = align_total / align_count
-                        losses['loss_align_raw'] = avg_align
-                        losses['loss_align'] = avg_align * w_align_eff
-                    else:
-                        zero = torch.zeros((), device=device)
-                        losses.setdefault('loss_align', zero)
-                        losses.setdefault('loss_align_raw', zero)
-            else:
-                base_device = next(self.parameters()).device
-                zero = torch.zeros((), device=base_device)
-                if two_d_cfg.get('enable_recon', False):
-                    losses.setdefault('loss_2d_recon', zero)
-                    losses.setdefault('loss_2d_recon_cos', zero)
-                    losses.setdefault('loss_2d_recon_mse', zero)
-                    losses.setdefault('cover_mean', zero)
-                if two_d_cfg.get('enable_seg', False):
-                    losses.setdefault('loss_2d_seg_ce', zero)
-                    losses.setdefault('loss_2d_seg_ce_raw', zero)
-                    losses.setdefault('supervised_pixel_ratio', zero)
-                if two_d_cfg.get('w_align', 0.0) > 0:
-                    losses.setdefault('loss_align', zero)
-                    losses.setdefault('loss_align_raw', zero)
-        else:
-            if hasattr(self.bi_encoder, 'set_alpha_2d'):
-                self.bi_encoder.set_alpha_2d(0.0)
-        
-        # Alpha regularization losses (if enabled)
-        if hasattr(self, 'alpha_regularizers') and self.alpha_regularizers:
-            if hasattr(self, '_encoder_out') and 'alpha_values' in self._encoder_out:
-                alpha_values = self._encoder_out['alpha_values']
-                
-                for reg_name, regularizer in self.alpha_regularizers.items():
-                    if regularizer is not None:
-                        regularizer.step()  # Update step counter
-                        reg_loss = regularizer(alpha_values)
-                        losses.update({f'alpha_{reg_name}': reg_loss})
-        
-        # Ensure all losses are in FP32 for numerical stability
-        for key, value in losses.items():
-            if isinstance(value, torch.Tensor) and value.dtype != torch.float32:
-                losses[key] = value.float()
-        
-        # 收集融合统计信息用于日志输出（enhanced with more metrics）
-        if self.bi_encoder is not None and hasattr(self.bi_encoder, '_fusion_stats') and self.bi_encoder._fusion_stats:
-            fusion_stats = self.bi_encoder._fusion_stats
-
-            # Core fusion statistics
-            stat_keys = [
-                'avg_confidence',
-                'valid_ratio',
-                'norm_ratio_2d_over_3d',
-                'cos_2d3d_mean',
-                'cos_2d3d_mean_ln',
-                'norm_2d_mean',
-                'norm_3d_mean',
-                'feat3d_mean_abs',
-                'feat3d_std',
-                'feat3d_nonzero_ratio',
-                'feat2d_mean_abs',
-                'feat2d_std',
-                'feat2d_nonzero_ratio',
-                'fused_mean_abs',
-                'fused_std',
-                'grad_norm_feat3d',
-                'grad_norm_feat2d',
-                'grad_norm_feat3d_raw',
-                'grad_norm_feat2d_raw',
-                'grad_norm_fusion_raw',
-                'grad_params_feat2d',
-                'grad_params_feat3d',
-                'grad_params_fusion',
-                'grad_params_decoder',
-                'grad_ratio_2d_over_3d'
-            ]
-            tensor_stats = {
-                key: torch.tensor(fusion_stats[key], dtype=torch.float32)
-                for key in stat_keys if key in fusion_stats
-            }
-            losses.update(tensor_stats)
-        
-        # Enhanced loss recording and anomaly detection
-        return losses
+        # Loss
+        return self.criterion(x, gt_instances, gt_point_instances, None, self.decoder.mask_pred_mode)
 
     def predict(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], **kwargs) -> List[Any]:  # type: ignore[override]
         """Predict results from a batch of inputs and data samples with post-
@@ -1042,6 +732,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         self.train_cfg = train_cfg
         self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.map_to_rec_pcd = map_to_rec_pcd
+        self._dino_debug_count = 0
         self.init_weights()
     
     def init_weights(self):
@@ -1052,7 +743,90 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
 
     def extract_feat(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], frame_i: int) -> Tuple[List[Any], List[torch.Tensor], Any, List[Any]]:  # type: ignore[override]
         """Extract features from sparse tensor.
+        DINO 三条链路（有且仅在可用时触发，缺一则退化为纯3D）：
+          1) 外部直接传入 dino_fpn / dino_feats：[s1..s16]，无需再构建。
+          2) 传入点级 dino_point_feats（与 points 对齐），在此处 voxel 化并 build_sparse_fpn。
+          3) 如果有 clip_pix + cam_info，则在线投影 clip_pix 到点级 → voxel → build_sparse_fpn。
+        未命中上述任一分支时，dino_feats=None，U-Net 注入自动跳过。
         """
+        # 调试：查看 DINO 相关键是否存在（仅前几次打印）
+        if self._dino_debug_count < 3:
+            has_keys = {
+                'dino_fpn': 'dino_fpn' in batch_inputs_dict,
+                'dino_feats': 'dino_feats' in batch_inputs_dict,
+                'dino_point_feats': 'dino_point_feats' in batch_inputs_dict,
+                'clip_pix': 'clip_pix' in batch_inputs_dict,
+                'cam_info': 'cam_info' in batch_inputs_dict,
+            }
+            clip_shapes = None
+            if 'clip_pix' in batch_inputs_dict:
+                cp = batch_inputs_dict['clip_pix']
+                if isinstance(cp, list) and len(cp) > frame_i and torch.is_tensor(cp[frame_i]):
+                    clip_shapes = cp[frame_i].shape
+                elif torch.is_tensor(cp):
+                    clip_shapes = cp.shape
+            cam_info_len = len(batch_inputs_dict.get('cam_info', [])) if isinstance(batch_inputs_dict.get('cam_info', None), list) else int('cam_info' in batch_inputs_dict)
+            print(f"[DINO][debug] keys={has_keys}, clip_shape={clip_shapes}, cam_info_len={cam_info_len}, frame={frame_i}")
+        # 可选：外部传入的 DINO 稀疏金字塔或点级 DINO 特征，按帧索引取用
+        dino_feats = None
+        # 1) 直接传入的稀疏 FPN 列表 [s1..s16]
+        if 'dino_fpn' in batch_inputs_dict:
+            try:
+                dino_feats = batch_inputs_dict['dino_fpn'][frame_i]
+                if self._dino_debug_count < 5:
+                    print(f"[DINO] use provided dino_fpn frame={frame_i}")
+                    self._dino_debug_count += 1
+            except Exception:
+                dino_feats = None
+        elif 'dino_feats' in batch_inputs_dict:
+            try:
+                dino_feats = batch_inputs_dict['dino_feats'][frame_i]
+                if self._dino_debug_count < 5:
+                    print(f"[DINO] use provided dino_feats frame={frame_i}")
+                    self._dino_debug_count += 1
+            except Exception:
+                dino_feats = None
+        # 2) 如果传入了点级 DINO 特征（与 points 同顺序），自动构建 FPN
+        if dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
+            try:
+                pt_feats_list = []
+                coords_list = []
+                for b_idx, pts in enumerate(batch_inputs_dict['points']):
+                    xyz = pts[frame_i, :, :3]  # (N,3) 已包含 elastic 等增强
+                    feats_2d = batch_inputs_dict['dino_point_feats'][b_idx][frame_i]  # (N,C_dino)
+                    # voxel 坐标（向下取整），添加 batch 维
+                    coords = torch.cat([
+                        torch.full((xyz.shape[0], 1), b_idx, dtype=torch.int32, device=xyz.device),
+                        (xyz / self.voxel_size).floor().to(torch.int32)
+                    ], dim=1)
+                    coords_list.append(coords.cpu())  # Minkowski 要求 int32，后续 sparse_collate 处理
+                    pt_feats_list.append(feats_2d.cpu())
+                # 批量稀疏拼接
+                coords_batch, feats_batch = ME.utils.sparse_collate(
+                    coords_list, pt_feats_list, device=pt_feats_list[0].device)
+                fpn = build_sparse_fpn(coords_batch, feats_batch)
+                dino_feats = fpn
+                if self._dino_debug_count < 3:
+                    print(f"[DINO] build from dino_point_feats frame={frame_i}, coords={coords_batch.shape}, feats={feats_batch.shape}")
+                    self._dino_debug_count += 1
+            except Exception:
+                dino_feats = None
+        # 3) 若仍为空且存在 clip_pix + cam_info，尝试在线投影得到点级 DINO
+        if dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
+            try:
+                dino_feats = self._build_dino_fpn_from_clip(batch_inputs_dict, frame_i)
+                if dino_feats is not None and self._dino_debug_count < 3:
+                    shapes = [x.shape for x in dino_feats]
+                    strides = [x.tensor_stride for x in dino_feats]
+                    print(f"[DINO] build from clip_pix frame={frame_i}, shapes={shapes}, strides={strides}")
+                    self._dino_debug_count += 1
+            except Exception:
+                dino_feats = None
+        # 4) 若最终仍未构建，打印一次提示
+        if dino_feats is None and self._dino_debug_count < 5:
+            print(f"[DINO] no dino_feats used at frame={frame_i}")
+            self._dino_debug_count += 1
+
         # construct tensor field
         coordinates, features = [], []
         for i in range(len(batch_inputs_dict['points'])):
@@ -1070,7 +844,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         field = ME.TensorField(coordinates=coordinates, features=features)
 
         # forward of backbone and neck
-        x = self.backbone(field.sparse(), memory=self.memory if hasattr(self,'memory') else None)
+        x = self.backbone(
+            field.sparse(),
+            dino_feats=dino_feats,
+            memory=self.memory if hasattr(self, 'memory') else None)
         if self.with_neck:
             assert self.neck is not None
             x = self.neck(x)
@@ -1096,6 +873,90 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             features.append(x[begin: end, :-3])
             sp_xyz_list.append(x[begin: end, -3:])
         return features, point_features, all_xyz_w, sp_xyz_list
+
+    def _build_dino_fpn_from_clip(self, batch_inputs_dict: Dict[str, Any], frame_i: int):
+        """从 clip_pix + cam_info 在线投影获取点级 DINO，并构建稀疏 FPN。
+        假设 clip_pix 为 List[Tensor]，cam_info 为 List[dict]，points 为 List[Tensor]。
+        若缺失必要信息则返回 None。
+        """
+        if 'points' not in batch_inputs_dict:
+            return None
+        points_list = batch_inputs_dict['points']
+        clip_list = batch_inputs_dict.get('clip_pix', None)
+        cam_info_list = batch_inputs_dict.get('cam_info', None)
+        if clip_list is None or cam_info_list is None:
+            return None
+
+        coords_list, feats_list = [], []
+        for b_idx, pts in enumerate(points_list):
+            if b_idx >= len(cam_info_list):
+                continue
+            cam_meta = cam_info_list[b_idx] if isinstance(cam_info_list, list) else cam_info_list
+            clip = clip_list[b_idx] if isinstance(clip_list, list) else clip_list
+            if clip is None:
+                continue
+            # clip_pix 期望 shape (C, H, W)
+            if not torch.is_tensor(clip):
+                clip = torch.as_tensor(clip)
+            clip = clip.to(pts.device)
+            C, Hf, Wf = clip.shape
+
+            # 取当前帧点
+            xyz = pts[frame_i, :, :3]  # (N,3)
+
+            # 准备相机参数
+            intr = cam_meta[0].get('intrinsics', SCANET_INTRINSICS) if isinstance(cam_meta, list) else cam_meta.get('intrinsics', SCANET_INTRINSICS)
+            max_depth = cam_meta[0].get('max_depth', 20.0) if isinstance(cam_meta, list) else cam_meta.get('max_depth', 20.0)
+            pose = None
+            if isinstance(cam_meta, list) and len(cam_meta) > 0:
+                pose = cam_meta[0].get('pose') or cam_meta[0].get('extrinsics')
+            elif isinstance(cam_meta, dict):
+                pose = cam_meta.get('pose') or cam_meta.get('extrinsics')
+
+            # 世界坐标 -> 相机坐标（若提供 cam2world 则取逆）
+            if pose is not None:
+                pose_t = torch.as_tensor(pose, device=xyz.device, dtype=xyz.dtype)
+                if pose_t.shape == (4, 4):
+                    try:
+                        w2c = torch.linalg.inv(pose_t)
+                    except Exception:
+                        w2c = torch.inverse(pose_t)
+                    xyz_h = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=1)
+                    xyz_cam = (w2c @ xyz_h.t()).t()[:, :3]
+                else:
+                    xyz_cam = xyz
+            else:
+                xyz_cam = xyz
+
+            # 投影到特征图坐标
+            uv_feat, valid = project_points_to_uv(
+                xyz_cam,
+                (Hf, Wf),
+                max_depth=max_depth,
+                standard_intrinsics=tuple(intr) if not torch.is_tensor(intr) else tuple(intr.cpu().numpy().tolist())
+            )
+            # 采样特征 (N, C)
+            sampled = sample_img_feat(clip.unsqueeze(0), uv_feat, valid, align_corners=True)
+            sampled = sampled.to(pts.device)
+
+            # 构造稀疏坐标（同当前点的 voxel 量化方式）
+            coords = torch.cat([
+                torch.full((xyz.shape[0], 1), b_idx, dtype=torch.int32, device=xyz.device),
+                (xyz / self.voxel_size).floor().to(torch.int32)
+            ], dim=1).cpu()
+            coords_list.append(coords)
+            feats_list.append(sampled.cpu())
+
+        if not coords_list:
+            return None
+        coords_batch, feats_batch = ME.utils.sparse_collate(coords_list, feats_list, device=feats_list[0].device)
+        fpn = build_sparse_fpn(coords_batch, feats_batch)
+        if self._dino_debug_count < 3:
+            shapes = [x.shape for x in fpn]
+            strides = [x.tensor_stride for x in fpn]
+            print(f"[DINO] proj+fpn frame={frame_i}, shapes={shapes}, strides={strides}")
+            self._dino_debug_count += 1
+        return fpn
     
     def _select_queries(self, x: List[Any], gt_instances: List[Any], sp_xyz: Optional[List[Any]] = None, frame_i: int = 0) -> Tuple[List[Any], List[Any], List[Any]]:  # type: ignore[override]
         """Select queries for train pass.
@@ -1189,32 +1050,6 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                  for i in range(len(ins_masks_query_n_frames[0]))]
             loss = self.merge_criterion(merge_feat_n_frames, ins_masks_query_n_frames)
             losses.update(loss)
-        # 收集融合统计信息用于日志输出
-        if self.bi_encoder is not None and hasattr(self.bi_encoder, '_fusion_stats'):
-            fusion_stats = self.bi_encoder._fusion_stats
-            monitor_keys = [
-                'avg_confidence',
-                'valid_ratio',
-                'norm_ratio_2d_over_3d',
-                'cos_2d3d_mean',
-                'cos_2d3d_mean_ln',
-                'feat3d_mean_abs',
-                'feat3d_std',
-                'feat3d_nonzero_ratio',
-                'feat2d_mean_abs',
-                'feat2d_std',
-                'feat2d_nonzero_ratio',
-                'fused_mean_abs',
-                'fused_std',
-                'grad_norm_feat3d',
-                'grad_norm_feat2d'
-            ]
-            monitor_tensors = {
-                key: torch.tensor(fusion_stats[key])
-                for key in monitor_keys if key in fusion_stats
-            }
-            losses.update(monitor_tensors)
-
         return losses
 
     def predict(self, batch_inputs_dict: Dict[str, Any], batch_data_samples: List[Any], **kwargs) -> List[Any]:  # type: ignore[override]

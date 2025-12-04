@@ -13,7 +13,9 @@ custom_imports = dict(imports=[
     'oneformer3d.bi_fusion_encoder_3dmv',
     'oneformer3d.partial_load_hook',
     'oneformer3d.detailed_loss_hook',
-    'oneformer3d.enhanced_training_hook'
+    'oneformer3d.enhanced_training_hook',
+    # 新增：冻结 BN 统计的 Hook（仅 S1 使用）
+    'oneformer3d.bn_eval_hook',
 ])
 
 # 从 Phase A 最优权重继续训练（避免再次覆写 3D 主干）
@@ -373,6 +375,17 @@ param_scheduler = dict(
 
 custom_hooks = [
     dict(type='EmptyCacheHook', after_iter=True),
+    # S1：将冻结分支切到 eval()，避免 BN running stats 漂移
+    dict(
+        type='ModuleEvalFreezeHook',
+        module_prefixes=[
+            'bi_encoder.backbone3d',
+            'bi_encoder.conv3d_fusion.features3d',
+            'decoder',
+        ],
+        also_require_grad_off=False,
+        verbose=True,
+    ),
     dict(
         type='EnhancedTrainingHook',
         log_interval=50,
