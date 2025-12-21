@@ -171,6 +171,10 @@ class InstanceCriterion:
                                                       insts, indices):
             if len(inst) == 0:
                 continue
+            # matcher 可能返回空匹配（例如 query_masks 全 False 的列），
+            # 对空 tensor 做 BCE(mean) 会产生 NaN。
+            if idx_q.numel() == 0 or idx_gt.numel() == 0:
+                continue
 
             pred_mask = mask[idx_q]
             tgt_mask = inst.sp_masks[idx_gt]
@@ -275,6 +279,10 @@ class InstanceCriterion:
         for mask, score, inst, (idx_q, idx_gt) in zip(pred_masks, pred_scores,
                                                       insts, indices):
             if len(inst) == 0:
+                continue
+            # matcher 可能返回空匹配（例如 query_masks 全 False 的列），
+            # 对空 tensor 做 BCE(mean) 会产生 NaN。
+            if idx_q.numel() == 0 or idx_gt.numel() == 0:
                 continue
             pred_mask = mask[idx_q]
             tgt_mask = inst.sp_masks[idx_gt]
@@ -428,6 +436,10 @@ class MixedInstanceCriterion:
         for mask, score, bbox, center, inst, (idx_q, idx_gt) in zip(pred_masks, pred_scores, 
                                                       pred_bboxes, centers, insts, indices):
             if len(inst) == 0:
+                continue
+            # matcher 可能返回空匹配（例如 query_masks 全 False 的列），
+            # 对空 tensor 做 BCE(mean) 会产生 NaN。
+            if idx_q.numel() == 0 or idx_gt.numel() == 0:
                 continue
 
             pred_mask = mask[idx_q]
@@ -599,6 +611,10 @@ class MixedInstanceCriterion:
         for mask, score, bbox, center, inst, (idx_q, idx_gt) in zip(pred_masks, pred_scores, 
                                                       pred_bboxes, centers, insts, indices):
             if len(inst) == 0:
+                continue
+            # matcher 可能返回空匹配（例如 query_masks 全 False 的列），
+            # 对空 tensor 做 BCE(mean) 会产生 NaN。
+            if idx_q.numel() == 0 or idx_gt.numel() == 0:
                 continue
             pred_mask = mask[idx_q]
             tgt_mask = inst.p_masks[idx_gt]

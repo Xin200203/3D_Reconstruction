@@ -28,6 +28,10 @@ from .scannet_dataset import ScanNetSegDataset_, ScanNet200SegDataset_, ScanNet2
 from .time_divided_transformer import TimeDividedTransformer
 from .bi_fusion_encoder import BiFusionEncoder
 from .bife_clip_loss import ClipConsCriterion
+from .dino_backbone import DINOv2Backbone
+from .minkowski_clear_hook import MinkowskiClearCoordinateManagerHook
+from .dino_sanity_hook import DINOAlignmentSanityHook
+from .collate import esam_collate
 # 将所有在 mmdet3d.registry.MODELS 中注册的模块同步到 mmengine.registry.MODELS，
 # 以便 mmengine 的 BaseModel 能够直接查询到自定义组件（如 Det3DDataPreprocessor_）。
 from mmdet3d.registry import MODELS as _M3D_MODELS  # noqa: E402

@@ -8,9 +8,15 @@ num_instance_classes = 1
 num_semantic_classes = 200
 num_instance_classes_eval = 1
 
-# 使用 DINO 特征的单帧版本：仅在管线中加载 clip_pix（DINO），模型仍为纯 3D 主干
+# 单帧在线 DINOv2 版本：
+# - 2D 增强（水平翻转 + 颜色抖动 + 等比例 resize）全部在 dataset pipeline 内完成；
+# - 模型内用冻结的 DINOv2 在线提取 patch 特征并做 2D→3D 对齐；
+# - 不再依赖离线 clip_pix / dino_feats 文件。
 model = dict(
     type='ScanNet200MixFormer3D',
+    # 训练期严格约束：只走在线 DINO 注入，任何链路异常直接报错终止训练（避免“半随机失效”悄悄污染训练）。
+    dino_require=True,
+    dino_online_only=True,
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     voxel_size=0.02,
     num_classes=num_instance_classes_eval,
@@ -22,9 +28,22 @@ model = dict(
         config=dict(
             dilations=[1, 1, 1, 1],
             conv1_kernel_size=5,
-            bn_momentum=0.02),
+            bn_momentum=0.02,
+            # DINO 注入严格检查：decoder 各尺度 hit_rate 必须足够高，否则立即报错中止训练。
+            # 经验：对齐正确时应接近 1.0；若因增强/坐标反解问题错位，会显著下降。
+            dino_strict=True,
+            dino_min_hit_ratio=0.95,
+            # 残差式注入：base_cat + fuse(cat+ dino)，并将 fuse 初始化为 0，
+            # 用于避免加载“不含 DINO 注入层”的旧 checkpoint 时出现 AP 断崖式下降。
+            dino_residual=True),
         # 启用 DINO 注入，通道数与 DINO clip_pix 保持一致（1024）
         dino_dim=1024),
+    dino_cfg=dict(
+        type='DINOv2Backbone',
+        # 使用 DINOv2 ViT-L/14 reg4 变体，与本地权重对应
+        arch='dinov2_vitl14_reg',
+        # 本地预训练权重路径（避免联网加载）
+        checkpoint='/home/nebula/xxy/dataset/models/dinov2_vitl14_reg4_pretrain.pth'),
     pool=dict(type='GeoAwarePooling', channel_proj=96),
     decoder=dict(
         type='ScanNetMixQueryDecoder',
@@ -142,7 +161,7 @@ color_std = (
     0.27566157565723015 * 255,
     0.27018971370874995 * 255)
 
-# dataset settings（在管线中加载 DINO clip_feat）
+# dataset settings（在线加载 RGB，并在模型中提取 DINO 特征）
 train_pipeline = [
     dict(
         type='LoadPointsFromFile',
@@ -151,8 +170,6 @@ train_pipeline = [
         use_color=True,
         load_dim=6,
         use_dim=[0, 1, 2, 3, 4, 5]),
-    dict(type='LoadClipFeature', data_root=data_root),  # 读取 DINO clip_pix
-    dict(type='LoadSingleImageFromFile', dataset_type='scannet200'),
     dict(
         type='LoadAnnotations3D_',
         with_bbox_3d=False,
@@ -162,21 +179,51 @@ train_pipeline = [
         with_sp_mask_3d=True),
     dict(type='SwapChairAndFloor'),
     dict(type='PointSegClassMapping'),
+    dict(type='LoadSingleImageFromFile', dataset_type='scannet200', keep_imgs=False),
+    # mmcv 默认读入为 BGR；DINOv2 期望 RGB，且点云颜色也通常按 RGB 存储。
+    # 这里统一转为 RGB，保证在线 DINO 与对齐诊断一致。
+    dict(type='BGR2RGBImg'),
+    dict(
+        # 重要：引入 img 后，mmdet3d 原生 RandomFlip3D(sync_2d=True) 会强制关闭 pcd_vertical_flip，
+        # 会比基线少一半 3D 增强；这里使用自定义版本保持“水平与 2D 同步 + 垂直 BEV 仍随机”。
+        type='RandomFlip3D_Sync2DWithVF',
+        sync_2d=True,
+        flip_ratio_bev_horizontal=0.5,
+        flip_ratio_bev_vertical=0.5),
+    dict(
+        type='GlobalRotScaleTrans',
+        rot_range=[-3.14, 3.14],
+        scale_ratio_range=[0.8, 1.2],
+        translation_std=[0.1, 0.1, 0.1],
+        shift_height=False),
     dict(
         type='NormalizePointsColor_',
         color_mean=color_mean,
         color_std=color_std),
+    dict(
+        type='ColorJitterImg',
+        brightness=0.4,
+        contrast=0.4,
+        saturation=0.4,
+        hue=0.1),
+    dict(type='ResizeForDINO', target_size=(420, 560)),
+    dict(type='NormalizeCamInfo', strict=True),
     dict(
         type='AddSuperPointAnnotations',
         num_classes=num_semantic_classes,
         stuff_classes=[0, 1],
         merge_non_stuff_cls=False),
     dict(
+        type='ElasticTransfrom',
+        gran=[6, 20],
+        mag=[40, 160],
+        voxel_size=0.02,
+        p=0.5),
+    dict(
         type='Pack3DDetInputs_',
         keys=[
             'points', 'gt_labels_3d', 'pts_semantic_mask', 'pts_instance_mask',
-            'sp_pts_mask', 'gt_sp_masks', 'elastic_coords', 'clip_pix',
-            'cam_info'
+            'sp_pts_mask', 'gt_sp_masks', 'elastic_coords', 'img', 'cam_info'
         ])
 ]
 test_pipeline = [
@@ -187,8 +234,6 @@ test_pipeline = [
         use_color=True,
         load_dim=6,
         use_dim=[0, 1, 2, 3, 4, 5]),
-    dict(type='LoadClipFeature', data_root=data_root),
-    dict(type='LoadSingleImageFromFile', dataset_type='scannet200'),
     dict(
         type='LoadAnnotations3D_',
         with_bbox_3d=False,
@@ -198,6 +243,8 @@ test_pipeline = [
         with_sp_mask_3d=True),
     dict(type='SwapChairAndFloor'),
     dict(type='PointSegClassMapping'),
+    dict(type='LoadSingleImageFromFile', dataset_type='scannet200', keep_imgs=False),
+    dict(type='BGR2RGBImg'),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -208,18 +255,25 @@ test_pipeline = [
                 type='NormalizePointsColor_',
                 color_mean=color_mean,
                 color_std=color_std),
+            # 保证 val/test 的 DINO 输入也在 420×560（30×40 patch grid）上运行
+            # 注意：必须放在 MultiScaleFlipAug3D 内部，才能对每个 aug 生效
+            dict(type='ResizeForDINO', target_size=(420, 560)),
+            dict(type='NormalizeCamInfo', strict=True),
             dict(
                 type='AddSuperPointAnnotations',
                 num_classes=num_semantic_classes,
                 stuff_classes=[0, 1],
                 merge_non_stuff_cls=False),
         ]),
-    dict(type='Pack3DDetInputs_', keys=['points', 'sp_pts_mask', 'clip_pix', 'cam_info'])
+    dict(type='Pack3DDetInputs_', keys=['points', 'sp_pts_mask', 'img', 'cam_info'])
 ]
 
 train_dataloader = dict(
+    # 在线 DINOv2 (ViT-L/14) 前向开销较大，单卡常见 batch_size=2~4；
+    # 若显存充足或多卡训练可再调大，并按需线性调整 lr。
     batch_size=16,
     num_workers=6,
+    collate_fn=dict(type='esam_collate'),
     dataset=dict(
         type=dataset_type,
         ann_file='scannet200_sv_oneformer3d_infos_train_dino.pkl',
@@ -231,6 +285,7 @@ train_dataloader = dict(
         scene_idxs=None,
         test_mode=False))
 val_dataloader = dict(
+    collate_fn=dict(type='esam_collate'),
     dataset=dict(
         type=dataset_type,
         ann_file='scannet200_sv_oneformer3d_infos_val_dino.pkl',
@@ -278,15 +333,22 @@ test_evaluator = val_evaluator
 
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='AdamW', lr=5e-5, weight_decay=0.05),
+    # 对齐 baseline（ESAM_sv_scannet200_CA.py）：batch_size=16 下使用 lr=1e-4 + PolyLR(128ep)
+    optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.05),
     clip_grad=dict(max_norm=10, norm_type=2))
 
-param_scheduler = [
-    dict(type='LinearLR', begin=0, end=2, start_factor=0.1, by_epoch=True),  # 2 个 epoch warmup
-    dict(type='PolyLR', begin=2, end=80, power=0.9)
-]
+# learning rate（对齐 baseline：全程 128 epoch 衰减，避免 end=80 导致后 48 epoch 学习率归零）
+param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
 
-custom_hooks = [dict(type='EmptyCacheHook', after_iter=True)]
+custom_hooks = [
+    # MinkowskiEngine 可能在长训练中累积 coordinate maps（非 PyTorch allocator 统计），
+    # 导致训练数个 epoch 后可用显存逐步下降并最终 OOM。
+    dict(type='MinkowskiClearCoordinateManagerHook', after_iter=True),
+    # 仍保留 PyTorch cache 清理（可选；若训练变慢可改成 after_epoch=True）。
+    dict(type='EmptyCacheHook', after_iter=True),
+    # 训练期 sanity：每个 epoch 汇总一次 vertical flip 命中率与 DINO 注入命中率（s1..s16）
+    dict(type='DINOAlignmentSanityHook', log_interval_epochs=1),
+]
 default_hooks = dict(
     checkpoint=dict(
         interval=1,
@@ -294,9 +356,9 @@ default_hooks = dict(
         save_best=['all_ap_50%'],
         rule='greater'))
 
-load_from = '/home/nebula/xxy/3D_Reconstruction/work_dirs/ESAM_sv_scannet200_CA/best_all_ap_50%_epoch_128.pth'
+load_from = '/home/nebula/xxy/3D_Reconstruction/work_dirs/tmp/mask3d_scannet200.pth'
 
 
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=80, val_interval=5)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')

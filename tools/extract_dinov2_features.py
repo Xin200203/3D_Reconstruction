@@ -36,6 +36,9 @@ logger = logging.getLogger("dinov2_extract")
 DINO_MEAN = (0.485, 0.456, 0.406)
 DINO_STD = (0.229, 0.224, 0.225)
 
+# ViT-14 的 patch 大小（与 notebook 中保持一致）
+PATCH_SIZE = 14
+
 
 def preprocess_image(image_pil: Image.Image,
                      expect_size: Tuple[int, int] = (480, 640),
@@ -79,7 +82,13 @@ class DINOv2FeatureExtractor:
         self._load_model()
 
     def _load_model(self):
-        """加载 DINOv2；若提供 checkpoint 则优先使用本地权重。"""
+        """加载 DINOv2；若提供 checkpoint 则优先使用本地权重。
+
+        优先尝试使用本地 cache / repo，避免每次都访问网络。
+        """
+        import os
+        import torch.hub
+
         valid_arch = {
             "dinov2_vits14", "dinov2_vits14_reg",
             "dinov2_vitb14", "dinov2_vitb14_reg",
@@ -88,11 +97,29 @@ class DINOv2FeatureExtractor:
         }
         if self.arch not in valid_arch:
             raise RuntimeError(f"arch={self.arch} 不在合法列表 {valid_arch}")
+
+        # 1) 优先尝试从本地 hub cache 加载，避免重复访问 GitHub
+        hub_dir = torch.hub.get_dir()
+        local_repo = os.path.join(hub_dir, "facebookresearch_dinov2_main")
+
         try:
-            # 若提供 checkpoint，关闭预训练下载
-            self.model = torch.hub.load(
-                "facebookresearch/dinov2", self.arch, pretrained=self.checkpoint is None
-            )
+            if os.path.isdir(local_repo):
+                logger.info(f"从本地 DINOv2 repo 加载: {local_repo}")
+                self.model = torch.hub.load(
+                    local_repo,
+                    self.arch,
+                    source="local",
+                    pretrained=self.checkpoint is None,
+                )
+            else:
+                # 若本地 repo 不存在，回退到默认的远程加载（可能触发网络访问）
+                logger.info("未找到本地 DINOv2 repo，尝试从 GitHub 加载。")
+                self.model = torch.hub.load(
+                    "facebookresearch/dinov2",
+                    self.arch,
+                    pretrained=self.checkpoint is None,
+                )
+
             if self.checkpoint:
                 ckpt = torch.load(self.checkpoint, map_location=self.device)
                 # 兼容多种保存格式
@@ -111,6 +138,7 @@ class DINOv2FeatureExtractor:
                 if unexpected:
                     logger.warning(f"load_state_dict 存在未使用参数: {unexpected[:5]}{' ...' if len(unexpected)>5 else ''}")
                 logger.info(f"✓ 从本地权重加载: {self.checkpoint}")
+
             self.model.eval()
             self.model.to(self.device)
             logger.info(f"✓ 成功加载 {self.arch}")
@@ -119,10 +147,21 @@ class DINOv2FeatureExtractor:
             raise
 
     @torch.inference_mode()
-    def extract_features(self, image_path: Path) -> torch.Tensor:
-        """对单张图像提取特征，返回 (C, H_p, W_p)。"""
+    def extract_features(self, image_path: Path, debug: bool = False) -> torch.Tensor:
+        """对单张图像提取特征，返回 (C, H_p, W_p)。
+
+        若 debug=True，会额外打印图像与 patch 网格的一些形状信息，便于排查 PCA 可视化问题。
+        """
         img = Image.open(image_path).convert("RGB")
-        img_tensor = preprocess_image(img)  # (3, H_pad, W_pad), float32
+        if debug:
+            logger.info(f"[DINOv2] image_path={image_path}, PIL_size={img.size}")  # (W,H)
+
+        # 仅做归一化 + pad，不做 resize；同时记录 pad 后尺寸，便于根据 H_pad/W_pad 推断 h,w
+        img_tensor = preprocess_image(img, patch_size=PATCH_SIZE)  # (3, H_pad, W_pad), float32
+        _, H_pad, W_pad = img_tensor.shape
+        if debug:
+            logger.info(f"[DINOv2] after preprocess: tensor shape={tuple(img_tensor.shape)} (H_pad={H_pad}, W_pad={W_pad})")
+
         img_tensor = img_tensor.unsqueeze(0).to(self.device)
         # 对齐模型权重 dtype（通常 float32）
         img_tensor = img_tensor.to(dtype=self.model.patch_embed.proj.weight.dtype)
@@ -150,10 +189,28 @@ class DINOv2FeatureExtractor:
             raise RuntimeError("未能从 forward_features 得到 patch tokens。")
         # tokens: (B, L, C)
         B, L, C = tokens.shape
+        if debug:
+            logger.info(f"[DINOv2] tokens shape: B={B}, L={L}, C={C}, h={h}, w={w}")
+
         if h is None or w is None:
-            # 若未提供 h, w，则尝试平方根推断
+            # 若未提供 h, w，则优先根据 pad 后尺寸和 patch_size 推断
+            h = H_pad // PATCH_SIZE
+            w = W_pad // PATCH_SIZE
+            if debug:
+                logger.info(
+                    f"[DINOv2] infer h,w from H_pad/W_pad: "
+                    f"H_pad={H_pad}, W_pad={W_pad}, PATCH_SIZE={PATCH_SIZE} -> h={h}, w={w}, h*w={h*w}, L={L}"
+                )
+
+        # 理论上 h*w 应该等于 L（纯 patch tokens）；若出现不一致，作为兜底才使用 sqrt(L)
+        if h * w > L:
             hw = int(np.sqrt(L))
+            if debug:
+                logger.warning(
+                    f"[DINOv2] h*w={h*w} > L={L}, fallback to sqrt(L) grid: h=w={hw}, h*w={hw*hw}"
+                )
             h = w = hw
+
         tokens = tokens[0, :h * w, :]  # (L, C)
         feat_map = tokens.transpose(0, 1).reshape(C, h, w).contiguous()  # (C, H_p, W_p)
 

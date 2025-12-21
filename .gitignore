@@ -93,3 +93,4 @@ thirdparty/FastSAM
 *.swo
 *.tmp
 tmp/
+vis_demo/200_dinov2_feat.pt

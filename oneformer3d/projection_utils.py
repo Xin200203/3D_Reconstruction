@@ -64,8 +64,27 @@ def project_points_to_uv(xyz_cam: torch.Tensor,
                          max_depth: float,
                          standard_intrinsics: Tuple[float, float, float, float] = SCANET_INTRINSICS,
                          debug: bool = False,
-                         debug_prefix: str = "") -> Tuple[torch.Tensor, torch.Tensor]:
-    fx_feat, fy_feat, cx_feat, cy_feat = _scale_intrinsics(standard_intrinsics, feat_hw)
+                         debug_prefix: str = "",
+                         already_scaled: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Project 3D points in camera coordinates to 2D feature grid.
+
+    Args:
+        xyz_cam: (N,3) points in camera coordinates.
+        feat_hw: (H_feat, W_feat) of the target grid (image or feature map).
+        max_depth: maximum valid depth.
+        standard_intrinsics: intrinsics of the base image or already scaled intrinsics.
+        debug: whether to print debug statistics.
+        debug_prefix: prefix for debug prints.
+        already_scaled: if True, `standard_intrinsics` are treated as the
+            final intrinsics for `feat_hw` and will NOT be rescaled inside
+            this function. This is useful for cases where intrinsics have
+            already been updated by 2D augmentations (resize/flip) and
+            stored in metadata.
+    """
+    if already_scaled:
+        fx_feat, fy_feat, cx_feat, cy_feat = standard_intrinsics
+    else:
+        fx_feat, fy_feat, cx_feat, cy_feat = _scale_intrinsics(standard_intrinsics, feat_hw)
     x, y, z = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
     valid_z = (z > MIN_DEPTH) & (z < max_depth)
     ratio_x = torch.zeros_like(x)

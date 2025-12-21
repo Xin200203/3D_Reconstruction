@@ -304,9 +304,9 @@ default_hooks = dict(
         save_best=['all_ap_50%'],
         rule='greater'))
 
-load_from = 'work_dirs/tmp/mask3d_scannet200.pth'
+load_from = '/home/nebula/xxy/3D_Reconstruction/work_dirs/ESAM_sv_scannet200_CA/best_all_ap_50%_epoch_128.pth'
 
 # training schedule for 1x
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=128)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')

@@ -29,6 +29,15 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
         """
         # 提取核心数据
         inputs = data.get('inputs', {})
+
+        # 当同时存在单帧 `img` 和多帧 `imgs` 时，优先走单帧分支（ESAM+在线 DINO 的典型配置），
+        # 避免误触发多帧 BiFusion 路径导致 `No valid images found` 等错误。
+        if 'img' in inputs and 'imgs' in inputs:
+            inputs = dict(inputs)
+            inputs.pop('imgs')
+            # 同步更新 data['inputs']，保证后续 _get_pad_shape 等看到一致视图
+            data = dict(data)
+            data['inputs'] = inputs
         
         if 'img' in data['inputs']:
             batch_pad_shape = self._get_pad_shape(data)
@@ -134,14 +143,14 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
                             print(f"[Det3DDataPreprocessor_] list imgs cam_info len={len(cam_info)}")
             
             # 验证最终的图像列表
-            if len(tensor_imgs) == 0:
-                raise ValueError("No valid images found after preprocessing")
-            
-            batch_inputs['imgs'] = tensor_imgs
-            if os.environ.get('BIFUSION_DEBUG_CAMINFO'):
-                print(f"[Det3DDataPreprocessor_] batch imgs={len(tensor_imgs)}")
+            # 对于 BiFusion 多帧路径，如果没有成功解析任何图像，静默跳过，
+            # 让后续的 `img` 或无图像路径接管，避免直接抛出异常。
+            if len(tensor_imgs) > 0:
+                batch_inputs['imgs'] = tensor_imgs
+                if os.environ.get('BIFUSION_DEBUG_CAMINFO'):
+                    print(f"[Det3DDataPreprocessor_] batch imgs={len(tensor_imgs)}")
 
-        elif 'img' in inputs:
+        if 'img' in inputs:
             # 原来的 img 处理逻辑
             batch_pad_shape = self._get_pad_shape(data)
             imgs = inputs['img']

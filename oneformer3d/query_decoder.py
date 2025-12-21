@@ -49,6 +49,17 @@ class CrossAttentionLayer(BaseModule):
         for i in range(len(sources)):
             k = v = sources[i]
             attn_mask = attn_masks[i] if attn_masks is not None else None
+            # MultiheadAttention: bool mask where True means "masked".
+            # 若某一 query 行全为 True，会导致 softmax 全 -inf -> NaN。
+            if attn_mask is not None:
+                attn_mask = attn_mask.to(device=queries[i].device)
+                if attn_mask.dtype is not torch.bool:
+                    attn_mask = attn_mask.bool()
+                if attn_mask.ndim == 2:
+                    all_true = attn_mask.all(dim=1)
+                    if all_true.any():
+                        attn_mask = attn_mask.clone()
+                        attn_mask[all_true] = False
             output, _ = self.attn(queries[i], k, v, attn_mask=attn_mask)
             if self.fix:
                 output = self.dropout(output)
@@ -688,11 +699,17 @@ class ScanNetMixQueryDecoder(QueryDecoder):
                     xyz_weights = torch.chunk(super_points[1], len(super_points[0]), dim=0)
                     attn_mask_score = [scatter_mean(att.float() * xyz_w.view(1, -1), sp, dim=1)
                          for att, sp, xyz_w in zip(attn_mask, super_points[0], xyz_weights)]
+                    attn_mask_score = [torch.nan_to_num(att, nan=0.0, posinf=1.0, neginf=0.0)
+                                       for att in attn_mask_score]
                     attn_mask = [(att > 0.5).bool() for att in attn_mask_score] # > 0.5, not <
                     # If attn_mask has all-True row, the result of CA will be nan
                     for j in range(len(attn_mask)):
                         mask = ~(attn_mask_score[j] == attn_mask_score[j].min(dim=1, keepdim=True)[0])
-                        attn_mask[j] *= mask
+                        attn_mask[j] = attn_mask[j] & mask
+                        all_true = attn_mask[j].all(dim=1)
+                        if all_true.any():
+                            attn_mask[j] = attn_mask[j].clone()
+                            attn_mask[j][all_true] = False
                 queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
             elif self.cross_attn_mode[i+1] == "P" and self.mask_pred_mode[i] == "SP":
                 if attn_mask is not None:
