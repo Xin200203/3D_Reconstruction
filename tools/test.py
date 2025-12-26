@@ -100,6 +100,35 @@ def trigger_visualization_hook(cfg, args):
     return cfg
 
 
+def _rewrite_diagnostics_out_dir(cfg):
+    """Make diagnostics output dir unique per run.
+
+    UnifiedSegMetric resolves relative `diagnostics.out_dir` against logger
+    fields, which may fall back to CWD. Here we force it to live under the
+    runner `work_dir` (absolute) to avoid cross-run overwrites.
+    """
+
+    def _rewrite_one(evaluator):
+        if not isinstance(evaluator, dict):
+            return
+        diag = evaluator.get('diagnostics', None)
+        if not isinstance(diag, dict):
+            return
+        out_dir = diag.get('out_dir', 'instance_diagnostics')
+        out_dir = str(out_dir)
+        if not osp.isabs(out_dir):
+            diag['out_dir'] = osp.abspath(osp.join(cfg.work_dir, out_dir))
+
+    for key in ('val_evaluator', 'test_evaluator'):
+        if key not in cfg:
+            continue
+        if isinstance(cfg[key], dict):
+            _rewrite_one(cfg[key])
+        elif isinstance(cfg[key], (list, tuple)):
+            for e in cfg[key]:
+                _rewrite_one(e)
+
+
 def main():
     args = parse_args()
 
@@ -136,6 +165,9 @@ def main():
                                 osp.splitext(osp.basename(args.config))[0])
 
     cfg.load_from = args.checkpoint
+
+    # Ensure diagnostics output does not overwrite across experiments.
+    _rewrite_diagnostics_out_dir(cfg)
 
     if args.show or args.show_dir:
         cfg = trigger_visualization_hook(cfg, args)

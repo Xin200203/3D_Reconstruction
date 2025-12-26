@@ -1146,15 +1146,106 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             scores *= out['scores'][0]
         if self.num_classes == 1:
             scores = scores.sum(-1, keepdim=True)
-        labels = torch.arange(
+
+        labels_all = torch.arange(
             self.num_classes,
             device=scores.device).unsqueeze(0).repeat(
                 len(cls_preds), 1).flatten(0, 1)
-        topk_num = min(int(self.test_cfg.topk_insts), scores.shape[0] * scores.shape[1])
-        scores, topk_idx = scores.flatten(0, 1).topk(topk_num, sorted=False)
-        labels = labels[topk_idx]
 
-        topk_idx = torch.div(topk_idx, self.num_classes, rounding_mode='floor')
+        # Selection / rerank before top-K (quality-aware selection).
+        # - `scores` is kept as the *base score* for downstream scoring/AP.
+        # - `select_scores` is used for top-K selection and diagnostics (oracle/rank).
+        sel_cfg = self.test_cfg.get('selection', None) or {}
+        base_scores = scores  # (Q, C)
+        select_scores = base_scores
+        if bool(sel_cfg.get('enable', False)):
+            mode = str(sel_cfg.get('mode', 'cls'))
+            if mode not in ('cls', 'cls_stab_size'):
+                mode = 'cls'
+            if mode == 'cls_stab_size':
+                # Compute quality proxies on point-domain masks (robust to SP/P domains).
+                sp_thr = float(self.test_cfg.sp_score_thr)
+                stability_offset = float(sel_cfg.get('stability_offset', 0.1))
+                gamma = float(sel_cfg.get('gamma', 1.0))
+                size_ref = float(sel_cfg.get('size_ref', 300.0))
+                delta = float(sel_cfg.get('delta', 0.3))
+                size_clip_min = float(sel_cfg.get('size_clip_min', 0.5))
+                size_clip_max = float(sel_cfg.get('size_clip_max', 2.0))
+
+                mask_sigmoid_all = pred_masks.sigmoid()
+                try:
+                    if isinstance(superpoints, torch.Tensor):
+                        n_raw = int(superpoints.numel())
+                        n_mask_dim = int(mask_sigmoid_all.shape[1])
+                        n_sp = int(superpoints.max().item()) + 1 if superpoints.numel() > 0 else 0
+                        if n_mask_dim != n_raw and n_sp > 0 and n_mask_dim == n_sp:
+                            mask_sigmoid_all = mask_sigmoid_all[:, superpoints]
+                except Exception:
+                    pass
+
+                # Stability proxy: IoU(thr-Δ, thr+Δ). Since (thr+Δ) ⊆ (thr-Δ), IoU == |hi|/|lo|.
+                thr_lo = max(0.0, sp_thr - stability_offset)
+                thr_hi = min(1.0, sp_thr + stability_offset)
+                lo = mask_sigmoid_all > thr_lo
+                hi = mask_sigmoid_all > thr_hi
+                lo_sum = lo.sum(1).float().clamp_min(1.0)
+                hi_sum = hi.sum(1).float()
+                q_stab = (hi_sum / lo_sum).clamp(0.0, 1.0)
+
+                # Size/coverage guardrail (avoid "too small & pure" dominating the ranking).
+                n_fg = (mask_sigmoid_all > sp_thr).sum(1).float()
+                size_ref = max(size_ref, 1.0)
+                q_size = (n_fg / size_ref).clamp(min=size_clip_min, max=size_clip_max)
+
+                q = (q_stab.pow(gamma) * q_size.pow(delta)).to(base_scores.dtype)
+                select_scores = base_scores * q.unsqueeze(1)
+
+            keep_topk = int(sel_cfg.get('keep_topk', int(self.test_cfg.topk_insts)))
+            keep_topk = max(0, keep_topk)
+            fallback_topk = int(sel_cfg.get('fallback_topk', 0))
+            fallback_topk = max(0, fallback_topk)
+            max_candidates = int(sel_cfg.get('max_candidates', keep_topk + fallback_topk))
+            max_candidates = max(keep_topk, max_candidates)
+
+            base_flat = base_scores.flatten(0, 1)
+            select_flat = select_scores.flatten(0, 1)
+            k_main = min(int(keep_topk), int(select_flat.numel()))
+            if k_main > 0:
+                _, idx_main = select_flat.topk(k_main, sorted=False)
+            else:
+                idx_main = select_flat.new_zeros((0,), dtype=torch.long)
+            idx = idx_main
+            if fallback_topk > 0:
+                k_fb = min(int(fallback_topk), int(base_flat.numel()))
+                if k_fb > 0:
+                    _, idx_fb = base_flat.topk(k_fb, sorted=False)
+                    idx = torch.unique(torch.cat([idx_main, idx_fb], dim=0))
+                else:
+                    idx = idx_main
+                if idx.numel() > max_candidates:
+                    sub = select_flat[idx]
+                    _, ord2 = sub.topk(max_candidates, sorted=False)
+                    idx = idx[ord2]
+
+            select_scores = select_flat[idx]
+            scores = base_flat[idx]
+            labels = labels_all[idx]
+            topk_idx = torch.div(idx, self.num_classes, rounding_mode='floor')
+        else:
+            topk_num = min(int(self.test_cfg.topk_insts), base_scores.shape[0] * base_scores.shape[1])
+            base_flat = base_scores.flatten(0, 1)
+            if topk_num > 0:
+                scores, idx = base_flat.topk(topk_num, sorted=False)
+                labels = labels_all[idx]
+                topk_idx = torch.div(idx, self.num_classes, rounding_mode='floor')
+                select_scores = scores.clone()
+            else:
+                empty = base_flat.new_zeros((0,))
+                scores, idx = empty, base_flat.new_zeros((0,), dtype=torch.long)
+                labels = labels_all.new_zeros((0,), dtype=torch.long)
+                topk_idx = idx
+                select_scores = empty
+
         mask_pred = pred_masks
         mask_pred = mask_pred[topk_idx]
         mask_pred_sigmoid = mask_pred.sigmoid()
@@ -1191,6 +1282,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         scores = scores[score_mask]
         labels = labels[score_mask]
         mask_pred = mask_pred[score_mask]
+        select_scores = select_scores[score_mask]
 
         # npoint_thr
         mask_pointnum = mask_pred.sum(1)
@@ -1199,8 +1291,75 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         scores = scores[npoint_mask]
         labels = labels[npoint_mask]
         mask_pred = mask_pred[npoint_mask]
+        select_scores = select_scores[npoint_mask]
 
-        return mask_pred, labels, scores
+        # Optional: high-IoU copy suppression (explicit de-dup; actually drops masks).
+        cs_cfg = self.test_cfg.get('copy_suppress', None) or {}
+        if bool(cs_cfg.get('enable', False)) and mask_pred.shape[0] > 1:
+            iou_thr = float(cs_cfg.get('iou_thr', 0.9))
+            max_num = cs_cfg.get('max_num', None)
+            pre_max_num = cs_cfg.get('pre_max_num', None)
+            allow_replace = bool(cs_cfg.get('allow_replace', True))
+            refill = bool(cs_cfg.get('refill', True))
+            if pre_max_num is not None:
+                pre_max_num = int(pre_max_num)
+            if max_num is not None:
+                max_num = int(max_num)
+
+            sort_by = str(cs_cfg.get('sort_by', 'scores'))
+            if sort_by not in ('scores', 'select_scores'):
+                sort_by = 'scores'
+            prefer_by = str(cs_cfg.get('prefer_by', 'scores'))
+            if prefer_by not in ('scores', 'select_scores'):
+                prefer_by = 'scores'
+
+            rank_scores = scores if sort_by == 'scores' else select_scores
+            prefer_scores = scores if prefer_by == 'scores' else select_scores
+
+            order = torch.argsort(rank_scores, descending=True)
+            if pre_max_num is not None and pre_max_num > 0 and order.numel() > pre_max_num:
+                order = order[:pre_max_num]
+
+            m = mask_pred[order].float()
+            areas = m.sum(1).clamp_min(1.0)
+            inter = m @ m.t()
+            union = areas[:, None] + areas[None, :] - inter
+            iou = inter / union.clamp_min(1.0)
+
+            prefer_vals = prefer_scores[order]
+            keep: list[int] = []
+
+            for i in range(int(order.numel())):
+                if not keep:
+                    keep.append(i)
+                    continue
+
+                prev = torch.tensor(keep, device=iou.device, dtype=torch.long)
+                ov = iou[i, prev] > iou_thr
+                if torch.any(ov):
+                    if allow_replace:
+                        prev_ov = prev[ov]
+                        ov_iou = iou[i, prev_ov]
+                        j = int(prev_ov[int(torch.argmax(ov_iou).item())].item())
+                        if float(prefer_vals[i].item()) > float(prefer_vals[j].item()):
+                            keep[keep.index(j)] = i
+                    continue
+
+                if max_num is None or len(keep) < max_num:
+                    keep.append(i)
+                    continue
+
+                if not refill:
+                    break
+
+            keep_t = torch.tensor(keep, device=order.device, dtype=torch.long)
+            keep_inds = order[keep_t]
+            scores = scores[keep_inds]
+            labels = labels[keep_inds]
+            mask_pred = mask_pred[keep_inds]
+            select_scores = select_scores[keep_inds]
+
+        return mask_pred, labels, scores, select_scores
 
 @MODELS.register_module()
 class ScanNet200MixFormer3D_FF(ScanNet200MixFormer3D):
@@ -2052,18 +2211,27 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         pts_instance_mask = [inst_res[0].bool(), inst_res2[0].bool()]
         instance_labels = [inst_res[1], inst_res2[1]]
         instance_scores = [inst_res[2], inst_res2[2]]
+        instance_select_scores = []
+        if isinstance(inst_res, (tuple, list)) and len(inst_res) > 5:
+            instance_select_scores.append(inst_res[5])
+        if isinstance(inst_res2, (tuple, list)) and len(inst_res2) > 5:
+            instance_select_scores.append(inst_res2[5])
         instance_queries = [inst_res[3], inst_res2[3]]
         mapping = [inst_res[4], inst_res2[4]]
       
-        return [
-            PointData(
-                pts_semantic_mask=pts_semantic_mask,
-                pts_instance_mask=pts_instance_mask,
-                instance_labels=instance_labels,
-                instance_scores=instance_scores,
-                instance_queries=instance_queries)], mapping
+        pd_kwargs = dict(
+            pts_semantic_mask=pts_semantic_mask,
+            pts_instance_mask=pts_instance_mask,
+            instance_labels=instance_labels,
+            instance_scores=instance_scores,
+            instance_queries=instance_queries,
+        )
+        if len(instance_select_scores) == 2:
+            pd_kwargs["instance_select_scores"] = instance_select_scores
+
+        return [PointData(**pd_kwargs)], mapping
     
-    def predict_by_feat_instance(self, out: Dict[str, Any], superpoints: Any, score_threshold: float) -> Tuple[Any, torch.Tensor, torch.Tensor, Any, torch.Tensor]:  # type: ignore[override]
+    def predict_by_feat_instance(self, out: Dict[str, Any], superpoints: Any, score_threshold: float) -> Tuple[Any, torch.Tensor, torch.Tensor, Any, torch.Tensor, torch.Tensor]:  # type: ignore[override]
         """Predict instance masks for a single scene.
 
         Args:
@@ -2091,15 +2259,97 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             scores *= out['scores'][0]
         if self.num_classes == 1:
             scores = scores.sum(-1, keepdim=True)
-        labels = torch.arange(
+        labels_all = torch.arange(
             self.num_classes,
             device=scores.device).unsqueeze(0).repeat(
                 len(cls_preds), 1).flatten(0, 1)
-        topk_num = min(int(self.test_cfg.topk_insts), scores.shape[0] * scores.shape[1])
-        scores, topk_idx = scores.flatten(0, 1).topk(topk_num, sorted=False)
-        labels = labels[topk_idx]
 
-        topk_idx = torch.div(topk_idx, self.num_classes, rounding_mode='floor')
+        sel_cfg = self.test_cfg.get('selection', None) or {}
+        base_scores = scores
+        select_scores_mat = base_scores
+        if bool(sel_cfg.get('enable', False)):
+            mode = str(sel_cfg.get('mode', 'cls'))
+            if mode not in ('cls', 'cls_stab_size'):
+                mode = 'cls'
+            if mode == 'cls_stab_size':
+                sp_thr = float(self.test_cfg.sp_score_thr)
+                stability_offset = float(sel_cfg.get('stability_offset', 0.1))
+                gamma = float(sel_cfg.get('gamma', 1.0))
+                size_ref = float(sel_cfg.get('size_ref', 300.0))
+                delta = float(sel_cfg.get('delta', 0.3))
+                size_clip_min = float(sel_cfg.get('size_clip_min', 0.5))
+                size_clip_max = float(sel_cfg.get('size_clip_max', 2.0))
+
+                mask_sigmoid_all = pred_masks.sigmoid()
+                try:
+                    if isinstance(superpoints, torch.Tensor):
+                        n_raw = int(superpoints.numel())
+                        n_mask_dim = int(mask_sigmoid_all.shape[1])
+                        n_sp = int(superpoints.max().item()) + 1 if superpoints.numel() > 0 else 0
+                        if n_mask_dim != n_raw and n_sp > 0 and n_mask_dim == n_sp:
+                            mask_sigmoid_all = mask_sigmoid_all[:, superpoints]
+                except Exception:
+                    pass
+
+                thr_lo = max(0.0, sp_thr - stability_offset)
+                thr_hi = min(1.0, sp_thr + stability_offset)
+                lo = mask_sigmoid_all > thr_lo
+                hi = mask_sigmoid_all > thr_hi
+                lo_sum = lo.sum(1).float().clamp_min(1.0)
+                hi_sum = hi.sum(1).float()
+                q_stab = (hi_sum / lo_sum).clamp(0.0, 1.0)
+
+                n_fg = (mask_sigmoid_all > sp_thr).sum(1).float()
+                size_ref = max(size_ref, 1.0)
+                q_size = (n_fg / size_ref).clamp(min=size_clip_min, max=size_clip_max)
+
+                q = (q_stab.pow(gamma) * q_size.pow(delta)).to(base_scores.dtype)
+                select_scores_mat = base_scores * q.unsqueeze(1)
+
+            keep_topk = int(sel_cfg.get('keep_topk', int(self.test_cfg.topk_insts)))
+            keep_topk = max(0, keep_topk)
+            fallback_topk = int(sel_cfg.get('fallback_topk', 0))
+            fallback_topk = max(0, fallback_topk)
+            max_candidates = int(sel_cfg.get('max_candidates', keep_topk + fallback_topk))
+            max_candidates = max(keep_topk, max_candidates)
+
+            base_flat = base_scores.flatten(0, 1)
+            select_flat = select_scores_mat.flatten(0, 1)
+            k_main = min(int(keep_topk), int(select_flat.numel()))
+            if k_main > 0:
+                _, idx_main = select_flat.topk(k_main, sorted=False)
+            else:
+                idx_main = select_flat.new_zeros((0,), dtype=torch.long)
+            idx = idx_main
+            if fallback_topk > 0:
+                k_fb = min(int(fallback_topk), int(base_flat.numel()))
+                if k_fb > 0:
+                    _, idx_fb = base_flat.topk(k_fb, sorted=False)
+                    idx = torch.unique(torch.cat([idx_main, idx_fb], dim=0))
+                else:
+                    idx = idx_main
+                if idx.numel() > max_candidates:
+                    sub = select_flat[idx]
+                    _, ord2 = sub.topk(max_candidates, sorted=False)
+                    idx = idx[ord2]
+
+            select_scores = select_flat[idx]
+            scores, topk_idx_flat = base_flat[idx], idx
+            labels = labels_all[topk_idx_flat]
+        else:
+            topk_num = min(int(self.test_cfg.topk_insts), base_scores.shape[0] * base_scores.shape[1])
+            base_flat = base_scores.flatten(0, 1)
+            if topk_num > 0:
+                scores, topk_idx_flat = base_flat.topk(topk_num, sorted=False)
+                labels = labels_all[topk_idx_flat]
+                select_scores = scores.clone()
+            else:
+                empty = base_flat.new_zeros((0,))
+                scores, topk_idx_flat = empty, base_flat.new_zeros((0,), dtype=torch.long)
+                labels = labels_all.new_zeros((0,), dtype=torch.long)
+                select_scores = empty
+
+        topk_idx = torch.div(topk_idx_flat, self.num_classes, rounding_mode='floor')
         mask_pred = pred_masks
         mask_pred = mask_pred[topk_idx]
         mask_pred_sigmoid = mask_pred.sigmoid()
@@ -2117,6 +2367,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 mask_pred_sigmoid, labels, scores, kernel=kernel)
             queries = queries[keep_inds]
             mapping = mapping[keep_inds]
+            select_scores = select_scores[keep_inds]
 
         mask_pred_sigmoid = mask_pred_sigmoid[:, ...]
         mask_pred = mask_pred_sigmoid > self.test_cfg.sp_score_thr
@@ -2128,6 +2379,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         mask_pred = mask_pred[score_mask]
         queries = queries[score_mask]
         mapping = mapping[score_mask]
+        select_scores = select_scores[score_mask]
 
         # npoint_thr
         mask_pointnum = mask_pred.sum(1)
@@ -2138,8 +2390,74 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         mask_pred = mask_pred[npoint_mask]
         queries = queries[npoint_mask]
         mapping = mapping[npoint_mask]
+        select_scores = select_scores[npoint_mask]
 
-        return mask_pred, labels, scores, queries, mapping
+        cs_cfg = self.test_cfg.get('copy_suppress', None) or {}
+        if bool(cs_cfg.get('enable', False)) and mask_pred.shape[0] > 1:
+            iou_thr = float(cs_cfg.get('iou_thr', 0.9))
+            max_num = cs_cfg.get('max_num', None)
+            pre_max_num = cs_cfg.get('pre_max_num', None)
+            allow_replace = bool(cs_cfg.get('allow_replace', True))
+            refill = bool(cs_cfg.get('refill', True))
+            if pre_max_num is not None:
+                pre_max_num = int(pre_max_num)
+            if max_num is not None:
+                max_num = int(max_num)
+
+            sort_by = str(cs_cfg.get('sort_by', 'scores'))
+            if sort_by not in ('scores', 'select_scores'):
+                sort_by = 'scores'
+            prefer_by = str(cs_cfg.get('prefer_by', 'scores'))
+            if prefer_by not in ('scores', 'select_scores'):
+                prefer_by = 'scores'
+
+            rank_scores = scores if sort_by == 'scores' else select_scores
+            prefer_scores = scores if prefer_by == 'scores' else select_scores
+
+            order = torch.argsort(rank_scores, descending=True)
+            if pre_max_num is not None and pre_max_num > 0 and order.numel() > pre_max_num:
+                order = order[:pre_max_num]
+            m = mask_pred[order].float()
+            areas = m.sum(1).clamp_min(1.0)
+            inter = m @ m.t()
+            union = areas[:, None] + areas[None, :] - inter
+            iou = inter / union.clamp_min(1.0)
+
+            prefer_vals = prefer_scores[order]
+            keep: list[int] = []
+            for i in range(int(order.numel())):
+                if not keep:
+                    keep.append(i)
+                    continue
+
+                prev = torch.tensor(keep, device=iou.device, dtype=torch.long)
+                ov = iou[i, prev] > iou_thr
+                if torch.any(ov):
+                    if allow_replace:
+                        prev_ov = prev[ov]
+                        ov_iou = iou[i, prev_ov]
+                        j = int(prev_ov[int(torch.argmax(ov_iou).item())].item())
+                        if float(prefer_vals[i].item()) > float(prefer_vals[j].item()):
+                            keep[keep.index(j)] = i
+                    continue
+
+                if max_num is None or len(keep) < max_num:
+                    keep.append(i)
+                    continue
+
+                if not refill:
+                    break
+
+            keep_t = torch.tensor(keep, device=order.device, dtype=torch.long)
+            keep_inds = order[keep_t]
+            scores = scores[keep_inds]
+            labels = labels[keep_inds]
+            mask_pred = mask_pred[keep_inds]
+            queries = queries[keep_inds]
+            mapping = mapping[keep_inds]
+            select_scores = select_scores[keep_inds]
+
+        return mask_pred, labels, scores, queries, mapping, select_scores
     
     def predict_by_feat_panoptic(self, sem_map: torch.Tensor, mask_pred: torch.Tensor, labels: torch.Tensor, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
         """Predict panoptic masks for a single scene.

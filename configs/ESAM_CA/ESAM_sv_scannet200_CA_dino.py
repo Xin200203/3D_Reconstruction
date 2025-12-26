@@ -303,6 +303,20 @@ metric_meta = dict(
     ignore_index=[num_semantic_classes],
     classes=class_names + ['unlabeled'])
 
+diagnostics_cfg = dict(
+    enable=True,
+    out_dir='instance_diagnostics',
+    iou_thr=0.5,
+    iou_lo_thr=0.1,
+    gt_size_thr=100,
+    oracle_ks=[20, 30, 50, 100],
+    rank_bins=[10, 20, 50, 100],
+    purity_low_thr=0.85,
+    purity_high_thr=0.9,
+    iou_mid_lo=0.6,
+    iou_mid_hi=0.8,
+)
+
 sem_mapping = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23,
     24, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 42, 44, 45, 46,
@@ -328,7 +342,8 @@ val_evaluator = dict(
     id_offset=2**16,
     sem_mapping=sem_mapping,
     inst_mapping=inst_mapping,
-    metric_meta=metric_meta)
+    metric_meta=metric_meta,
+    diagnostics=diagnostics_cfg)
 test_evaluator = val_evaluator
 
 optim_wrapper = dict(

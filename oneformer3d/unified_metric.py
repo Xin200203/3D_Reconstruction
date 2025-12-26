@@ -183,6 +183,8 @@ class UnifiedSegMetric(SegMetric):
         iou_mid_hi: float = 0.8,
         max_pred_per_scene: Optional[int] = None,
         gt_size_thr: int = 100,
+        oracle_ks: Optional[Sequence[int]] = None,
+        rank_bins: Optional[Sequence[int]] = None,
     ) -> None:
         out_dir = self._resolve_diagnostics_dir(logger, out_dir)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -195,6 +197,15 @@ class UnifiedSegMetric(SegMetric):
         gt_best_iou_all = []
         gt_hit_cnt_all = []
         gt_hit_cnt_lo_all = []
+        gt_sizes_all = []
+
+        # Oracle@K and best-IoU rank diagnostics (require per-pred scores).
+        oracle_ks_sorted = sorted({int(k) for k in (oracle_ks or (20, 30, 50, 100)) if int(k) > 0})
+        rank_bins_sorted = sorted({int(b) for b in (rank_bins or (10, 20, 50, 100)) if int(b) > 0})
+        gt_best_rank_all = []  # 1-based rank in score-sorted preds; 0 if undefined.
+        gt_oracle_best_iou_by_k = {k: [] for k in oracle_ks_sorted}
+        n_scenes_oracle_used = 0
+        n_gt_oracle_used = 0
 
         n_scenes_used = 0
         n_pred_used = 0
@@ -253,6 +264,16 @@ class UnifiedSegMetric(SegMetric):
             gt_hit_cnt = np.zeros((G,), dtype=np.int64)
             gt_hit_cnt_lo = np.zeros((G,), dtype=np.int64)
 
+            # Per-GT best-pred tracking for rank diagnostics.
+            best_pred_idx = np.full((G,), -1, dtype=np.int32)
+            best_pred_score = np.full((G,), -1e9, dtype=np.float32)
+
+            scene_scores = None
+            if pred_instance_scores is not None and scene_i < len(pred_instance_scores):
+                s = np.asarray(pred_instance_scores[scene_i]).reshape(-1)
+                if s.shape[0] == pred_masks.shape[0]:
+                    scene_scores = s.astype(np.float32, copy=False)
+
             for pi in range(pred_masks.shape[0]):
                 pm = pred_masks[pi] & valid
                 pred_size = int(pm.sum())
@@ -278,15 +299,80 @@ class UnifiedSegMetric(SegMetric):
                 pred_best_iou.append(best_i)
                 pred_strong_gt_cnt.append(int(np.sum(iou >= float(iou_thr))))
 
+                # Track, for each GT, which prediction achieves the best IoU.
+                # IMPORTANT: compare against the *previous* best IoU (before updating).
+                if scene_scores is not None:
+                    score_pi = float(scene_scores[pi])
+                    better_iou = iou > (gt_best_iou + 1e-12)
+                    tie_iou = np.abs(iou - gt_best_iou) <= 1e-12
+                    better = better_iou | (tie_iou & (score_pi > best_pred_score))
+                    if np.any(better):
+                        best_pred_idx[better] = int(pi)
+                        best_pred_score[better] = score_pi
+                else:
+                    # If no per-instance scores are provided, still track by IoU only.
+                    better = iou > (gt_best_iou + 1e-12)
+                    if np.any(better):
+                        best_pred_idx[better] = int(pi)
+
                 gt_best_iou = np.maximum(gt_best_iou, iou)
                 gt_hit_cnt += (iou >= float(iou_thr)).astype(np.int64)
                 gt_hit_cnt_lo += (iou >= float(iou_lo_thr)).astype(np.int64)
 
                 n_pred_used += 1
 
+            # Oracle@K (requires scores) computed on top-score predictions.
+            if scene_scores is not None and oracle_ks_sorted:
+                order = np.argsort(scene_scores)[::-1]
+                rank_map = np.empty((pred_masks.shape[0],), dtype=np.int32)
+                rank_map[order] = np.arange(pred_masks.shape[0], dtype=np.int32)
+
+                # Best-IoU rank for each GT (1-based).
+                gt_best_rank = np.zeros((G,), dtype=np.int32)
+                has_best = best_pred_idx >= 0
+                if np.any(has_best):
+                    gt_best_rank[has_best] = rank_map[best_pred_idx[has_best]] + 1
+                gt_best_rank_all.extend(gt_best_rank.tolist())
+
+                # Oracle curve: max IoU per GT within top-K predictions by score.
+                max_k = int(min(int(order.size), int(max(oracle_ks_sorted))))
+                oracle_running = np.zeros((G,), dtype=np.float32)
+                snapshots = {}
+                snap_ks = sorted({min(int(k), int(order.size)) for k in oracle_ks_sorted})
+                snap_set = set(snap_ks)
+                for oi in range(max_k):
+                    pi = int(order[oi])
+                    pm = pred_masks[pi] & valid
+                    pred_size = int(pm.sum())
+                    if pred_size <= 0:
+                        continue
+                    labels = mapped[pm]
+                    if labels.size == 0:
+                        continue
+                    inter = np.bincount(labels, minlength=G).astype(np.int64)
+                    union = (pred_size + gt_sizes - inter).astype(np.float32)
+                    union = np.maximum(union, 1.0)
+                    iou = inter.astype(np.float32) / union
+                    oracle_running = np.maximum(oracle_running, iou)
+                    if (oi + 1) in snap_set and (oi + 1) not in snapshots:
+                        snapshots[oi + 1] = oracle_running.copy()
+
+                # Append per-GT oracle best IoU for requested Ks (mapped to available K).
+                for k in oracle_ks_sorted:
+                    k_eff = int(min(int(k), int(order.size)))
+                    if k_eff <= 0:
+                        arr = np.zeros((G,), dtype=np.float32)
+                    else:
+                        arr = snapshots.get(k_eff, oracle_running)
+                    gt_oracle_best_iou_by_k[k].extend(arr.tolist())
+
+                n_scenes_oracle_used += 1
+                n_gt_oracle_used += int(G)
+
             gt_best_iou_all.extend(gt_best_iou.tolist())
             gt_hit_cnt_all.extend(gt_hit_cnt.tolist())
             gt_hit_cnt_lo_all.extend(gt_hit_cnt_lo.tolist())
+            gt_sizes_all.extend(gt_sizes.tolist())
             n_gt_used += int(G)
             n_scenes_used += 1
             # Miss rate by GT size bucket.
@@ -314,6 +400,7 @@ class UnifiedSegMetric(SegMetric):
         gt_best_iou_np = np.asarray(gt_best_iou_all, dtype=np.float32)
         gt_hit_cnt_np = np.asarray(gt_hit_cnt_all, dtype=np.int64)
         gt_hit_cnt_lo_np = np.asarray(gt_hit_cnt_lo_all, dtype=np.int64)
+        gt_sizes_np = np.asarray(gt_sizes_all, dtype=np.int64)
 
         gt_hit_zero_rate = float(np.mean(gt_hit_cnt_np == 0)) if gt_hit_cnt_np.size else 0.0
         gt_hit_zero_rate_lo = float(np.mean(gt_hit_cnt_lo_np == 0)) if gt_hit_cnt_lo_np.size else 0.0
@@ -328,6 +415,65 @@ class UnifiedSegMetric(SegMetric):
         gt_large_best_low_rate = (gt_large_best_low / gt_large_total) if gt_large_total > 0 else 0.0
         gt_small_miss_lo_rate = (gt_small_miss_lo / gt_small_total) if gt_small_total > 0 else 0.0
         gt_large_miss_lo_rate = (gt_large_miss_lo / gt_large_total) if gt_large_total > 0 else 0.0
+
+        # Oracle@K and best-IoU rank summaries.
+        oracle_summary = {
+            "available": bool(n_scenes_oracle_used > 0 and n_gt_oracle_used > 0),
+            "ks": oracle_ks_sorted,
+            "n_scenes_used": int(n_scenes_oracle_used),
+            "n_gt_used": int(n_gt_oracle_used),
+            "overall": {},
+            f"ge_{int(gt_size_thr)}": {},
+            f"lt_{int(gt_size_thr)}": {},
+        }
+        rank_summary = {
+            "available": bool(len(gt_best_rank_all) == int(gt_best_iou_np.size) and len(gt_best_rank_all) > 0),
+            "bins": rank_bins_sorted,
+            "overall": {},
+            f"ge_{int(gt_size_thr)}": {},
+            f"lt_{int(gt_size_thr)}": {},
+        }
+
+        if oracle_summary["available"]:
+            is_ge = gt_sizes_np >= int(gt_size_thr)
+            for k in oracle_ks_sorted:
+                arr = np.asarray(gt_oracle_best_iou_by_k[k], dtype=np.float32)
+                if arr.size != gt_best_iou_np.size:
+                    continue
+                def _pack(x):
+                    return {
+                        "mean_best_iou": float(np.mean(x)) if x.size else 0.0,
+                        "hit_rate_iou_thr": float(np.mean(x >= float(iou_thr))) if x.size else 0.0,
+                        "hit_rate_iou_lo": float(np.mean(x >= float(iou_lo_thr))) if x.size else 0.0,
+                    }
+                oracle_summary["overall"][str(k)] = _pack(arr)
+                oracle_summary[f"ge_{int(gt_size_thr)}"][str(k)] = _pack(arr[is_ge])
+                oracle_summary[f"lt_{int(gt_size_thr)}"][str(k)] = _pack(arr[~is_ge])
+
+        if rank_summary["available"]:
+            ranks = np.asarray(gt_best_rank_all, dtype=np.int32)
+            is_ge = gt_sizes_np >= int(gt_size_thr)
+
+            def _rank_pack(mask):
+                r = ranks[mask]
+                # Exclude undefined ranks (0) for percentile stats.
+                r_pos = r[r > 0]
+                out = {
+                    "n": int(r.size),
+                    "n_rank_defined": int(r_pos.size),
+                    "median": float(np.median(r_pos)) if r_pos.size else 0.0,
+                    "p90": float(np.percentile(r_pos, 90)) if r_pos.size else 0.0,
+                    "p95": float(np.percentile(r_pos, 95)) if r_pos.size else 0.0,
+                }
+                for b in rank_bins_sorted:
+                    out[f"le_{int(b)}"] = float(np.mean(r_pos <= int(b))) if r_pos.size else 0.0
+                out["gt_50"] = float(np.mean(r_pos > 50)) if r_pos.size else 0.0
+                out["gt_100"] = float(np.mean(r_pos > 100)) if r_pos.size else 0.0
+                return out
+
+            rank_summary["overall"] = _rank_pack(np.ones_like(ranks, dtype=bool))
+            rank_summary[f"ge_{int(gt_size_thr)}"] = _rank_pack(is_ge)
+            rank_summary[f"lt_{int(gt_size_thr)}"] = _rank_pack(~is_ge)
 
         diag = self._diagnose_bottleneck(
             pred_purity=pred_purity_np,
@@ -355,6 +501,8 @@ class UnifiedSegMetric(SegMetric):
                 "iou_mid_hi": float(iou_mid_hi),
                 "max_pred_per_scene": None if max_pred_per_scene is None else int(max_pred_per_scene),
                 "gt_size_thr": int(gt_size_thr),
+                "oracle_ks": oracle_ks_sorted,
+                "rank_bins": rank_bins_sorted,
             },
             "miss_rates": {
                 "gt_hit_zero_rate": gt_hit_zero_rate,
@@ -373,6 +521,8 @@ class UnifiedSegMetric(SegMetric):
                 f"gt_count_lt_{int(gt_size_thr)}": int(gt_small_total),
                 f"gt_count_ge_{int(gt_size_thr)}": int(gt_large_total),
             },
+            "oracle": oracle_summary,
+            "best_iou_rank": rank_summary,
             "diagnosis": diag,
         }
         with open(os.path.join(out_dir, "instance_error_diagnostics.json"), "w", encoding="utf-8") as f:
@@ -387,6 +537,9 @@ class UnifiedSegMetric(SegMetric):
             gt_best_iou=gt_best_iou_np,
             gt_hit_cnt=gt_hit_cnt_np,
             gt_hit_cnt_lo=gt_hit_cnt_lo_np,
+            gt_size=gt_sizes_np,
+            gt_best_rank=np.asarray(gt_best_rank_all, dtype=np.int32) if len(gt_best_rank_all) == gt_best_iou_np.size else np.zeros((0,), dtype=np.int32),
+            **{f"gt_oracle_best_iou_at{k}": np.asarray(gt_oracle_best_iou_by_k[k], dtype=np.float32) for k in oracle_ks_sorted},
         )
 
         # Plots (optional dependency).
@@ -473,6 +626,7 @@ class UnifiedSegMetric(SegMetric):
         pred_instance_masks_inst_task = []
         pred_instance_labels = []
         pred_instance_scores = []
+        pred_instance_select_scores = []
 
         gt_semantic_masks_sem_task = []
         pred_semantic_masks_sem_task = []
@@ -507,6 +661,12 @@ class UnifiedSegMetric(SegMetric):
                 torch.tensor(single_pred_results['instance_labels']))
             pred_instance_scores.append(
                 torch.tensor(single_pred_results['instance_scores']))
+            if 'instance_select_scores' in single_pred_results:
+                pred_instance_select_scores.append(
+                    torch.tensor(single_pred_results['instance_select_scores']))
+            else:
+                pred_instance_select_scores.append(
+                    torch.tensor(single_pred_results['instance_scores']))
 
         # ret_pan = panoptic_seg_eval(
         #     gt_masks_pan, pred_masks_pan, classes, thing_classes,
@@ -562,6 +722,8 @@ class UnifiedSegMetric(SegMetric):
                 max_pred_per_scene = diag_cfg.get("max_pred_per_scene", None)
                 gt_size_thr = int(diag_cfg.get("gt_size_thr", 100))
                 iou_lo_thr = float(diag_cfg.get("iou_lo_thr", 0.1))
+                oracle_ks = diag_cfg.get("oracle_ks", (20, 30, 50, 100))
+                rank_bins = diag_cfg.get("rank_bins", (10, 20, 50, 100))
                 if max_pred_per_scene is not None:
                     max_pred_per_scene = int(max_pred_per_scene)
 
@@ -569,7 +731,10 @@ class UnifiedSegMetric(SegMetric):
                 gt_inst_np = [np.asarray(x, dtype=np.int64) for x in gt_instance_masks_inst_task]
                 pred_mask_np = [self._to_numpy_bool(x) for x in pred_instance_masks_inst_task]
                 pred_score_np = None
-                if len(pred_instance_scores) == len(pred_mask_np):
+                score_source = str(diag_cfg.get("score_source", "instance_scores"))
+                if score_source == "instance_select_scores" and len(pred_instance_select_scores) == len(pred_mask_np):
+                    pred_score_np = [self._to_numpy_float(s) for s in pred_instance_select_scores]
+                elif len(pred_instance_scores) == len(pred_mask_np):
                     pred_score_np = [self._to_numpy_float(s) for s in pred_instance_scores]
 
                 self._run_instance_error_diagnostics(
@@ -586,6 +751,8 @@ class UnifiedSegMetric(SegMetric):
                     max_pred_per_scene=max_pred_per_scene,
                     gt_size_thr=gt_size_thr,
                     iou_lo_thr=iou_lo_thr,
+                    oracle_ks=oracle_ks,
+                    rank_bins=rank_bins,
                 )
         except Exception as e:
             logger.warning(f"[UnifiedSegMetric] diagnostics failed: {e}")
