@@ -10,6 +10,9 @@ num_instance_classes_eval = 1
 
 model = dict(
     type='ScanNet200MixFormer3D',
+    # 纯 3D baseline：不启用 DINO 注入（不提供 dino_cfg，且 backbone 不设置 dino_dim）
+    dino_require=False,
+    dino_online_only=False,
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     voxel_size=0.02,
     num_classes=num_instance_classes_eval,
@@ -304,9 +307,9 @@ default_hooks = dict(
         save_best=['all_ap_50%'],
         rule='greater'))
 
-load_from = 'work_dirs/tmp/mask3d_scannet200.pth'
+load_from = '/home/nebula/xxy/3D_Reconstruction/work_dirs/ESAM_sv_scannet200_CA/best_all_ap_50%_epoch_128.pth'
 
 # training schedule for 1x
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=128)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')

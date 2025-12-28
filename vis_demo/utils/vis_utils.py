@@ -5,6 +5,7 @@ import os
 class vis_pointcloud:
     def __init__(self, use_vis, online_vis=False):
         self.use_vis=use_vis
+        self.online_vis = online_vis
         if self.use_vis==0:
             return
         self.vis = o3d.visualization.Visualizer()

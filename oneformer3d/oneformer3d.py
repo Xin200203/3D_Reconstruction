@@ -38,13 +38,17 @@ class ScanNetOneFormer3DMixin:
 
         pts_semantic_mask = [sem_res.cpu().numpy()]
         pts_instance_mask = [inst_res[0].cpu().bool().numpy()]
-      
-        return [
-            PointData(
-                pts_semantic_mask=pts_semantic_mask,
-                pts_instance_mask=pts_instance_mask,
-                instance_labels=inst_res[1].cpu().numpy(),
-                instance_scores=inst_res[2].cpu().numpy())]
+
+        pd_kwargs = dict(
+            pts_semantic_mask=pts_semantic_mask,
+            pts_instance_mask=pts_instance_mask,
+            instance_labels=inst_res[1].cpu().numpy(),
+            instance_scores=inst_res[2].cpu().numpy(),
+        )
+        if isinstance(inst_res, (tuple, list)) and len(inst_res) > 3:
+            pd_kwargs["instance_select_scores"] = inst_res[3].cpu().numpy()
+
+        return [PointData(**pd_kwargs)]
     
     def predict_by_feat_instance(self, out, superpoints, score_threshold):
         """Predict instance masks for a single scene.
@@ -148,8 +152,9 @@ class ScanNetOneFormer3DMixin:
         """
         sem_map = self.predict_by_feat_semantic(
             out, superpoints, self.test_cfg.stuff_classes)
-        mask_pred, labels, scores  = self.predict_by_feat_instance(
+        inst_res = self.predict_by_feat_instance(
             out, superpoints, self.test_cfg.pan_score_thr)
+        mask_pred, labels, scores = inst_res[0], inst_res[1], inst_res[2]
         if mask_pred.shape[0] == 0:
             return sem_map, sem_map
 
@@ -911,12 +916,21 @@ class ScanNet200OneFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         pts_instance_mask = [inst_res[0].bool(), inst_res2[0].bool()]
         instance_labels = [inst_res[1], inst_res2[1]]
         instance_scores = [inst_res[2], inst_res2[2]]
+        instance_select_scores = []
+        if isinstance(inst_res, (tuple, list)) and len(inst_res) > 3:
+            instance_select_scores.append(inst_res[3])
+        if isinstance(inst_res2, (tuple, list)) and len(inst_res2) > 3:
+            instance_select_scores.append(inst_res2[3])
         
-        return [PointData(
+        pd_kwargs = dict(
             pts_semantic_mask=pts_semantic_mask,
             pts_instance_mask=pts_instance_mask,
             instance_labels=instance_labels,
-            instance_scores=instance_scores)]
+            instance_scores=instance_scores,
+        )
+        if len(instance_select_scores) == 2:
+            pd_kwargs["instance_select_scores"] = instance_select_scores
+        return [PointData(**pd_kwargs)]
 
     def predict_by_feat_panoptic(self, sem_map, mask_pred, labels, scores):
         """Predict panoptic masks for a single scene.

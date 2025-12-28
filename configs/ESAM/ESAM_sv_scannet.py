@@ -22,7 +22,7 @@ model = dict(
             dilations=[1, 1, 1, 1],
             conv1_kernel_size=5,
             bn_momentum=0.02)),
-    pool=dict(type='GeoAwarePooling', channel_proj=96),
+    pool=dict(type='GeoAwarePooling', channel_proj=256),
     decoder=dict(
         type='ScanNetMixQueryDecoder',
         num_layers=3,
@@ -36,7 +36,7 @@ model = dict(
         num_instance_classes=num_instance_classes,
         num_semantic_classes=num_semantic_classes,
         num_semantic_linears=1,
-        in_channels=96,
+        in_channels=256,  # 从96更新为256以匹配BiFusionEncoder输出
         d_model=256,
         num_heads=8,
         hidden_dim=1024,

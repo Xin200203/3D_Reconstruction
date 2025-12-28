@@ -1,0 +1,84 @@
+# === 0. 代码库上下文 ===
+# ESAM 真实目录（相对 repo 根）
+# ├── oneformer3d/                # 现有网络模块（backbone / decoder / merge 等）
+# │   ├── mink_unet.py
+# │   ├── query_decoder.py
+# │   ├── instance_merge.py
+# │   ├── instance_criterion.py   # 实例级损失
+# │   └── __init__.py
+# ├── time_divided_transformer/   # 🆕 规划中的跨帧模块与说明文档
+# ├── configs/                    # 训练 / 推理配置
+# └── docs/
+
+# === 1. 任务目标 ===
+# 实现 “跨帧 Transformer” (Inter-frame Slot-Transformer)：
+#   • 动态刷新 Memory slot 特征
+#   • 输出注意力矩阵指导实例级匹配 / 融合
+# 要求：
+#   • 仅更新特征，不修改点云几何
+#   • 几何偏置 (sin-cos xyz + bbox size + height) 注入到 Q/K
+#   • 一致性、匹配监督损失接入 instance_criterion
+
+# === 2. 架构要点（照此编码） ===
+#   文件: oneformer3d/time_divided_transformer.py
+#   类  : TimeDividedTransformer
+#   输入:  Q = [Nc,D], P_c=[Nc,9]  当前帧 instance feat & geom
+#          K = [Nm,D], P_m=[Nm,9]  Memory slot feat & geom
+#          mask_mem=[Nm]           0/1
+#   逻辑:
+#     • L=3 层 Geometry-biased Cross-Attention (G-XCA)
+#         Δ_ij = MLP([P_c_i || P_m_j]) → scalar
+#         attn_ij = softmax((QW_q · KW_k^T)/√d  + β·Δ_ij)
+#         output = Σ attn_ij · V_j
+#         更新 Q 用 GRU(q_i, output_i)
+#     • 层后做一次 Point-wise Self-Attention 加强帧内一致
+#     • 最后一层输出:
+#         A = attn  (Nc × Nm)  —> 供外部匹配
+#         Q_new    (Nc × D)   —> 写入 Memory（EMA）
+#
+#   公开方法:
+#     forward(Q, K, P_c, P_m, mask_mem) -> (A, Q_new)
+
+# === 3. 复用 ESAM 代码 ===
+#   • 现有时序更新逻辑位于 `oneformer3d/instance_merge.py::OnlineMerge`
+#     其中已实现基于查询向量与 IoU 的在线融合。
+#   • TimeDividedTransformer 将在推理阶段 **替换** OnlineMerge 内的
+#     `mix_scores = query_feat * xyz_scores` 计算：
+#       - OnlineMerge 新增可选调用 `tformer.forward(Q, K, ...)` 获取
+#         `attn_matrix`，再用阈值 / 匈牙利匹配。
+#   • 复用的 util： `instance_merge.OnlineMerge._bbox_pred_to_bbox` 等。
+
+# === 4. 损失函数接口 ===
+#   • 编辑 `oneformer3d/instance_criterion.py`：
+#       - 新增 build_crossframe_loss(cfg)
+#           * 交叉熵 (Hungarian label)  -> L_match
+#           * InfoNCE 一致性           -> L_cons
+#       - 在 forward() 里接受 A, gt_ids 计算并加权
+#   • 在 models/__init__.py 里注册 TimeDividedTransformer，便于主干调用。
+
+# === 5. 文件/文档维护 ===
+#   • 新建 docs/time_divided_transformer.md
+#       - 包含: 设计动机、公式、调用示例
+#       - 每次代码 push 时同步更新关键变更
+#
+# === 6. 步骤拆解 ===
+# ┌─ Step-1: scaffold `oneformer3d/time_divided_transformer.py`
+# │         实现 TimeDividedTransformer.forward & _layer (G-XCA)
+# ├─ Step-2: 在 models/__init__.py 里导出
+# ├─ Step-3: 修改 `oneformer3d/instance_merge.py`
+# │         • 在 `OnlineMerge.__init__` 注入 transformer 模型句柄
+# │         • 在 `merge()` 中调用 `self.tformer.forward(...)`
+# │           替代原 mix_scores 计算，输出 attn 矩阵 A
+# │         • 继续使用匈牙利或阈值匹配逻辑不变
+# ├─ Step-4: criterion/instance_criterion.py
+# │         添加 L_match & L_cons
+# ├─ Step-5: 单元测试
+# │   • test/test_td_transformer.py
+# │       - 随机输入维度对齐，assert A 行 softmax, shape OK
+# │       - EMA 更新后 Memory 变化
+# └─ Step-6: docs/time_divided_transformer.md 初版落地
+#
+# 预期单元测试 <60s，本步骤工作量 ~ 8h
+
+# === 7. 开始编码 ===
+# 依次完成 Step-1 … Step-6，必要时在 PR 描述里引用本 prompt。

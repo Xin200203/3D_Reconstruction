@@ -1,0 +1,112 @@
+# === 0. 代码库上下文（ESAM v2） ===
+# ├── oneformer3d/
+# │   ├── mink_unet.py               # 3D Sparse U-Net (Res16UNet34C)
+# │   ├── bi_fusion_encoder.py       # 🆕 将要实现
+# │   ├── mixformer3d.py             # 主干 Detector，提取点特征接口
+# │   ├── img_backbone.py            # ViT-B/16 提取 2D patch feat
+# │   └── __init__.py
+# └── Bi_fusion_encoder/             # 文档 & composer
+
+# === 1. 任务目标 ===
+# "Bi-Fusion Encoder"：单帧同步编码 2D 语义与 3D 几何
+#   1. 输出 96-d 点特征 `feat_fusion` （供 Decoder & Slot-Transformer）
+#   2. 发布置信度 `conf_2d` 及 32-d `pe_xyz` 方便可视化 / 消融
+#   3. 引入 CLIP-Cons 正则，在阶段-I 静态图预训练中使用
+
+# === 2. 关键模块拆解 ===
+# 文件: oneformer3d/bi_fusion_encoder.py
+# 类  : BiFusionEncoder
+#
+# ┌─ 2.1 2D 语义分支 ─────────────────────────────────────────┐
+# │ a) ViT-B/16 (CLIP)                 –> (H/16,W/16,768)    │
+# │ b) PixelShuffle×2 + Conv1×1        –> (H/8 ,W/8 ,256)    │
+# │ c) 深度投影抽样(可微 gather)        –> F_2D (N_vis,256)    │
+# │ d) Linear256→128 + ReLU                              │
+# └──────────────────────────────────────────────────────────┘
+#
+# ┌─ 2.2 3D 几何分支 ─────────────────────────────────────────┐
+# │ a) Res16UNet34C encoder  (无 Memory)   –> (N_p,128)       │
+# │ b) Tiny-SA Neck ×2  (邻域 r=0.3 m)     –> (N_p,128)       │
+# │    ‑> 实现为 `TinySANeck(in=128,h=128,nhead=4)`            │
+# │ c) Linear128→128 + ReLU                                  │
+# └──────────────────────────────────────────────────────────┘
+#
+# ┌─ 2.3 Geo-PE (64 d) ──────────────────────────────────────┐
+# │ ① xyz_w               : 3                                │
+# │ ② sin/cos(2^{k}·xyz) k=0…7 : 3×2×8 = 48                 │
+# │ ③ bbox size (w h l)   : 3                                │
+# │ ④ 相机 Δpose (R6 + t3): 9                                │
+# │ ⑤ height h            : 1                                │
+# │ 合计 3+48+3+9+1 = 64                                    │
+# │ MLP_pe 64→32 + ReLU                                      │
+# └──────────────────────────────────────────────────────────┘
+#
+# 2.4 维度对齐 & 门控融合
+#   • 2D:  [F_2D128 || PE32]  –> Linear160→96
+#   • 3D:  [F_3D128 || PE32]  –> Linear160→96
+#   • FusionGate:  gate = σ(MLP_g192→96)          (通道门控)
+#                  feat_fusion = gate⊙F2D96 + (1-gate)⊙F3D96
+#   • conf_2d = gate.mean(dim=-1, keepdim=True)
+#
+# 2.5 输出 Dict
+#   {
+#     'feat_fusion': List[Tensor](B,N_p,96),
+#     'conf_2d': List[Tensor](B,N_p,1),
+#     'pe_xyz': List[Tensor](B,N_p,32)
+#   }
+
+# === 3. ESAM 集成方案 ===
+# • 修改 `mixformer3d.extract_feat()`
+#     原: point_features = backbone(field.sparse())
+#     新: encoder_out = self.bi_encoder(points, imgs, cam_info)
+#         point_features = encoder_out['feat_fusion']
+#         (其余 all_xyz_w 不变)
+# • `BiFusionEncoder` 在模型 `__init__` 中以 `self.bi_encoder = MODELS.build(...)` 创建。
+
+# === 4. 损失函数 ===
+# 文件: oneformer3d/bife_clip_loss.py   (新建)
+# 类  : ClipConsCriterion
+#   forward(fusion_feat, clip_feat_detach) →
+#       loss_clip = λ_c * (1 - cosine_sim).mean
+# 整合: 在 `mixformer3d.loss()` :
+#       if self.enable_clip_loss:
+#           losses.update(self.clip_criterion(fusion_feat, clip_feat_detach))
+
+# === 5. 依赖与环境 ===
+# • `open_clip_torch>=2.22`  (requirements.txt)  – ViT-B/16
+# • 显存估计：ViT 约 350 MiB (fp16)，Tiny-SA < 200 MiB。
+
+# === 6. 开发步骤 ===
+# S1  新建  oneformer3d/bi_fusion_encoder.py
+#     - CLIPWrapper (freeze except last 2 blocks)
+#       示例加载：
+#       ```python
+#       import open_clip
+#       model, _, preprocess = open_clip.create_model_and_transforms(
+#           'ViT-B-16', pretrained='openai', cache_dir='~/.cache/clip')
+#       vision_encoder = model.visual  # 仅视觉分支
+#       vision_encoder.eval()          # 冻结
+#       for n, p in vision_encoder.named_parameters():
+#           p.requires_grad = n.startswith('blocks') and n.split('.')[1] in {'10','11'}
+#       ```
+#     - build_geo_pe util
+#     - FusionGate & forward()
+# S1a  util  build_uv_index(points_cam, intr, extr, img_shape)
+#       - 返回 Tensor idx_vis (N_vis) 与 uv (N_vis,2) (像素坐标)
+#       - 使用 torch.round & valid mask (0<=u<W,0<=v<H,|d_img - d_depth|<ε)
+# S1b  sampler sample_img_feat(clip_feat, uv)  → F2D(N_vis,256)
+#       - 使用 bilinear_grid_sample，可微
+# S2  实装 Tiny-SA Neck (可放同文件或 tiny_sa.py)
+# S3  mixformer3d.py → extract_feat 修改；模型 __init__ 中增加 bi_encoder
+# S4  新建 bife_clip_loss.py 并注册
+# S5  configs/ESAM/Bi_fusion_encoder_*.py 复制原 online_scannet 配置并替换 encoder / 添加 clip_loss
+# S6  单元测试 test/test_bi_encoder.py
+# S7  文档 docs/bi_fusion_encoder.md 说明 & ablation
+
+# === 7. 注意点 ===
+# • 投影索引：用 `torch.round(K·xyz/z)` 得到 uv，再用深度差 & occ-mask 过滤；索引表保存在 DataPipeline，避免重复计算。
+# • Tiny-SA 只作用在 lowest resolution (≈3k points)，forward 前 downsample(FPS) 再 upsample via nearest; 与实现方法.md 完全一致。
+# • 训练阶段-I：仅 forward BiFusionEncoder + ClipConsCriterion；不跑 Decoder/Slot 部分。
+# • 训练阶段-II：加载阶段-I 权重，联合所有任务 finetune。
+
+# END ======================================================

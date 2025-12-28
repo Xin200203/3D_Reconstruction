@@ -1,0 +1,56 @@
+{
+  "counts": {
+    "scenes_used": 2768,
+    "pred_instances": 145317,
+    "gt_instances": 18204
+  },
+  "thresholds": {
+    "iou_thr": 0.5,
+    "iou_lo_thr": 0.1,
+    "purity_low_thr": 0.85,
+    "purity_high_thr": 0.9,
+    "iou_mid_lo": 0.6,
+    "iou_mid_hi": 0.8,
+    "max_pred_per_scene": null,
+    "gt_size_thr": 100
+  },
+  "miss_rates": {
+    "gt_hit_zero_rate": 0.19254010107668645,
+    "gt_hit_zero_rate_iou_lo": 0.06630410898703581,
+    "gt_best_iou_zero_rate": 0.007251153592617007,
+    "gt_best_iou_0_0p5_rate": 0.18528894748406943,
+    "gt_best_iou_lt_0p5_rate": 0.19254010107668645,
+    "gt_miss_rate_lt_100": 0.7271565495207668,
+    "gt_miss_rate_ge_100": 0.08153111317500332,
+    "gt_best_iou_zero_rate_lt_100": 0.04089456869009585,
+    "gt_best_iou_zero_rate_ge_100": 0.00026535756932466497,
+    "gt_best_iou_0_0p5_rate_lt_100": 0.6862619808306709,
+    "gt_best_iou_0_0p5_rate_ge_100": 0.08126575560567866,
+    "gt_hit_zero_rate_iou_lo_lt_100": 0.36261980830670926,
+    "gt_hit_zero_rate_iou_lo_ge_100": 0.0047764362478439695,
+    "gt_count_lt_100": 3130,
+    "gt_count_ge_100": 15074
+  },
+  "diagnosis": {
+    "primary": "duplicate_instances",
+    "scores": {
+      "sticky_underseg": 2.753703971317877e-07,
+      "boundary_alignment": 0.10479947460311224,
+      "duplicate_instances": 0.6584816523840914
+    },
+    "rates": {
+      "purity_low_rate": 0.27537039713178774,
+      "purity_high_rate": 0.677470633167489,
+      "multi_gt_strong_rate": 0.0,
+      "multi_gt_strong_lowpur_rate": 0.0,
+      "gt_best_iou_mid_rate": 0.15469127664249616,
+      "gt_hit_ge2_rate": 0.6584816523840914
+    },
+    "suggestions": [
+      "mask NMS / matrix NMS tuning",
+      "query de-dup / diversity regularization",
+      "score re-calibration",
+      "merge strategy (spatial + feature consistency)"
+    ]
+  }
+}

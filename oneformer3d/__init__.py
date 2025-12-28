@@ -17,8 +17,26 @@ from .instance_criterion import (
     MaskDiceCost, HungarianMatcher, SparseMatcher)
 from .loading import LoadAnnotations3D_, NormalizePointsColor_
 from .formatting import Pack3DDetInputs_
+# Enhanced loss functions for BiFusion optimization
+from .bife_clip_loss import ClipConsCriterion, LegacyClipConsCriterion
+from .auxiliary_loss import SpatialConsistencyLoss, NoViewSupervisionLoss
 from .transforms_3d import (
     ElasticTransfrom, AddSuperPointAnnotations, SwapChairAndFloor)
 from .data_preprocessor import Det3DDataPreprocessor_
 from .unified_metric import UnifiedSegMetric
 from .scannet_dataset import ScanNetSegDataset_, ScanNet200SegDataset_, ScanNet200SegMVDataset_
+from .time_divided_transformer import TimeDividedTransformer
+from .bi_fusion_encoder import BiFusionEncoder
+from .bife_clip_loss import ClipConsCriterion
+from .dino_backbone import DINOv2Backbone
+from .minkowski_clear_hook import MinkowskiClearCoordinateManagerHook
+from .dino_sanity_hook import DINOAlignmentSanityHook
+from .collate import esam_collate
+# 将所有在 mmdet3d.registry.MODELS 中注册的模块同步到 mmengine.registry.MODELS，
+# 以便 mmengine 的 BaseModel 能够直接查询到自定义组件（如 Det3DDataPreprocessor_）。
+from mmdet3d.registry import MODELS as _M3D_MODELS  # noqa: E402
+from mmengine.registry import MODELS as _MM_MODELS  # noqa: E402
+for _name, _module in _M3D_MODELS.module_dict.items():
+    if _name not in _MM_MODELS.module_dict:
+        # 使用强制注册，避免与已有同名冲突时报错
+        _MM_MODELS.register_module(name=_name, force=True)(_module)

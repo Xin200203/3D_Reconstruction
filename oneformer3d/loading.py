@@ -1,18 +1,22 @@
 # Adapted from mmdet3d/datasets/transforms/loading.py
 import mmengine
 import numpy as np
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 import os, pdb, json
 
 from mmdet3d.datasets.transforms import LoadAnnotations3D
 from mmdet3d.datasets.transforms.loading import get
 from mmdet3d.datasets.transforms.loading import NormalizePointsColor
+from mmdet3d.datasets.transforms.transforms_3d import RandomFlip3D
+from mmdet.datasets.transforms import RandomFlip as MMDetRandomFlip
 from mmcv.transforms.base import BaseTransform
 from mmcv.transforms import Compose, LoadImageFromFile
+import torchvision.transforms as T
 
 from mmdet3d.registry import TRANSFORMS
 from mmdet3d.structures.bbox_3d import get_box_type
 from mmdet3d.structures.points import BasePoints, get_points_type
+import torch
 
 
 @TRANSFORMS.register_module()
@@ -73,6 +77,153 @@ class LoadAnnotations3D_(LoadAnnotations3D):
 
 
 @TRANSFORMS.register_module()
+class NormalizeCamInfo(BaseTransform):
+    """Canonicalize cam_info to a single dict with tensor fields.
+
+    This prevents default_collate from producing nested list-of-tensor(B)
+    structures when cam_info is a list, and guarantees stable downstream
+    parsing (intrinsics/img_size_dino shapes).
+    """
+
+    def __init__(self, *, strict: bool = False) -> None:
+        super().__init__()
+        self.strict = strict
+
+    @staticmethod
+    def _to_tensor_1d(x, *, dtype: torch.dtype) -> torch.Tensor:
+        if torch.is_tensor(x):
+            t = x.reshape(-1).to(dtype=dtype)
+        else:
+            t = torch.tensor(list(x), dtype=dtype).reshape(-1)
+        return t
+
+    @staticmethod
+    def _to_tensor_2d(x, *, dtype: torch.dtype) -> torch.Tensor:
+        if torch.is_tensor(x):
+            t = x.to(dtype=dtype)
+        else:
+            t = torch.tensor(x, dtype=dtype)
+        return t.reshape(4, 4)
+
+    def _normalize_single(self, cam_meta: dict) -> dict:
+        intr = cam_meta.get('intrinsics', None)
+        if intr is not None:
+            intr_t = self._to_tensor_1d(intr, dtype=torch.float32)
+            if intr_t.numel() != 4 and self.strict:
+                raise RuntimeError(f"[NormalizeCamInfo] invalid intrinsics shape: {intr_t.shape}")
+            cam_meta['intrinsics'] = intr_t[:4].to(torch.float32)
+
+        img_size = cam_meta.get('img_size_dino', None)
+        if img_size is not None:
+            img_t = self._to_tensor_1d(img_size, dtype=torch.int64)
+            if img_t.numel() != 2 and self.strict:
+                raise RuntimeError(f"[NormalizeCamInfo] invalid img_size_dino shape: {img_t.shape}")
+            cam_meta['img_size_dino'] = img_t[:2].to(torch.int64)
+
+        for k in ('pose', 'extrinsics'):
+            mat = cam_meta.get(k, None)
+            if mat is None:
+                continue
+            mat_t = self._to_tensor_2d(mat, dtype=torch.float32)
+            if mat_t.shape != (4, 4) and self.strict:
+                raise RuntimeError(f"[NormalizeCamInfo] invalid {k} shape: {mat_t.shape}")
+            cam_meta[k] = mat_t
+
+        if 'img_valid' in cam_meta:
+            cam_meta['img_valid'] = bool(cam_meta['img_valid'])
+
+        return cam_meta
+
+    def transform(self, results: dict) -> dict:
+        cam_info = results.get('cam_info', None)
+        if cam_info is None:
+            return results
+
+        if isinstance(cam_info, list):
+            if len(cam_info) == 1 and isinstance(cam_info[0], dict):
+                cam_info = cam_info[0]
+            elif self.strict:
+                raise RuntimeError(f"[NormalizeCamInfo] unexpected cam_info list len={len(cam_info)}")
+            else:
+                cam_info = [self._normalize_single(m) for m in cam_info if isinstance(m, dict)]
+                results['cam_info'] = cam_info
+                return results
+
+        if isinstance(cam_info, dict):
+            results['cam_info'] = self._normalize_single(cam_info)
+            return results
+
+        if self.strict:
+            raise RuntimeError(f"[NormalizeCamInfo] unsupported cam_info type: {type(cam_info)}")
+
+        return results
+
+@TRANSFORMS.register_module()
+class RandomFlip3D_Sync2DWithVF(RandomFlip3D):
+    """RandomFlip3D with sync_2d horizontal flip but keeps vertical BEV flip.
+
+    Upstream mmdet3d `RandomFlip3D(sync_2d=True)` forces `pcd_vertical_flip=False`
+    when `img` is present. In our online-DINO pipeline we include `img`, so the
+    default behavior silently disables vertical BEV augmentation compared to the
+    baseline (image-free) pipeline.
+
+    This transform:
+    - Keeps 2D flip (and meta keys `flip`, `flip_direction`) consistent with
+      horizontal 3D flip when `sync_2d=True`.
+    - Still samples and applies vertical 3D flip by `flip_ratio_bev_vertical`
+      (vertical flip has no 2D counterpart here, so we do NOT flip the image).
+    """
+
+    def transform(self, input_dict: dict) -> dict:
+        # 仅打印一次，避免训练日志噪声
+        if not hasattr(self, '_vf_logged'):
+            try:
+                from torch.utils.data import get_worker_info
+                wi = get_worker_info()
+                should_print = (wi is None) or (getattr(wi, 'id', 0) == 0)
+            except Exception:
+                should_print = True
+            if should_print and self.sync_2d and float(self.flip_ratio_bev_vertical) > 0:
+                print(
+                    "[RandomFlip3D_Sync2DWithVF] sync_2d=True (image horizontal flip synced) "
+                    f"+ pcd_vertical_flip enabled (p={float(self.flip_ratio_bev_vertical):.2f})."
+                )
+            self._vf_logged = True
+
+        # 1) Flip 2D image (and set `flip` / `flip_direction`) if present.
+        if 'img' in input_dict:
+            MMDetRandomFlip.transform(self, input_dict)
+
+        # 2) Decide 3D flips.
+        if self.sync_2d and 'img' in input_dict:
+            input_dict['pcd_horizontal_flip'] = bool(input_dict.get('flip', False))
+            if 'pcd_vertical_flip' not in input_dict:
+                input_dict['pcd_vertical_flip'] = bool(
+                    np.random.rand() < float(self.flip_ratio_bev_vertical))
+        else:
+            if 'pcd_horizontal_flip' not in input_dict:
+                input_dict['pcd_horizontal_flip'] = bool(
+                    np.random.rand() < float(self.flip_ratio_bev_horizontal))
+            if 'pcd_vertical_flip' not in input_dict:
+                input_dict['pcd_vertical_flip'] = bool(
+                    np.random.rand() < float(self.flip_ratio_bev_vertical))
+
+        if 'transformation_3d_flow' not in input_dict:
+            input_dict['transformation_3d_flow'] = []
+
+        # 3) Apply 3D flip(s) and record the flow for later reverse mapping.
+        if input_dict.get('pcd_horizontal_flip', False):
+            self.random_flip_data_3d(input_dict, 'horizontal')
+            input_dict['transformation_3d_flow'].extend(['HF'])
+
+        if input_dict.get('pcd_vertical_flip', False):
+            self.random_flip_data_3d(input_dict, 'vertical')
+            input_dict['transformation_3d_flow'].extend(['VF'])
+
+        return input_dict
+
+
+@TRANSFORMS.register_module()
 class NormalizePointsColor_(NormalizePointsColor):
     """Just add color_std parameter.
 
@@ -82,9 +233,11 @@ class NormalizePointsColor_(NormalizePointsColor):
             Default value is from SPFormer preprocessing.
     """
 
-    def __init__(self, color_mean, color_std=127.5):
+    def __init__(self, color_mean, color_std=127.5, clamp_range=None):
         self.color_mean = color_mean
         self.color_std = color_std
+        # 添加颜色值钳制范围，默认为[-3, 3]以允许合理的标准化范围
+        self.clamp_range = clamp_range or [-3.0, 3.0]
 
     def transform(self, input_dict):
         """Call function to normalize color of points.
@@ -101,12 +254,28 @@ class NormalizePointsColor_(NormalizePointsColor):
         assert points.attribute_dims is not None and \
                'color' in points.attribute_dims.keys(), \
                'Expect points have color attribute'
+        
+        # 记录原始颜色值范围用于调试
+        orig_min = points.color.min().item()
+        orig_max = points.color.max().item()
+        
         if self.color_mean is not None:
             points.color = points.color - \
                            points.color.new_tensor(self.color_mean)
         if self.color_std is not None:
             points.color = points.color / \
                 points.color.new_tensor(self.color_std)
+        
+        # 钳制颜色值到合理范围
+        if self.clamp_range is not None:
+            points.color = torch.clamp(points.color, 
+                                     min=self.clamp_range[0], 
+                                     max=self.clamp_range[1])
+        
+        # 检查是否有异常值（静默处理）
+        if orig_min < 0 or orig_max > 255:
+            pass  # 颜色值超出正常范围，已通过clamp处理
+        
         input_dict['points'] = points
         return input_dict
 
@@ -310,27 +479,79 @@ class LoadAdjacentDataFromFile(BaseTransform):
         Returns:
             dict: The dict containing loaded 3D mask annotations.
         """
-        scene_name = pts_filenames[0].split('/')[-2]
-        rec_pts_filename = 'data/' + self.dataset_type + '/points/' + scene_name + '.bin'
-        rec_ins_path = 'data/' + self.dataset_type + '/instance_mask/' + scene_name + '.bin'
-        rec_sem_path = 'data/' + self.dataset_type + '/semantic_mask/' + scene_name + '.bin'
+        scene_name = os.path.basename(os.path.dirname(pts_filenames[0]))
+        rec_pts_filename = os.path.join('data', self.dataset_type, 'points',
+                                        f'{scene_name}.bin')
+        rec_ins_path = os.path.join('data', self.dataset_type, 'instance_mask',
+                                    f'{scene_name}.bin')
+        rec_sem_path = os.path.join('data', self.dataset_type, 'semantic_mask',
+                                    f'{scene_name}.bin')
+
+        def _load_arr(filename: str, dtype):
+            try:
+                return np.frombuffer(
+                    get(filename, backend_args=self.backend_args), dtype=dtype)
+            except ConnectionError:
+                return np.fromfile(filename, dtype=dtype)
+
         try:
-            rec_pts = np.frombuffer(get(rec_pts_filename, backend_args=self.backend_args), dtype=np.float32)
-            rec_ins = np.frombuffer(get(rec_ins_path, backend_args=self.backend_args), dtype=np.int64)
-            rec_sem = np.frombuffer(get(rec_sem_path, backend_args=self.backend_args), dtype=np.int64).copy()
-        except ConnectionError:
-            rec_pts = np.fromfile(rec_pts_filename, dtype=np.float32)
-            rec_ins = np.fromfile(rec_ins_path, dtype=np.int64)
-            rec_sem = np.fromfile(rec_sem_path, dtype=np.int64)
+            rec_pts = _load_arr(rec_pts_filename, np.float32)
+            rec_ins = _load_arr(rec_ins_path, np.int64)
+            rec_sem = _load_arr(rec_sem_path, np.int64).copy()
+        except (FileNotFoundError, OSError):
+            # MV 数据集通常只有逐帧文件：points/<scene>/<frame>.bin。
+            # 当未准备 scene-level 的 rec 文件时，回退到使用第一帧作为 rec。
+            frame_pts_filename = pts_filenames[0]
+            if '/points/' in frame_pts_filename:
+                frame_ins_path = frame_pts_filename.replace(
+                    '/points/', '/instance_mask/', 1)
+                frame_sem_path = frame_pts_filename.replace(
+                    '/points/', '/semantic_mask/', 1)
+            else:
+                # 兜底：基于路径段替换 points 目录
+                parts = frame_pts_filename.split(os.sep)
+                if 'points' in parts:
+                    pidx = parts.index('points')
+                    frame_ins_path = os.sep.join(
+                        parts[:pidx] + ['instance_mask'] + parts[pidx + 1:])
+                    frame_sem_path = os.sep.join(
+                        parts[:pidx] + ['semantic_mask'] + parts[pidx + 1:])
+                else:
+                    raise
+
+            rec_pts = _load_arr(frame_pts_filename, np.float32)
+            rec_ins = _load_arr(frame_ins_path, np.int64)
+            rec_sem = _load_arr(frame_sem_path, np.int64).copy()
+        
+        # 初始化segment_ids，确保在所有情况下都有定义
+        segment_ids = np.array([])
+        
         if self.dataset_type == 'scannet' or self.dataset_type == 'scannet200':
-            segment_path = 'data/' + self.dataset_type + '/scans/' + scene_name + '/' + scene_name + '_vh_clean_2.0.010000.segs.json'
-            segment_ids = np.array(json.load(open(segment_path))['segIndices'])
-        if self.dataset_type == '3RScan':
-            segment_path = 'data/' + self.dataset_type + '/3RScan/' + scene_name + '/' + 'mesh.refined.0.010000.segs.v2.json'
-            segment_ids = np.array(json.load(open(segment_path))['segIndices'])
-        if self.dataset_type == 'scenenn':
-            segment_path = 'data/' + self.dataset_type + '/mesh_segs/' + scene_name + '.segs.json'
-            segment_ids = np.array(json.load(open(segment_path))['segIndices'])
+            segment_path = os.path.join('data', self.dataset_type, 'scans',
+                                        scene_name,
+                                        f'{scene_name}_vh_clean_2.0.010000.segs.json')
+            try:
+                segment_ids = np.array(
+                    json.load(open(segment_path))['segIndices'])
+            except FileNotFoundError:
+                segment_ids = np.array([])
+        elif self.dataset_type == '3RScan':
+            segment_path = os.path.join('data', self.dataset_type, '3RScan',
+                                        scene_name,
+                                        'mesh.refined.0.010000.segs.v2.json')
+            try:
+                segment_ids = np.array(
+                    json.load(open(segment_path))['segIndices'])
+            except FileNotFoundError:
+                segment_ids = np.array([])
+        elif self.dataset_type == 'scenenn':
+            segment_path = os.path.join('data', self.dataset_type, 'mesh_segs',
+                                        f'{scene_name}.segs.json')
+            try:
+                segment_ids = np.array(
+                    json.load(open(segment_path))['segIndices'])
+            except FileNotFoundError:
+                segment_ids = np.array([])
 
         rec_pts = rec_pts.reshape(-1, self.load_dim).copy()
         if self.dataset_type == 'scenenn':
@@ -363,6 +584,11 @@ class LoadAdjacentDataFromFile(BaseTransform):
         pts_instance_mask_paths = results['pts_instance_mask_paths']
         pts_semantic_mask_paths = results['pts_semantic_mask_paths']
         sp_pts_mask_paths = results['super_pts_paths']
+        
+        # 初始化img_file_paths和poses，确保在所有情况下都有定义
+        img_file_paths = []
+        poses = []
+        
         if self.use_FF:
             img_file_paths = results['img_paths']
             poses = results['poses']
@@ -426,13 +652,12 @@ class LoadAdjacentDataFromFile(BaseTransform):
         if self.use_color:
             assert len(self.use_dim) >= 6
             if attribute_dims is None:
-                attribute_dims = dict()
-            attribute_dims.update(
-                dict(color=[
+                attribute_dims = {}
+            attribute_dims['color'] = [  # type: ignore[assignment]
                     points.shape[1] - 3,
                     points.shape[1] - 2,
                     points.shape[1] - 1,
-                ]))
+            ]
 
         if self.with_bbox_3d:
             raise NotImplementedError("bbox_3d is not needed for Online seg")
@@ -461,13 +686,17 @@ class LoadAdjacentDataFromFile(BaseTransform):
         
         if self.use_FF:
             imgs = []
-            for i in range(len(img_file_paths)):
-                _results = dict(img_path=img_file_paths[i], img_prefix=None)
-                _results = self.loader(_results)
-                imgs.append(_results['img'])
-            for key in _results.keys():
-                if key not in ['img', 'img_prefix', 'img_path']:
-                    results[key] = _results[key]
+            for img_path in img_file_paths:
+                load_dict = dict(img_path=img_path, img_prefix=None)
+                _img_result = self.loader(load_dict)  # type: ignore
+                if isinstance(_img_result, dict):
+                    imgs.append(_img_result['img'])  # type: ignore[index]
+                    for k, v in _img_result.items():
+                        if k not in ['img', 'img_prefix', 'img_path']:
+                            results[k] = v  # 其余 meta 信息写回
+                else:
+                    # fallback: 仅将返回值视为图像 Tensor
+                    imgs.append(_img_result)  # type: ignore[arg-type]
             results['img'] = imgs
             results['img_paths'] = img_file_paths
             results['poses'] = poses
@@ -619,13 +848,12 @@ class LoadPointsFromFile_(BaseTransform):
         if self.use_color:
             assert len(self.use_dim) >= 6
             if attribute_dims is None:
-                attribute_dims = dict()
-            attribute_dims.update(
-                dict(color=[
+                attribute_dims = {}
+            attribute_dims['color'] = [  # type: ignore[assignment]
                     points.shape[1] - 3,
                     points.shape[1] - 2,
                     points.shape[1] - 1,
-                ]))
+            ]
 
         points_class = get_points_type(self.coord_type)
         points = points_class(
@@ -644,4 +872,489 @@ class LoadPointsFromFile_(BaseTransform):
         repr_str += f'norm_intensity={self.norm_intensity})'
         repr_str += f'norm_elongation={self.norm_elongation})'
         return repr_str
+
+@TRANSFORMS.register_module()
+class LoadClipFeature(BaseTransform):
+    """Load offline CLIP conv1 features (.pt) saved by ``precompute_clip_feats.py``.
+
+    1. 对 *SV*（单帧）样本：
+       - 优先读取 ``clip_feat_path``，若不存在则由 ``img_path`` 推断。
+    2. 对 *MV*（多帧）样本：
+       - 优先读取 ``clip_feat_paths``，否则由 ``img_paths`` 推断。
+
+    添加字段：
+        - ``clip_pix``   : Tensor 或 List[Tensor]，C=192, H/8, W/8
+        - ``clip_global``: Tensor 或 List[Tensor]，dim=768
+
+    若指定路径的 .pt 不存在，则对应位置写入 ``None``；模型内部可据此回退到在线计算。
+    """
+    def __init__(self, data_root: str, dtype: str = 'fp16') -> None:
+        super().__init__()
+        self.data_root = data_root
+        self.dtype = dtype
+
+    def _load_single(self, rel_path: Optional[str]):
+        import torch, os
+        if rel_path is None:
+            return None, None
+        full_path = os.path.join(self.data_root, rel_path)
+        if not os.path.exists(full_path):
+            return None, None
+        data = torch.load(full_path)
+        
+        # 处理不同的数据格式
+        if isinstance(data, dict):
+            # 原始格式：字典包含 'pix' 和 'global'
+            return data.get('pix', None), data.get('global', None)
+        elif isinstance(data, torch.Tensor):
+            # 新格式：直接是60×80的特征张量 (512, 60, 80)
+            # 这就是我们需要的 'pix' 特征，没有 'global' 特征
+            return data, None
+        else:
+            # 未知格式
+            print(f"警告: 未知的CLIP特征格式: {type(data)} 在文件 {full_path}")
+            return None, None
+
+    def transform(self, results: dict) -> dict:
+        # Determine SV or MV
+        if 'img_paths' in results:  # MV
+            clip_paths = results.get('clip_feat_paths', None)
+            if clip_paths is None:
+                clip_paths = [p.replace('2D', 'clip_feat').replace('.jpg', '.pt')
+                              for p in results['img_paths']]
+            clip_pix_list, clip_global_list = [], []
+            for rel in clip_paths:
+                pix, glob = self._load_single(rel)
+                clip_pix_list.append(pix)
+                clip_global_list.append(glob)
+            results['clip_pix'] = clip_pix_list
+            results['clip_global'] = clip_global_list
+        else:  # SV
+            clip_path = results.get('clip_feat_path', None)
+            if clip_path is None and 'img_path' in results:
+                clip_path = results['img_path'].replace('2D', 'clip_feat').replace('.jpg', '.pt')
+            pix, glob = self._load_single(clip_path)
+            results['clip_pix'] = pix
+            results['clip_global'] = glob
+        return results
   
+@TRANSFORMS.register_module()
+class LoadSingleImageFromFile(BaseTransform):
+    """Load single image for BiFusion encoder.
+    
+    Adds:
+        - 'imgs': List[Tensor] (C,H,W) 
+        - 'cam_info': dict with intrinsics/extrinsics (single camera)
+    """
+    def __init__(self, backend_args: Optional[dict] = None, dataset_type: str = 'scannet200', keep_imgs: bool = True):
+        self.backend_args = backend_args
+        self.dataset_type = dataset_type
+        self.keep_imgs = keep_imgs
+        # 使用 mmcv 的标准图像加载器
+        from mmcv.transforms import LoadImageFromFile
+        self.loader = LoadImageFromFile(backend_args=backend_args)
+    
+    def transform(self, results: dict) -> dict:
+        if 'img_path' in results:
+            # Load image using mmcv's LoadImageFromFile
+            temp_results = {'img_path': results['img_path']}
+            temp_results = self.loader(temp_results)
+            
+            # 检查加载结果是否有效
+            if temp_results is None or 'img' not in temp_results:
+                # 图像路径无效 / 读取失败：默认直接报错（避免静默用“假图”污染训练）。
+                # 如需容错继续训练，可设置环境变量 ALLOW_MISSING_IMG=1，将使用零图并标记 img_valid=False。
+                import os
+                if os.environ.get('ALLOW_MISSING_IMG', '') != '1':
+                    raise FileNotFoundError(f"[LoadSingleImageFromFile] failed to load img: {results.get('img_path')}")
+                import torch
+                import numpy as np
+                results['img'] = torch.zeros((3, 224, 224), dtype=torch.float32)
+                # 仍然补齐 cam_info，便于上游定位（但下游 DINO strict 可选择直接中止）
+                cam_info = {}
+                if self.dataset_type in ['scannet', 'scannet200']:
+                    intrinsics = [577.870605, 577.870605, 319.5, 239.5]
+                elif self.dataset_type == 'scenenn':
+                    intrinsics = [544.47329, 544.47329, 320.0, 240.0]
+                else:
+                    intrinsics = [577.870605, 577.870605, 319.5, 239.5]
+                cam_info['intrinsics'] = torch.tensor(intrinsics, dtype=torch.float32)
+                cam_info['img_size_dino'] = torch.tensor([224, 224], dtype=torch.int64)
+                if 'pose' in results:
+                    pose_t = torch.as_tensor(results['pose'], dtype=torch.float32)
+                    cam_info['pose'] = pose_t
+                    cam_info['extrinsics'] = pose_t
+                cam_info['img_valid'] = False
+                results['cam_info'] = cam_info
+                return results
+
+            import torch
+            import numpy as np
+            # 使用异常处理来避免类型检查错误
+            try:
+                img = temp_results['img']  # type: ignore
+            except (KeyError, TypeError):
+                import os
+                if os.environ.get('ALLOW_MISSING_IMG', '') != '1':
+                    raise FileNotFoundError(f"[LoadSingleImageFromFile] invalid img in loader output: {results.get('img_path')}")
+                results['img'] = torch.zeros((3, 224, 224), dtype=torch.float32)
+                cam_info = {}
+                if self.dataset_type in ['scannet', 'scannet200']:
+                    intrinsics = [577.870605, 577.870605, 319.5, 239.5]
+                elif self.dataset_type == 'scenenn':
+                    intrinsics = [544.47329, 544.47329, 320.0, 240.0]
+                else:
+                    intrinsics = [577.870605, 577.870605, 319.5, 239.5]
+                cam_info['intrinsics'] = torch.tensor(intrinsics, dtype=torch.float32)
+                cam_info['img_size_dino'] = torch.tensor([224, 224], dtype=torch.int64)
+                if 'pose' in results:
+                    pose_t = torch.as_tensor(results['pose'], dtype=torch.float32)
+                    cam_info['pose'] = pose_t
+                    cam_info['extrinsics'] = pose_t
+                cam_info['img_valid'] = False
+                results['cam_info'] = cam_info
+                return results
+
+            # 保留原始 numpy 图像用于 2D pipeline（H,W,C）
+            img_np = img
+
+            # 转换为 (C,H,W) tensor 供旧的 BiFusion / 多帧路径使用
+            if isinstance(img, np.ndarray):
+                if img.ndim == 3 and img.shape[-1] == 3:  # (H,W,C)
+                    img_tensor = torch.from_numpy(img).permute(2, 0, 1).float()
+                else:
+                    img_tensor = torch.from_numpy(img).float()
+            elif isinstance(img, torch.Tensor):
+                img_tensor = img.float()
+                if img_tensor.dim() == 3 and img_tensor.shape[0] not in (1, 3):
+                    img_tensor = img_tensor.permute(2, 0, 1).contiguous()
+            else:
+                img_tensor = torch.tensor(img).float()
+
+            # 新的在线 DINO pipeline 使用 `results['img']`，
+            # 后续 ColorJitterImg / ResizeForDINO 等会接管并转换为 tensor。
+            results['img'] = img_np
+
+            # 旧的 BiFusion 路径继续通过 `results['imgs']` 读入 C,H,W tensor
+            if self.keep_imgs:
+                results['imgs'] = [img_tensor]  # List format for batch compatibility
+            
+            # Prepare cam_info with intrinsics from PKL or defaults
+            cam_info = {}
+            
+            # 🔧 核心修复：完全忽略PKL中的内参，统一使用ScanNet标准内参
+            # 参考官方数据处理策略: load_scannet_sv_data_v2_fast.py 第152行
+            # 官方使用: unify_intrinsic = adjust_intrinsic(make_intrinsic(577.870605,577.870605,319.5,239.5), [640,480], unify_dim)
+            # 这解释了为什么不同场景有不同内参值 - 官方根本不使用场景特定内参！
+            
+            # ScanNet标准内参 (fx, fy, cx, cy) - 统一使用
+            if self.dataset_type in ['scannet', 'scannet200']:
+                intrinsics = [577.870605, 577.870605, 319.5, 239.5]
+            elif self.dataset_type == 'scenenn':
+                intrinsics = [544.47329, 544.47329, 320.0, 240.0]
+            else:
+                intrinsics = [577.870605, 577.870605, 319.5, 239.5]  # fallback
+            
+            # 🔧 只在初始化时打印一次，避免重复日志
+            if not hasattr(self, '_intrinsics_logged'):
+                # 多 worker 下每个 worker 都会各自初始化一个 transform 实例；
+                # 这里仅在 worker0（或 num_workers=0）打印一次，减少训练日志噪声。
+                try:
+                    from torch.utils.data import get_worker_info
+                    wi = get_worker_info()
+                    should_print = (wi is None) or (getattr(wi, 'id', 0) == 0)
+                except Exception:
+                    should_print = True
+                if should_print:
+                    print(f"[LoadCamInfo] 使用固定标准内参: {intrinsics} (ScanNet官方策略)")
+                self._intrinsics_logged = True
+            
+            # 统一成 tensor，避免 default_collate 产生“list(4) of Tensor(B)”这种易混淆结构
+            cam_info['intrinsics'] = torch.tensor(intrinsics, dtype=torch.float32)
+            # 记录当前图像尺寸（后续 ResizeForDINO 会覆盖为 DINO 输入尺寸）
+            if isinstance(img_np, np.ndarray) and img_np.ndim >= 2:
+                cam_info['img_size_dino'] = torch.tensor([int(img_np.shape[0]), int(img_np.shape[1])], dtype=torch.int64)
+            cam_info['img_valid'] = True
+
+            # Use pose as both extrinsics and pose (ScanNet format: pose = cam2world)
+            if 'pose' in results:
+                pose_data = results['pose']
+                # 🔧 关键修复：处理多相机pose数据，只使用第一个相机
+                if isinstance(pose_data, (list, tuple)) and len(pose_data) > 0:
+                    # 多相机情况：使用第一个相机的pose
+                    first_pose = pose_data[0]
+                    pose_t = torch.as_tensor(first_pose, dtype=torch.float32)
+                    cam_info['extrinsics'] = pose_t  # cam2world matrix
+                    cam_info['pose'] = pose_t        # 单相机pose信息
+                else:
+                    # 单相机情况：直接使用
+                    pose_t = torch.as_tensor(pose_data, dtype=torch.float32)
+                    cam_info['extrinsics'] = pose_t
+                    cam_info['pose'] = pose_t
+            
+            # 单相机：用 dict 形式即可；后续 `default_collate` 会自然 batch 成 dict(tensor[B,...])
+            results['cam_info'] = cam_info
+        
+        return results
+
+
+@TRANSFORMS.register_module()
+class BGR2RGBImg(BaseTransform):
+    """Convert loaded image from BGR to RGB.
+
+    mmcv's `LoadImageFromFile` commonly returns BGR images (OpenCV convention),
+    while DINOv2 and most foundation models expect RGB.
+
+    This transform updates:
+    - results['img']: numpy(H,W,3) or torch(3,H,W)/(H,W,3)
+    - results['imgs']: optional list of torch tensors (C,H,W)
+    """
+
+    def __init__(self, *, apply_to_imgs: bool = True) -> None:
+        super().__init__()
+        self.apply_to_imgs = apply_to_imgs
+
+    @staticmethod
+    def _swap3(x):
+        import numpy as np
+
+        if x is None:
+            return x
+        if isinstance(x, np.ndarray):
+            if x.ndim == 3 and x.shape[-1] == 3:
+                # HWC
+                return np.ascontiguousarray(x[..., [2, 1, 0]])
+            if x.ndim == 3 and x.shape[0] == 3:
+                # CHW
+                return np.ascontiguousarray(x[[2, 1, 0], ...])
+            return x
+        if torch.is_tensor(x):
+            if x.dim() == 3 and x.shape[0] == 3:
+                return x[[2, 1, 0], ...].contiguous()
+            if x.dim() == 3 and x.shape[-1] == 3:
+                return x[..., [2, 1, 0]].contiguous()
+            if x.dim() == 4 and x.shape[1] == 3:
+                return x[:, [2, 1, 0], ...].contiguous()
+            return x
+        return x
+
+    def transform(self, results: dict) -> dict:
+        if 'img' in results:
+            results['img'] = self._swap3(results['img'])
+        if self.apply_to_imgs and 'imgs' in results and isinstance(results['imgs'], list):
+            swapped = []
+            for t in results['imgs']:
+                swapped.append(self._swap3(t))
+            results['imgs'] = swapped
+        return results
+
+
+@TRANSFORMS.register_module()
+class ColorJitterImg(BaseTransform):
+    """Apply color jitter to a single image.
+
+    This transform only perturbs RGB values and will not touch any
+    geometry-related fields (cam_info, pose, intrinsics, etc.).
+    """
+
+    def __init__(self,
+                 brightness: float = 0.4,
+                 contrast: float = 0.4,
+                 saturation: float = 0.4,
+                 hue: float = 0.1) -> None:
+        super().__init__()
+        self.jitter = T.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue)
+
+    def transform(self, results: dict) -> dict:
+        if 'img' not in results:
+            return results
+
+        img = results['img']
+
+        # Convert to torch tensor (C,H,W), float32.
+        if isinstance(img, torch.Tensor):
+            tensor = img
+            if tensor.dim() == 3 and tensor.shape[0] not in (1, 3) and tensor.shape[-1] in (1, 3):
+                tensor = tensor.permute(2, 0, 1).contiguous()
+            elif tensor.dim() != 3:
+                tensor = tensor.view(3, *tensor.shape[-2:])
+            tensor = tensor.float()
+        else:
+            import numpy as np
+            if isinstance(img, np.ndarray):
+                if not img.flags['C_CONTIGUOUS']:
+                    img = np.ascontiguousarray(img)
+                if img.ndim == 3 and img.shape[-1] in (1, 3):
+                    tensor = torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
+                elif img.ndim == 3 and img.shape[0] in (1, 3):
+                    tensor = torch.from_numpy(img).contiguous().float()
+                else:
+                    tensor = torch.from_numpy(np.asarray(img)).float()
+                    if tensor.dim() == 3 and tensor.shape[0] not in (1, 3) and tensor.shape[-1] in (1, 3):
+                        tensor = tensor.permute(2, 0, 1).contiguous()
+            else:
+                tensor = torch.tensor(img).float()
+                if tensor.dim() == 3 and tensor.shape[0] not in (1, 3) and tensor.shape[-1] in (1, 3):
+                    tensor = tensor.permute(2, 0, 1).contiguous()
+
+        # IMPORTANT: Use fixed 0..1 normalization, NOT per-image min/max rescaling.
+        # DINOv2 expects standard RGB statistics; per-image stretching changes appearance semantics too much.
+        # We keep the tensor in 0..255 (float) after jitter to match downstream expectations.
+        assume_255 = False
+        if tensor.dtype.is_floating_point:
+            maxv = float(tensor.max().item()) if tensor.numel() > 0 else 0.0
+            assume_255 = maxv > 1.5
+        else:
+            assume_255 = True
+
+        x01 = (tensor / 255.0) if assume_255 else tensor
+        x01 = x01.clamp(0.0, 1.0)
+        x01 = self.jitter(x01)
+        x01 = x01.clamp(0.0, 1.0)
+        out = x01 * 255.0 if assume_255 else x01
+
+        results['img'] = out
+        return results
+
+
+@TRANSFORMS.register_module()
+class ResizeForDINO(BaseTransform):
+    """Resize image to a fixed size for DINO and update intrinsics.
+
+    - Resize img to (target_h, target_w) with aspect ratio preserved.
+    - Scale intrinsics in `cam_info` accordingly and record `img_size_dino`.
+    - This transform does not perform any flip.
+    """
+
+    def __init__(self,
+                 target_size: Tuple[int, int] = (420, 560)) -> None:
+        super().__init__()
+        self.target_h, self.target_w = target_size
+
+    def transform(self, results: dict) -> dict:
+        if 'img' not in results:
+            return results
+
+        img = results['img']
+
+        # Expect img in (C,H,W) tensor; also support numpy (H,W,C) from mmcv.
+        if isinstance(img, torch.Tensor):
+            if img.dim() == 3:
+                # Prefer CHW; if HWC-like, convert.
+                if img.shape[0] in (1, 3, 4):
+                    _, H0, W0 = img.shape
+                elif img.shape[-1] in (1, 3, 4):
+                    # HWC -> CHW
+                    H0, W0 = int(img.shape[0]), int(img.shape[1])
+                    img = img.permute(2, 0, 1).contiguous()
+                else:
+                    # Fallback: treat as CHW
+                    _, H0, W0 = img.shape
+            else:
+                H0, W0 = int(img.shape[-2]), int(img.shape[-1])
+        else:
+            # numpy or other array-like
+            import numpy as np
+            if isinstance(img, np.ndarray):
+                # 处理由于翻转等操作导致的负 stride，先转为连续内存
+                if not img.flags['C_CONTIGUOUS']:
+                    img = np.ascontiguousarray(img)
+                # Robustly infer original H,W from numpy layout.
+                if img.ndim == 2:
+                    H0, W0 = int(img.shape[0]), int(img.shape[1])
+                    img = torch.from_numpy(img).unsqueeze(0).float()  # (1,H,W)
+                elif img.ndim == 3:
+                    # Most common: HWC (H,W,C)
+                    if img.shape[-1] in (1, 3, 4):
+                        H0, W0 = int(img.shape[0]), int(img.shape[1])
+                        img = torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
+                    # Possible: CHW (C,H,W)
+                    elif img.shape[0] in (1, 3, 4):
+                        H0, W0 = int(img.shape[1]), int(img.shape[2])
+                        img = torch.from_numpy(img).contiguous().float()
+                    else:
+                        # Unknown layout; fall back to (H,W,?) assumption for safety.
+                        H0, W0 = int(img.shape[0]), int(img.shape[1])
+                        img = torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
+                        if not hasattr(self, '_resize_layout_warned'):
+                            print(f"[ResizeForDINO][warn] unknown numpy img layout {img.shape}; assuming HWC.")
+                            self._resize_layout_warned = True
+                else:
+                    # Fallback for unusual dims: use last two dims as H,W.
+                    H0, W0 = int(img.shape[-2]), int(img.shape[-1])
+                    img = torch.from_numpy(img).float()
+            else:
+                tensor = torch.tensor(img).float()
+                if tensor.dim() == 3 and tensor.shape[0] not in (1, 3):
+                    tensor = tensor.permute(2, 0, 1).contiguous()
+                img = tensor
+                H0, W0 = img.shape[-2], img.shape[-1]
+
+        H1, W1 = self.target_h, self.target_w
+        scale_h = H1 / float(H0)
+        scale_w = W1 / float(W0)
+
+        # 保持近似等比例缩放，避免改变长宽比。
+        if abs(scale_h - scale_w) > 1e-3:
+            # 记录一个警告，但仍然继续使用各自的尺度，防止训练中断。
+            print(f"[ResizeForDINO] non-uniform scale detected: "
+                  f"H0={H0},W0={W0},H1={H1},W1={W1}, "
+                  f"scale_h={scale_h:.4f}, scale_w={scale_w:.4f}")
+
+        # 使用双线性插值缩放到目标大小。
+        img_resized = torch.nn.functional.interpolate(
+            img.unsqueeze(0), size=(H1, W1), mode='bilinear', align_corners=False
+        ).squeeze(0)
+        results['img'] = img_resized
+
+        # 同步更新 cam_info 中的 intrinsics / img_size_dino（若存在）。
+        cam_info = results.get('cam_info', None)
+        if cam_info is not None:
+            # 支持 cam_info 是 list[dict] 或 dict
+            metas = cam_info if isinstance(cam_info, list) else [cam_info]
+            for meta in metas:
+                intr = meta.get('intrinsics', None)
+                if intr is None:
+                    continue
+                # intrinsics 允许 list[float] 或 tensor(4,)
+                if torch.is_tensor(intr):
+                    if intr.numel() != 4:
+                        continue
+                    fx, fy, cx, cy = [float(x) for x in intr.reshape(-1)]
+                    fx_new = fx * scale_w
+                    fy_new = fy * scale_h
+                    cx_new = cx * scale_w
+                    cy_new = cy * scale_h
+                    meta['intrinsics'] = intr.new_tensor([fx_new, fy_new, cx_new, cy_new]).to(torch.float32)
+                    meta['img_size_dino'] = torch.tensor([int(H1), int(W1)], dtype=torch.int64)
+                else:
+                    if not (isinstance(intr, (list, tuple)) and len(intr) == 4):
+                        continue
+                    fx, fy, cx, cy = intr
+                    fx_new = fx * scale_w
+                    fy_new = fy * scale_h
+                    cx_new = cx * scale_w
+                    cy_new = cy * scale_h
+                    # IMPORTANT: always keep cam_info as tensor to avoid ambiguous default_collate outputs
+                    meta['intrinsics'] = torch.tensor(
+                        [float(fx_new), float(fy_new), float(cx_new), float(cy_new)],
+                        dtype=torch.float32)
+                    meta['img_size_dino'] = torch.tensor([int(H1), int(W1)], dtype=torch.int64)
+                # Guardrail: warn once if intrinsics look suspicious (often caused by wrong H/W inference).
+                if (not hasattr(self, '_intrinsics_scale_warned') and
+                        (float(fx_new) > 5000 or float(fy_new) > 5000 or
+                         float(cx_new) > 2 * float(W1) or float(cy_new) > 2 * float(H1))):
+                    print(
+                        "[ResizeForDINO][warn] suspicious intrinsics after resize: "
+                        f"(H0,W0)=({H0},{W0})->(H1,W1)=({H1},{W1}), "
+                        f"scale_h={scale_h:.4f}, scale_w={scale_w:.4f}, "
+                        f"intr_old={[float(fx), float(fy), float(cx), float(cy)]}, "
+                        f"intr_new={[float(fx_new), float(fy_new), float(cx_new), float(cy_new)]}"
+                    )
+                    self._intrinsics_scale_warned = True
+
+        return results

@@ -57,6 +57,10 @@ def parse_args():
         help='job launcher')
     parser.add_argument(
         '--tta', action='store_true', help='Test time augmentation')
+    # 新增：是否使用类无关实例评测
+    parser.add_argument(
+        '--cat-agnostic', action='store_true',
+        help='If set, use category-agnostic instance evaluation (AP).')
     # When using PyTorch version >= 2.0.0, the `torch.distributed.launch`
     # will pass the `--local-rank` parameter to `tools/test.py` instead
     # of `--local_rank`.
@@ -96,6 +100,35 @@ def trigger_visualization_hook(cfg, args):
     return cfg
 
 
+def _rewrite_diagnostics_out_dir(cfg):
+    """Make diagnostics output dir unique per run.
+
+    UnifiedSegMetric resolves relative `diagnostics.out_dir` against logger
+    fields, which may fall back to CWD. Here we force it to live under the
+    runner `work_dir` (absolute) to avoid cross-run overwrites.
+    """
+
+    def _rewrite_one(evaluator):
+        if not isinstance(evaluator, dict):
+            return
+        diag = evaluator.get('diagnostics', None)
+        if not isinstance(diag, dict):
+            return
+        out_dir = diag.get('out_dir', 'instance_diagnostics')
+        out_dir = str(out_dir)
+        if not osp.isabs(out_dir):
+            diag['out_dir'] = osp.abspath(osp.join(cfg.work_dir, out_dir))
+
+    for key in ('val_evaluator', 'test_evaluator'):
+        if key not in cfg:
+            continue
+        if isinstance(cfg[key], dict):
+            _rewrite_one(cfg[key])
+        elif isinstance(cfg[key], (list, tuple)):
+            for e in cfg[key]:
+                _rewrite_one(e)
+
+
 def main():
     args = parse_args()
 
@@ -110,6 +143,18 @@ def main():
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
 
+    # 根据 --cat-agnostic 调整评测模式
+    eval_mode = 'cat_agnostic' if args.cat_agnostic else 'multi_class'
+    for key in ['val_evaluator', 'test_evaluator']:
+        if key in cfg:
+            # 支持 evaluator 为字典或列表
+            if isinstance(cfg[key], dict):
+                cfg[key]['eval_mode'] = eval_mode
+            elif isinstance(cfg[key], (list, tuple)):
+                for _e in cfg[key]:
+                    if isinstance(_e, dict):
+                        _e['eval_mode'] = eval_mode
+
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:
         # update configs according to CLI args if args.work_dir is not None
@@ -120,6 +165,9 @@ def main():
                                 osp.splitext(osp.basename(args.config))[0])
 
     cfg.load_from = args.checkpoint
+
+    # Ensure diagnostics output does not overwrite across experiments.
+    _rewrite_diagnostics_out_dir(cfg)
 
     if args.show or args.show_dir:
         cfg = trigger_visualization_hook(cfg, args)

@@ -270,8 +270,10 @@ class Res16UNetBase(BaseModule):
                  out_channels,
                  config,
                  D=3,
+                 dino_dim=None,  # 可选：DINO 通道数，提供则启用 2D 注入
                  **kwargs):
         self.D = D
+        self.dino_dim = dino_dim
         super().__init__()
         self.network_initialization(in_channels, out_channels, config, D)
         self.weight_initialization()
@@ -514,7 +516,187 @@ class Res16UNetBase(BaseModule):
         #     D=D)
         self.relu = MinkowskiReLU(inplace=True)
 
-    def forward(self, x, memory=None):
+        # 若提供 dino_dim，则为各解码层准备 1x1 投影（用于后续 2D 注入）
+        self.use_dino = self.dino_dim is not None
+        if self.use_dino:
+            # 最新一次 forward 中各尺度的命中率（用于训练期 sanity hook）
+            self._last_dino_hit = {}
+            # 最新一次 forward 中各尺度的融合尺度统计（用于训练期 sanity hook）
+            self._last_dino_fuse = {}
+            # 低命中保护：当 DINO sparse 坐标与 backbone 坐标不一致时，
+            # features_at_coordinates 会大量 miss 并返回全 0，此时继续做融合会把 backbone 特征扰乱。
+            # 这里提供一个轻量保护：命中率低于阈值则退化为原始 (up ⊕ skip)。
+            self._dino_miss_warn_count = 0
+            self._dino_min_hit_ratio = float(getattr(config, 'dino_min_hit_ratio', 0.05))
+            self._dino_strict = bool(getattr(config, 'dino_strict', False))
+            # 推荐：使用 residual 形式注入（base_cat + fuse(cat+ dino)），
+            # 并将 fuse 的 1×1 conv 初始化为 0，确保加载旧 checkpoint（不含 DINO）时
+            # 主干行为保持不变，避免 AP 断崖式下降。
+            self._dino_residual = bool(getattr(config, 'dino_residual', True))
+
+            # DITR 风格：三路特征（up、skip、dino）concat 后做 1×1 投影 + BN + GELU，
+            # 输出通道数保持与原始 (up ⊕ skip) 相同，以避免重写后续 decoder blocks。
+            def _fuse(in_ch: int, out_ch: int):
+                return nn.Sequential(
+                    ME.MinkowskiConvolution(
+                        in_channels=in_ch,
+                        out_channels=out_ch,
+                        kernel_size=1,
+                        stride=1,
+                        bias=False,
+                        dimension=D,
+                    ),
+                    ME.MinkowskiBatchNorm(out_ch, momentum=bn_momentum),
+                    ME.MinkowskiGELU(),
+                )
+
+            # level stride=8/4/2/1
+            self.dino_fuse_8 = _fuse(
+                # up: PLANES[4], skip(out_b3p8): PLANES[2]
+                self.PLANES[4] + self.PLANES[2] + self.dino_dim,
+                self.PLANES[4] + self.PLANES[2],
+            )
+            self.dino_fuse_4 = _fuse(
+                # up: PLANES[5], skip(out_b2p4): PLANES[1]
+                self.PLANES[5] + self.PLANES[1] + self.dino_dim,
+                self.PLANES[5] + self.PLANES[1],
+            )
+            self.dino_fuse_2 = _fuse(
+                # up: PLANES[6], skip(out_b1p2): PLANES[0]
+                self.PLANES[6] + self.PLANES[0] + self.dino_dim,
+                self.PLANES[6] + self.PLANES[0],
+            )
+            self.dino_fuse_1 = _fuse(
+                self.PLANES[7] + self.INIT_DIM + self.dino_dim,
+                self.PLANES[7] + self.INIT_DIM,
+            )
+
+            # 关键：零初始化 1×1 conv，让 fuse 初始输出为 0，配合 residual 注入不扰乱主干。
+            if self._dino_residual:
+                for m in (self.dino_fuse_8, self.dino_fuse_4, self.dino_fuse_2, self.dino_fuse_1):
+                    try:
+                        conv1x1 = m[0]
+                        if hasattr(conv1x1, 'kernel') and conv1x1.kernel is not None:
+                            conv1x1.kernel.data.zero_()
+                    except Exception:
+                        pass
+
+    def _fuse_with_dino(self, out_up, out_skip, dino_feat, fuse):
+        """DITR 风格：在 decoder level 将三路特征 concat 后投影融合。
+
+        - out_up: 当前 decoder 上采样分支特征（convtr+bn+relu 后）
+        - out_skip: encoder skip 特征（同 stride）
+        - dino_feat: 同 stride 的 DINO 稀疏特征（可为 None）
+        - fuse: 1×1 conv + BN + GELU（输出通道与 out_up⊕out_skip 一致）
+        """
+        base_cat = me.cat(out_up, out_skip)
+
+        if dino_feat is None:
+            if getattr(self, '_dino_strict', False):
+                raise RuntimeError(
+                    f"DINO strict: missing dino_feat for tensor_stride={tuple(out_up.tensor_stride)}")
+            return base_cat
+
+        try:
+            dino_on_out = dino_feat.features_at_coordinates(out_up.coordinates.float())
+        except Exception as e:
+            if getattr(self, '_dino_strict', False):
+                raise RuntimeError(
+                    f"DINO strict: features_at_coordinates failed for tensor_stride={tuple(out_up.tensor_stride)}: {repr(e)}")
+            return base_cat
+
+        if dino_on_out.dim() != 2 or dino_on_out.shape[0] != out_up.features.shape[0]:
+            if getattr(self, '_dino_strict', False):
+                raise RuntimeError(
+                    "DINO strict: features_at_coordinates returned invalid shape "
+                    f"got={tuple(getattr(dino_on_out, 'shape', []))}, expected=({out_up.features.shape[0]}, C)")
+            return base_cat
+
+        # 命中率检查（避免坐标 miss 时把 backbone 特征通过随机 fuse 破坏掉）
+        try:
+            hit = (dino_on_out.abs().sum(dim=1) > 1e-8).float().mean().item()
+            # 记录到成员变量，供训练期 sanity hook 汇总
+            try:
+                s = int(getattr(out_up, 'tensor_stride', (0,))[0])
+                key = {1: 's1', 2: 's2', 4: 's4', 8: 's8', 16: 's16'}.get(s, f's{s}')
+                if hasattr(self, '_last_dino_hit') and isinstance(self._last_dino_hit, dict):
+                    self._last_dino_hit[key] = float(hit)
+            except Exception:
+                pass
+            if hit < getattr(self, '_dino_min_hit_ratio', 0.0):
+                if getattr(self, '_dino_strict', False):
+                    raise RuntimeError(
+                        f"DINO strict: low hit_ratio={hit:.4f} (<{self._dino_min_hit_ratio:.4f}) "
+                        f"at tensor_stride={tuple(out_up.tensor_stride)}; check elastic/flip/resize/intrinsics sync.")
+                if getattr(self, '_dino_miss_warn_count', 0) < 3:
+                    print(f"[DINO][warn] low hit_ratio={hit:.4f} (<{self._dino_min_hit_ratio:.4f}), fallback to 3D-only concat")
+                    self._dino_miss_warn_count += 1
+                return base_cat
+        except Exception:
+            # 若检查失败，宁可继续走融合（不影响正常训练）
+            pass
+
+        dino_on_out = ME.SparseTensor(
+            features=dino_on_out,
+            coordinate_map_key=out_up.coordinate_map_key,
+            tensor_stride=out_up.tensor_stride,
+            coordinate_manager=out_up.coordinate_manager,
+        )
+        fused_in = me.cat(out_up, out_skip, dino_on_out)
+        fused_out = fuse(fused_in)
+        # 记录融合尺度统计（仅用于训练期监控）
+        try:
+            s = int(getattr(out_up, 'tensor_stride', (0,))[0])
+            key = {1: 's1', 2: 's2', 4: 's4', 8: 's8', 16: 's16'}.get(s, f's{s}')
+            base_feat = base_cat.features
+            fuse_feat = fused_out.features
+            # 均值/方差
+            dino_mean = float(dino_on_out.features.mean())
+            dino_std = float(dino_on_out.features.std())
+            base_mean = float(base_feat.mean())
+            base_std = float(base_feat.std())
+            # L2 norm 比例
+            base_norm = float(base_feat.norm(p=2, dim=1).mean())
+            fuse_norm = float(fuse_feat.norm(p=2, dim=1).mean())
+            ratio = float(fuse_norm / (base_norm + 1e-6))
+            if hasattr(self, '_last_dino_fuse') and isinstance(self._last_dino_fuse, dict):
+                self._last_dino_fuse[key] = dict(
+                    base_norm=base_norm,
+                    fuse_norm=fuse_norm,
+                    ratio=ratio,
+                    dino_mean=dino_mean,
+                    dino_std=dino_std,
+                    base_mean=base_mean,
+                    base_std=base_std,
+                )
+        except Exception:
+            pass
+        if getattr(self, '_dino_residual', False):
+            return base_cat + fused_out
+        return fused_out
+
+    def forward(self, x, dino_feats=None, memory=None):
+        """dino_feats: 可选 list/tuple，期望顺序 [s1, s2, s4, s8, s16]
+        解码注入逻辑：
+          - 仅在 self.use_dino 且提供 dino_feats 时生效；
+          - 在各 decoder level，将 (up, skip, dino) 三路特征 concat 后做 1×1+BN+GELU 融合；
+          - 输出通道与原始 (up ⊕ skip) 一致，保持 U-Net 主干结构与 block 输入不变。
+        """
+        if self.use_dino and hasattr(self, '_last_dino_hit') and isinstance(self._last_dino_hit, dict):
+            self._last_dino_hit = {}
+        if self.use_dino and hasattr(self, '_last_dino_fuse') and isinstance(self._last_dino_fuse, dict):
+            self._last_dino_fuse = {}
+
+        dino_s1 = dino_s2 = dino_s4 = dino_s8 = dino_s16 = None
+        if self.use_dino and dino_feats is not None and len(dino_feats) >= 4:
+            # build_sparse_fpn 返回 [s1, s2, s4, s8, s16]
+            dino_s1 = dino_feats[0]
+            dino_s2 = dino_feats[1]
+            dino_s4 = dino_feats[2]
+            dino_s8 = dino_feats[3]
+            if len(dino_feats) >= 5:
+                dino_s16 = dino_feats[4]
+
         out = self.conv0p1s1(x)
         out = self.bn0(out)
         out_p1 = self.relu(out)
@@ -540,6 +722,16 @@ class Res16UNetBase(BaseModule):
         out = self.relu(out)
         out = self.block4(out)
 
+        # stride=16 的坐标命中率统计（不参与融合，只用于 sanity/调试）
+        if self.use_dino and dino_s16 is not None:
+            try:
+                d16 = dino_s16.features_at_coordinates(out.coordinates.float())
+                hit16 = (d16.abs().sum(dim=1) > 1e-8).float().mean().item()
+                if hasattr(self, '_last_dino_hit') and isinstance(self._last_dino_hit, dict):
+                    self._last_dino_hit['s16'] = float(hit16)
+            except Exception:
+                pass
+
         if memory is not None:
             out_b1p2_temp, out_b2p4_temp, out_b3p8_temp, out_temp = out_b1p2, out_b2p4, out_b3p8, out
             out_b1p2, out_b2p4, out_b3p8, out = memory([out_b1p2, out_b2p4, out_b3p8, out])
@@ -552,28 +744,40 @@ class Res16UNetBase(BaseModule):
         out = self.convtr4p16s2(out)
         out = self.bntr4(out)
         out = self.relu(out)
-        out = me.cat(out, out_b3p8)
+        if self.use_dino:
+            out = self._fuse_with_dino(out, out_b3p8, dino_s8, self.dino_fuse_8)
+        else:
+            out = me.cat(out, out_b3p8)
         out = self.block5(out)
 
         # pixel_dist=4
         out = self.convtr5p8s2(out)
         out = self.bntr5(out)
         out = self.relu(out)
-        out = me.cat(out, out_b2p4)
+        if self.use_dino:
+            out = self._fuse_with_dino(out, out_b2p4, dino_s4, self.dino_fuse_4)
+        else:
+            out = me.cat(out, out_b2p4)
         out = self.block6(out)
 
         # pixel_dist=2
         out = self.convtr6p4s2(out)
         out = self.bntr6(out)
         out = self.relu(out)
-        out = me.cat(out, out_b1p2)
+        if self.use_dino:
+            out = self._fuse_with_dino(out, out_b1p2, dino_s2, self.dino_fuse_2)
+        else:
+            out = me.cat(out, out_b1p2)
         out = self.block7(out)
 
         # pixel_dist=1
         out = self.convtr7p2s2(out)
         out = self.bntr7(out)
         out = self.relu(out)
-        out = me.cat(out, out_p1)
+        if self.use_dino:
+            out = self._fuse_with_dino(out, out_p1, dino_s1, self.dino_fuse_1)
+        else:
+            out = me.cat(out, out_p1)
         out = self.block8(out)
 
         return out
@@ -581,7 +785,14 @@ class Res16UNetBase(BaseModule):
 class Res16UNetBase_FF(Res16UNetBase):
     """Base class for Minkowski U-Net."""
 
-    def forward(self, x, f=None, memory=None):
+    def forward(self, x, f=None, dino_feats=None, memory=None):
+        dino_s1 = dino_s2 = dino_s4 = dino_s8 = None
+        if self.use_dino and dino_feats is not None and len(dino_feats) >= 4:
+            dino_s1 = dino_feats[0]
+            dino_s2 = dino_feats[1]
+            dino_s4 = dino_feats[2]
+            dino_s8 = dino_feats[3]
+
         out = self.conv0p1s1(x)
         out = self.bn0(out)
         out_p1 = self.relu(out)
@@ -621,6 +832,8 @@ class Res16UNetBase_FF(Res16UNetBase):
         out = self.convtr4p16s2(out)
         out = self.bntr4(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s8, self.dino_proj_8)
         out = me.cat(out, out_b3p8)
         out = self.block5(out)
 
@@ -628,6 +841,8 @@ class Res16UNetBase_FF(Res16UNetBase):
         out = self.convtr5p8s2(out)
         out = self.bntr5(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s4, self.dino_proj_4)
         out = me.cat(out, out_b2p4)
         out = self.block6(out)
 
@@ -635,6 +850,8 @@ class Res16UNetBase_FF(Res16UNetBase):
         out = self.convtr6p4s2(out)
         out = self.bntr6(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s2, self.dino_proj_2)
         out = me.cat(out, out_b1p2)
         out = self.block7(out)
 
@@ -642,6 +859,8 @@ class Res16UNetBase_FF(Res16UNetBase):
         out = self.convtr7p2s2(out)
         out = self.bntr7(out)
         out = self.relu(out)
+        if self.use_dino:
+            out = self._inject_dino(out, dino_s1, self.dino_proj_1)
         out = me.cat(out, out_p1)
         out = self.block8(out)
 

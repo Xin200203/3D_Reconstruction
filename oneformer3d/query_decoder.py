@@ -49,6 +49,17 @@ class CrossAttentionLayer(BaseModule):
         for i in range(len(sources)):
             k = v = sources[i]
             attn_mask = attn_masks[i] if attn_masks is not None else None
+            # MultiheadAttention: bool mask where True means "masked".
+            # 若某一 query 行全为 True，会导致 softmax 全 -inf -> NaN。
+            if attn_mask is not None:
+                attn_mask = attn_mask.to(device=queries[i].device)
+                if attn_mask.dtype is not torch.bool:
+                    attn_mask = attn_mask.bool()
+                if attn_mask.ndim == 2:
+                    all_true = attn_mask.all(dim=1)
+                    if all_true.any():
+                        attn_mask = attn_mask.clone()
+                        attn_mask[all_true] = False
             output, _ = self.attn(queries[i], k, v, attn_mask=attn_mask)
             if self.fix:
                 output = self.dropout(output)
@@ -160,11 +171,21 @@ class QueryDecoder(BaseModule):
                  objectness_flag, **kwargs):
         super().__init__()
         self.objectness_flag = objectness_flag
+        self.expected_in_channels = in_channels  # 保存配置的预期维度
+        self.d_model = d_model
+        
+        # 修复：在初始化时直接创建input_proj，避免延迟初始化导致的权重加载问题
         self.input_proj = nn.Sequential(
-            nn.Linear(in_channels, d_model), nn.LayerNorm(d_model), nn.ReLU())
+            nn.Linear(in_channels, d_model), 
+            nn.LayerNorm(d_model), 
+            nn.ReLU()
+        )
+        self.input_adapter = None  # 保留适配器接口，但默认不使用
+        
         if num_instance_queries + num_semantic_queries > 0:
             self.query = nn.Embedding(num_instance_queries + num_semantic_queries, d_model)
         if num_instance_queries == 0:
+            # query_proj也需要类似处理，但先用原始逻辑，出错时再修复
             self.query_proj = nn.Sequential(
                 nn.Linear(in_channels, d_model), nn.ReLU(),
                 nn.Linear(d_model, d_model))
@@ -205,7 +226,10 @@ class QueryDecoder(BaseModule):
                 (n_queries_i, d_model).
         """
         if batch_size is None:
-            batch_size = len(queries)
+            if queries is not None:
+                batch_size = len(queries)
+            else:
+                batch_size = 1  # 默认batch_size
         
         result_queries = []
         for i in range(batch_size):
@@ -217,7 +241,7 @@ class QueryDecoder(BaseModule):
             result_queries.append(torch.cat(result_query))
         return result_queries
 
-    def _forward_head(self, queries, mask_feats):
+    def _forward_head(self, queries, mask_feats, *args, **kwargs):
         """Prediction head forward.
 
         Args:
@@ -256,7 +280,7 @@ class QueryDecoder(BaseModule):
         attn_masks = attn_masks if self.attn_mask else None
         return cls_preds, pred_scores, pred_masks, attn_masks
 
-    def forward_simple(self, x, queries):
+    def forward_simple(self, x, queries=None, **kwargs):
         """Simple forward pass.
         
         Args:
@@ -282,7 +306,7 @@ class QueryDecoder(BaseModule):
             masks=pred_masks,
             scores=pred_scores)
 
-    def forward_iter_pred(self, x, queries):
+    def forward_iter_pred(self, x, queries=None, **kwargs):
         """Iterative forward pass.
         
         Args:
@@ -323,7 +347,7 @@ class QueryDecoder(BaseModule):
             scores=pred_scores[-1],
             aux_outputs=aux_outputs)
 
-    def forward(self, x, queries=None):
+    def forward(self, x, queries=None, **kwargs):
         """Forward pass.
         
         Args:
@@ -357,7 +381,7 @@ class ScanNetQueryDecoder(QueryDecoder):
         else:
             self.out_sem = nn.Linear(d_model, num_semantic_classes + 1)
 
-    def _forward_head(self, queries, mask_feats, last_flag):
+    def _forward_head(self, queries, mask_feats, last_flag=False, **kwargs):  # type: ignore[override]
         """Prediction head forward.
 
         Args:
@@ -401,7 +425,7 @@ class ScanNetQueryDecoder(QueryDecoder):
         sem_preds = sem_preds if last_flag else None
         return cls_preds, sem_preds, pred_scores, pred_masks, attn_masks
 
-    def forward_simple(self, x, queries):
+    def forward_simple(self, x, queries=None, **kwargs):
         """Simple forward pass.
         
         Args:
@@ -424,11 +448,11 @@ class ScanNetQueryDecoder(QueryDecoder):
             queries, mask_feats, last_flag=True)
         return dict(
             cls_preds=cls_preds,
-            sem_preds=sem_preds,
+            sem_preds=sem_preds if sem_preds is not None else [],
             masks=pred_masks,
             scores=pred_scores)
 
-    def forward_iter_pred(self, x, queries):
+    def forward_iter_pred(self, x, queries=None, **kwargs):
         """Iterative forward pass.
         
         Args:
@@ -448,7 +472,7 @@ class ScanNetQueryDecoder(QueryDecoder):
         cls_pred, sem_pred, pred_score, pred_mask, attn_mask = self._forward_head(
             queries, mask_feats, last_flag=False)
         cls_preds.append(cls_pred)
-        sem_preds.append(sem_pred)
+        sem_preds.append(sem_pred if sem_pred is not None else [])
         pred_scores.append(pred_score)
         pred_masks.append(pred_mask)
         for i in range(len(self.cross_attn_layers)):
@@ -459,7 +483,7 @@ class ScanNetQueryDecoder(QueryDecoder):
             cls_pred, sem_pred, pred_score, pred_mask, attn_mask = self._forward_head(
                 queries, mask_feats, last_flag)
             cls_preds.append(cls_pred)
-            sem_preds.append(sem_pred)
+            sem_preds.append(sem_pred if sem_pred is not None else [])
             pred_scores.append(pred_score)
             pred_masks.append(pred_mask)
 
@@ -520,7 +544,7 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         else:
             self.out_sem = nn.Linear(d_model, num_semantic_classes + 1)
 
-    def _forward_head(self, queries, mask_feats, mask_pts_feats, last_flag, layer):
+    def _forward_head(self, queries, mask_feats, mask_pts_feats, last_flag, layer):  # type: ignore[override]
         """Prediction head forward.
 
         Args:
@@ -576,24 +600,85 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         sem_preds = sem_preds if last_flag else None
         return cls_preds, sem_preds, pred_scores, pred_masks, attn_masks, object_queries, pred_bboxes
 
-    def forward_iter_pred(self, sp_feats, p_feats, queries, super_points, prev_queries=None):
-        """Iterative forward pass.
+    def forward_iter_pred(self, x=None, queries=None, sp_feats=None, p_feats=None, super_points=None, prev_queries=None, **kwargs):
+        """Iterative forward pass - supports both interfaces.
         
         Args:
-            x (List[Tensor]): of len batch_size, each of shape
-                (n_points_i, in_channels).
-            queries (List[Tensor], optional): of len batch_size, each of shape
-                (n_points_i, in_channles).
+            x: Legacy compatibility (redirected to sp_feats if provided)
+            queries: Query tensors
+            sp_feats: Super-point features
+            p_feats: Point features
+            super_points: Super-point information
+            prev_queries: Previous queries (optional)
         
         Returns:
-            Dict: with instance scores, semantic scores, masks, scores,
-                and aux_outputs.
+            Dict: with instance scores, semantic scores, masks, scores, and aux_outputs.
         """
+        # Handle legacy interface
+        if x is not None and sp_feats is None:
+            sp_feats = x
+        if sp_feats is None or p_feats is None or super_points is None:
+            raise ValueError("ScanNetMixQueryDecoder requires sp_feats, p_feats, and super_points")
+            
+        return self._forward_iter_pred_impl(sp_feats, p_feats, queries, super_points, prev_queries)
+    
+    def _forward_iter_pred_impl(self, sp_feats, p_feats, queries, super_points, prev_queries=None):
+        """Implementation of iterative forward pass."""
         cls_preds, sem_preds, pred_scores, pred_masks = [], [], [], []
         object_queries, pred_bboxes = [], []
-        inst_feats = [self.input_proj(y) for y in sp_feats] if "SP" in self.cross_attn_mode else None
-        inst_pts_feats = [self.input_proj(y) if self.share_attn_mlp else self.input_pts_proj(y)
-             for y in p_feats] if "P" in self.cross_attn_mode else None
+        
+        # 修复：移除动态初始化逻辑，input_proj已在__init__中创建
+        # 检查维度兼容性，如果需要可以添加适配器
+        if "SP" in self.cross_attn_mode and sp_feats:
+            actual_in_channels = sp_feats[0].shape[-1]
+            
+            # 如果维度不匹配且没有适配器，创建适配器
+            if actual_in_channels != self.expected_in_channels and self.input_adapter is None:
+                print(f"[QueryDecoder] 维度不匹配: 输入{actual_in_channels} vs 期望{self.expected_in_channels}，创建适配器")
+                self.input_adapter = nn.Sequential(
+                    nn.Linear(actual_in_channels, self.expected_in_channels),
+                    nn.ReLU(),
+                    nn.LayerNorm(self.expected_in_channels)
+                ).to(sp_feats[0].device)
+            # elif actual_in_channels == self.expected_in_channels:
+            #     # 移除冗余日志输出：使用预初始化的input_proj
+            #     pass
+        
+        # 应用input_proj，考虑适配器
+        if "SP" in self.cross_attn_mode:
+            if self.input_adapter is not None:
+                # 需要先适配维度
+                inst_feats = [self.input_proj(self.input_adapter(y)) for y in sp_feats]
+            else:
+                # 直接使用input_proj
+                inst_feats = [self.input_proj(y) for y in sp_feats]
+        else:
+            inst_feats = None
+
+        # 修复：处理点特征，input_proj已在__init__中创建，只需检查适配器
+        if "P" in self.cross_attn_mode and p_feats:
+            actual_in_channels = p_feats[0].shape[-1]
+            
+            # 如果维度不匹配且没有适配器，创建适配器
+            if actual_in_channels != self.expected_in_channels and self.input_adapter is None:
+                print(f"[QueryDecoder] 点特征维度不匹配: 输入{actual_in_channels} vs 期望{self.expected_in_channels}，创建适配器")
+                self.input_adapter = nn.Sequential(
+                    nn.Linear(actual_in_channels, self.expected_in_channels),
+                    nn.ReLU(),
+                    nn.LayerNorm(self.expected_in_channels)
+                ).to(p_feats[0].device)
+            
+            # 应用点特征投影
+            if self.share_attn_mlp:
+                if self.input_adapter is not None:
+                    inst_pts_feats = [self.input_proj(self.input_adapter(y)) for y in p_feats]
+                else:
+                    inst_pts_feats = [self.input_proj(y) for y in p_feats]
+            else:
+                inst_pts_feats = [self.input_pts_proj(y) for y in p_feats]
+        else:
+            inst_pts_feats = None
+
         mask_feats = [self.x_mask(y) for y in sp_feats] if "SP" in self.mask_pred_mode else None
         mask_pts_feats = [self.x_mask(y) if self.share_mask_mlp else self.x_pts_mask(y)
              for y in p_feats] if "P" in self.mask_pred_mode else None
@@ -610,17 +695,25 @@ class ScanNetMixQueryDecoder(QueryDecoder):
             if self.cross_attn_mode[i+1] == "SP" and self.mask_pred_mode[i] == "SP":
                 queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
             elif self.cross_attn_mode[i+1] == "SP" and self.mask_pred_mode[i] == "P":   # current method, change P mask to SP
-                xyz_weights = torch.chunk(super_points[1], len(super_points[0]), dim=0)
-                attn_mask_score = [scatter_mean(att.float() * xyz_w.view(1, -1), sp, dim=1)
-                     for att, sp, xyz_w in zip(attn_mask, super_points[0], xyz_weights)]
-                attn_mask = [(att > 0.5).bool() for att in attn_mask_score] # > 0.5, not <
-                # If attn_mask has all-True row, the result of CA will be nan
-                for j in range(len(attn_mask)):
-                    mask = ~(attn_mask_score[j] == attn_mask_score[j].min(dim=1, keepdim=True)[0])
-                    attn_mask[j] *= mask
+                if attn_mask is not None:
+                    xyz_weights = torch.chunk(super_points[1], len(super_points[0]), dim=0)
+                    attn_mask_score = [scatter_mean(att.float() * xyz_w.view(1, -1), sp, dim=1)
+                         for att, sp, xyz_w in zip(attn_mask, super_points[0], xyz_weights)]
+                    attn_mask_score = [torch.nan_to_num(att, nan=0.0, posinf=1.0, neginf=0.0)
+                                       for att in attn_mask_score]
+                    attn_mask = [(att > 0.5).bool() for att in attn_mask_score] # > 0.5, not <
+                    # If attn_mask has all-True row, the result of CA will be nan
+                    for j in range(len(attn_mask)):
+                        mask = ~(attn_mask_score[j] == attn_mask_score[j].min(dim=1, keepdim=True)[0])
+                        attn_mask[j] = attn_mask[j] & mask
+                        all_true = attn_mask[j].all(dim=1)
+                        if all_true.any():
+                            attn_mask[j] = attn_mask[j].clone()
+                            attn_mask[j][all_true] = False
                 queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
             elif self.cross_attn_mode[i+1] == "P" and self.mask_pred_mode[i] == "SP":
-                attn_mask = [att[:, sp] for att, sp in zip(attn_mask, super_points[0])]
+                if attn_mask is not None:
+                    attn_mask = [att[:, sp] for att, sp in zip(attn_mask, super_points[0])]
                 queries = self.cross_attn_layers[i](inst_pts_feats, queries, attn_mask)
             elif self.cross_attn_mode[i+1] == "P" and self.mask_pred_mode[i] == "P":
                 queries = self.cross_attn_layers[i](inst_pts_feats, queries, attn_mask)
@@ -652,20 +745,41 @@ class ScanNetMixQueryDecoder(QueryDecoder):
             bboxes=pred_bboxes[-1],
             aux_outputs=aux_outputs)
     
-    def forward(self, sp_feats, p_feats, queries, super_points, prev_queries=None):
-        """Forward pass.
+    def forward(self, x=None, queries=None, sp_feats=None, p_feats=None, super_points=None, prev_queries=None, **kwargs):
+        """Forward pass for ScanNetMixQueryDecoder - supports both interfaces.
         
         Args:
-            x (List[Tensor]): of len batch_size, each of shape
-                (n_points_i, in_channels).
-            queries (List[Tensor], optional): of len batch_size, each of shape
-                (n_points_i, in_channles).
+            x: Legacy interface compatibility (unused)
+            queries: Query tensors
+            sp_feats: Super-point features  
+            p_feats: Point features
+            super_points: Super-point information
+            prev_queries: Previous queries (optional)
+        
+        Returns:
+            Dict: with labels, masks, scores, and possibly aux_outputs.
+        """
+        # Support legacy interface by redirecting to new interface
+        if sp_feats is not None and p_feats is not None and super_points is not None:
+            return self.forward_mix(sp_feats, p_feats, queries, super_points, prev_queries)
+        else:
+            raise NotImplementedError("ScanNetMixQueryDecoder requires sp_feats, p_feats, and super_points")
+    
+    def forward_mix(self, sp_feats, p_feats, queries, super_points, prev_queries=None):
+        """Forward pass implementation for ScanNetMixQueryDecoder.
+        
+        Args:
+            sp_feats: Super-point features
+            p_feats: Point features  
+            queries: Query tensors
+            super_points: Super-point information
+            prev_queries: Previous queries (optional)
         
         Returns:
             Dict: with labels, masks, scores, and possibly aux_outputs.
         """
         if self.iter_pred:
-            return self.forward_iter_pred(sp_feats, p_feats, queries, super_points, prev_queries)
+            return self._forward_iter_pred_impl(sp_feats, p_feats, queries, super_points, prev_queries)
         else:
             raise NotImplementedError("No simple forward!!!")
 

@@ -9,12 +9,13 @@ from mmdet3d.structures import BaseInstance3DBoxes, Det3DDataSample, PointData
 from mmdet3d.structures.points import BasePoints
 import math
 import PIL.Image as Image
+import torch
 
 @TRANSFORMS.register_module()
 class Pack3DDetInputs_(Pack3DDetInputs):
     """Just add elastic_coords, sp_pts_mask, and gt_sp_masks.
     """
-    INPUTS_KEYS = ['points', 'img', 'elastic_coords','img_path']
+    INPUTS_KEYS = ['points', 'img', 'imgs', 'cam_info', 'elastic_coords', 'img_path', 'clip_pix', 'clip_global']
     SEG_KEYS = [
         'gt_seg_map',
         'pts_instance_mask',
@@ -72,29 +73,54 @@ class Pack3DDetInputs_(Pack3DDetInputs):
             del results['pose']
     
         if 'img' in results:
-            if isinstance(results['img'], list):
-                # process multiple imgs in single frame
-                imgs = np.stack(results['img'], axis=0)
-                if imgs.flags.c_contiguous:
-                    imgs = to_tensor(imgs).permute(0, 3, 1, 2).contiguous()
-                else:
-                    imgs = to_tensor(
-                        np.ascontiguousarray(imgs.transpose(0, 3, 1, 2)))
-                results['img'] = imgs
+            img = results['img']
+            # 统一将 img 转成 (C,H,W) 的 torch.Tensor，兼容 numpy / tensor / list 等多种格式
+            if isinstance(img, list):
+                # 多张图的情况（当前单帧流程一般不会走到这里）
+                tensor_list = []
+                for im in img:
+                    if isinstance(im, torch.Tensor):
+                        t = im.float()
+                        if t.dim() == 2:
+                            t = t.unsqueeze(0)
+                        elif t.dim() == 3 and t.shape[0] not in (1, 3) and t.shape[-1] in (1, 3):
+                            # (H,W,C) -> (C,H,W)
+                            t = t.permute(2, 0, 1).contiguous()
+                        tensor_list.append(t)
+                    else:
+                        arr = np.asarray(im)
+                        if arr.ndim < 3:
+                            arr = np.expand_dims(arr, -1)
+                        if arr.flags.c_contiguous:
+                            t = to_tensor(arr).permute(2, 0, 1).contiguous()
+                        else:
+                            t = to_tensor(
+                                np.ascontiguousarray(arr.transpose(2, 0, 1)))
+                        tensor_list.append(t)
+                results['img'] = tensor_list
             else:
-                img = results['img']
-                if len(img.shape) < 3:
-                    img = np.expand_dims(img, -1)
-                # To improve the computational speed by by 3-5 times, apply:
-                # `torch.permute()` rather than `np.transpose()`.
-                # Refer to https://github.com/open-mmlab/mmdetection/pull/9533
-                # for more details
-                if img.flags.c_contiguous:
-                    img = to_tensor(img).permute(2, 0, 1).contiguous()
+                if isinstance(img, torch.Tensor):
+                    t = img.float()
+                    if t.dim() == 2:
+                        t = t.unsqueeze(0)
+                    elif t.dim() == 3 and t.shape[0] not in (1, 3) and t.shape[-1] in (1, 3):
+                        # (H,W,C) -> (C,H,W)
+                        t = t.permute(2, 0, 1).contiguous()
+                    results['img'] = t
                 else:
-                    img = to_tensor(
-                        np.ascontiguousarray(img.transpose(2, 0, 1)))
-                results['img'] = img
+                    arr = np.asarray(img)
+                    if arr.ndim < 3:
+                        arr = np.expand_dims(arr, -1)
+                    # To improve the computational speed by by 3-5 times, apply:
+                    # `torch.permute()` rather than `np.transpose()`.
+                    # Refer to https://github.com/open-mmlab/mmdetection/pull/9533
+                    # for more details
+                    if arr.flags.c_contiguous:
+                        t = to_tensor(arr).permute(2, 0, 1).contiguous()
+                    else:
+                        t = to_tensor(
+                            np.ascontiguousarray(arr.transpose(2, 0, 1)))
+                    results['img'] = t
 
         for key in [
                 'proposals', 'gt_bboxes', 'gt_bboxes_ignore', 'gt_labels',
@@ -163,6 +189,23 @@ class Pack3DDetInputs_(Pack3DDetInputs):
         packed_results = dict()
         packed_results['data_samples'] = data_sample
         packed_results['inputs'] = inputs
+
+        # 轻量调试：仅前几次打印 inputs 键，确认 cam_info 是否被打包
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        if self._debug_count < 3:
+            # 多 worker 下每个 worker 都会各自触发 debug print；
+            # 仅在 worker0（或 num_workers=0）输出，减少日志噪声。
+            try:
+                from torch.utils.data import get_worker_info
+                wi = get_worker_info()
+                should_print = (wi is None) or (getattr(wi, 'id', 0) == 0)
+            except Exception:
+                should_print = True
+            if should_print:
+                print(f"[Pack3DDetInputs_] keys={self.keys}, inputs_keys={list(inputs.keys())}")
+            self._debug_count += 1
+
         return packed_results
 
 
@@ -170,7 +213,7 @@ class Pack3DDetInputs_(Pack3DDetInputs):
 class Pack3DDetInputs_Online(Pack3DDetInputs):
     """Just add elastic_coords, sp_pts_mask, and gt_sp_masks.
     """
-    INPUTS_KEYS = ['points', 'img', 'elastic_coords', 'img_paths']
+    INPUTS_KEYS = ['points', 'img', 'imgs', 'cam_info', 'elastic_coords', 'img_paths', 'clip_pix', 'clip_global']
     SEG_KEYS = [
         'gt_seg_map',
         'pts_instance_mask',

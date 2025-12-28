@@ -1,30 +1,96 @@
-work_dirs 
-vis_demo/results
+####################################
+# Project outputs
+logs/
+tensorboard/
+vis_demo/results/
+output/
+outputs/
+work_dirs/
+experiments/
+checkpoints/
+wintermute_outputs/
+wintermute_logs/
+pose_centered/
+scannet*_instance_data/
+*.lmdb
+wandb/
+mlruns/
 
-*.pyc
+####################################
+# Data
+data/
+
+####################################
+# Large binary files
+*.pth
+*.pth.tar
+*.ckpt
+*.bin
+*.tar
+*.np[yz]
+
+####################################
+# Python
+*.py[cod]
 __pycache__/
-*.pt
+**/__pycache__/
+**/*.py[cod]
 
-# C extensions
+# Build / C-extensions
 *.so
-
-# Distribution / packaging
-.Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
+develop-eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
 wheels/
 pip-wheel-metadata/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
 MANIFEST
+*.a
+*.dll
+
+# third-party compiled dirs
+thirdparty/**/build/
+thirdparty/**/dist/
+thirdparty/**/*.so
+thirdparty/**/*.o
+
+####################################
+# Tests / type checking
+.pytest_cache/
+.mypy_cache/
+*.coverage
+coverage/
+
+####################################
+# Env / tooling
+.env/
+.venv/
+.vscode/
+.idea/
+*.log
+*.lock
+.cache/
+.pip/
+nohup.out
+
+####################################
+# Notebooks
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
+
+####################################
+# OS
+.DS_Store
+Thumbs.db
+thirdparty/FastSAM
+
+####################################
+# Temporary / editor files
+*~
+*.swp
+*.swo
+*.tmp
+tmp/
+vis_demo/200_dinov2_feat.pt

@@ -171,6 +171,10 @@ class InstanceCriterion:
                                                       insts, indices):
             if len(inst) == 0:
                 continue
+            # matcher 可能返回空匹配（例如 query_masks 全 False 的列），
+            # 对空 tensor 做 BCE(mean) 会产生 NaN。
+            if idx_q.numel() == 0 or idx_gt.numel() == 0:
+                continue
 
             pred_mask = mask[idx_q]
             tgt_mask = inst.sp_masks[idx_gt]
@@ -276,6 +280,10 @@ class InstanceCriterion:
                                                       insts, indices):
             if len(inst) == 0:
                 continue
+            # matcher 可能返回空匹配（例如 query_masks 全 False 的列），
+            # 对空 tensor 做 BCE(mean) 会产生 NaN。
+            if idx_q.numel() == 0 or idx_gt.numel() == 0:
+                continue
             pred_mask = mask[idx_q]
             tgt_mask = inst.sp_masks[idx_gt]
             mask_bce_losses.append(F.binary_cross_entropy_with_logits(
@@ -354,7 +362,11 @@ class MixedInstanceCriterion:
     def __init__(self, matcher, bbox_loss, loss_weight, non_object_weight, num_classes,
                  fix_dice_loss_weight, iter_matcher, fix_mean_loss=False):
         self.matcher = TASK_UTILS.build(matcher)
-        self.bbox_loss = MODELS.build(bbox_loss)
+        # 若 bbox_loss 为 None 或空 dict 则不计算 bbox 相关损失
+        if bbox_loss and isinstance(bbox_loss, dict) and bbox_loss.get('type', None):
+            self.bbox_loss = MODELS.build(bbox_loss)
+        else:
+            self.bbox_loss = None
         class_weight = [1] * num_classes + [non_object_weight]
         self.class_weight = class_weight
         self.loss_weight = loss_weight
@@ -425,6 +437,10 @@ class MixedInstanceCriterion:
                                                       pred_bboxes, centers, insts, indices):
             if len(inst) == 0:
                 continue
+            # matcher 可能返回空匹配（例如 query_masks 全 False 的列），
+            # 对空 tensor 做 BCE(mean) 会产生 NaN。
+            if idx_q.numel() == 0 or idx_gt.numel() == 0:
+                continue
 
             pred_mask = mask[idx_q]
             tgt_mask = inst.sp_masks[idx_gt] if mode == "SP" else inst.p_masks[idx_gt]
@@ -433,7 +449,7 @@ class MixedInstanceCriterion:
             mask_dice_losses.append(dice_loss(pred_mask, tgt_mask.float()))
 
             # check if skip bbox loss
-            if bbox is not None:
+            if self.bbox_loss is not None and bbox is not None:
                 pred_bbox = bbox[idx_q]
                 sp_center = center[idx_q]
                 tgt_bbox = inst.bboxes_3d[idx_gt, :6]
@@ -596,6 +612,10 @@ class MixedInstanceCriterion:
                                                       pred_bboxes, centers, insts, indices):
             if len(inst) == 0:
                 continue
+            # matcher 可能返回空匹配（例如 query_masks 全 False 的列），
+            # 对空 tensor 做 BCE(mean) 会产生 NaN。
+            if idx_q.numel() == 0 or idx_gt.numel() == 0:
+                continue
             pred_mask = mask[idx_q]
             tgt_mask = inst.p_masks[idx_gt]
             mask_bce_losses.append(F.binary_cross_entropy_with_logits(
@@ -603,7 +623,7 @@ class MixedInstanceCriterion:
             mask_dice_losses.append(dice_loss(pred_mask, tgt_mask.float()))
 
             # check if skip bbox loss
-            if bbox is not None:
+            if self.bbox_loss is not None and bbox is not None:
                 pred_bbox = bbox[idx_q]
                 sp_center = center[idx_q]
                 tgt_bbox = inst.bboxes_3d[idx_gt, :6]

@@ -102,7 +102,12 @@ def show_result(points,
     mmengine.mkdir_or_exist(result_path)
 
     if show:
-        from .open3d_vis import Visualizer
+        try:
+            # When imported as a package: demo.show_result
+            from .open3d_vis import Visualizer  # type: ignore
+        except Exception:
+            # When executed as a script from within demo/: python show_result.py
+            from open3d_vis import Visualizer  # type: ignore
 
         vis = Visualizer(points)
         if pred_bboxes is not None:
@@ -198,7 +203,10 @@ def show_seg_result(points,
     # online visualization of segmentation mask
     # we show three masks in a row, scene_points, gt_mask, pred_mask
     if show:
-        from .open3d_vis import Visualizer
+        try:
+            from .open3d_vis import Visualizer  # type: ignore
+        except Exception:
+            from open3d_vis import Visualizer  # type: ignore
         mode = 'xyzrgb' if points.shape[1] == 6 else 'xyz'
         vis = Visualizer(points, mode=mode)
         if gt_seg is not None:
