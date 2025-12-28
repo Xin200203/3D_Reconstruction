@@ -334,6 +334,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
                  with_rec=False,
                  cat_rec=False,
                  use_FF=False,
+                 rec_data_root: Optional[str] = None,
                  backend_args: Optional[dict] = None,
                  dataset_type = 'scannet200') -> None:
         self.shift_height = shift_height
@@ -361,6 +362,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
         self.with_rec = with_rec
         self.cat_rec = cat_rec
         self.use_FF = use_FF
+        self.rec_data_root = rec_data_root
         self.backend_args = backend_args
         self.dataset_type = dataset_type
         
@@ -480,9 +482,36 @@ class LoadAdjacentDataFromFile(BaseTransform):
             dict: The dict containing loaded 3D mask annotations.
         """
         scene_name = pts_filenames[0].split('/')[-2]
-        rec_pts_filename = 'data/' + self.dataset_type + '/points/' + scene_name + '.bin'
-        rec_ins_path = 'data/' + self.dataset_type + '/instance_mask/' + scene_name + '.bin'
-        rec_sem_path = 'data/' + self.dataset_type + '/semantic_mask/' + scene_name + '.bin'
+        frame_id = os.path.splitext(os.path.basename(pts_filenames[0]))[0]
+
+        # Prefer MV-style paths derived from current frame file:
+        #   .../points/<scene>/<frame>.bin
+        #   .../instance_mask/<scene>/<frame>.bin
+        #   .../semantic_mask/<scene>/<frame>.bin
+        mv_rec_pts = pts_filenames[0]
+        mv_rec_ins = mv_rec_pts.replace('/points/', '/instance_mask/')
+        mv_rec_sem = mv_rec_pts.replace('/points/', '/semantic_mask/')
+
+        if os.path.exists(mv_rec_pts) and os.path.exists(mv_rec_ins) and os.path.exists(mv_rec_sem):
+            rec_pts_filename = mv_rec_pts
+            rec_ins_path = mv_rec_ins
+            rec_sem_path = mv_rec_sem
+            # segment files (if any) would live under the same dataset root
+            # as points/instance_mask/semantic_mask.
+            seg_base = os.path.dirname(os.path.dirname(os.path.dirname(mv_rec_pts)))
+        else:
+            # Fallback to legacy rec naming: <scene>_<frame>.bin under rec_data_root.
+            rec_stem = f'{scene_name}_{frame_id}'
+            if self.rec_data_root is not None:
+                rec_pts_filename = os.path.join(self.rec_data_root, 'points', rec_stem + '.bin')
+                rec_ins_path = os.path.join(self.rec_data_root, 'instance_mask', rec_stem + '.bin')
+                rec_sem_path = os.path.join(self.rec_data_root, 'semantic_mask', rec_stem + '.bin')
+                seg_base = self.rec_data_root
+            else:
+                rec_pts_filename = os.path.join('data', self.dataset_type, 'points', rec_stem + '.bin')
+                rec_ins_path = os.path.join('data', self.dataset_type, 'instance_mask', rec_stem + '.bin')
+                rec_sem_path = os.path.join('data', self.dataset_type, 'semantic_mask', rec_stem + '.bin')
+                seg_base = os.path.join('data', self.dataset_type)
         try:
             rec_pts = np.frombuffer(get(rec_pts_filename, backend_args=self.backend_args), dtype=np.float32)
             rec_ins = np.frombuffer(get(rec_ins_path, backend_args=self.backend_args), dtype=np.int64)
@@ -496,14 +525,19 @@ class LoadAdjacentDataFromFile(BaseTransform):
         segment_ids = np.array([])
         
         if self.dataset_type == 'scannet' or self.dataset_type == 'scannet200':
-            segment_path = 'data/' + self.dataset_type + '/scans/' + scene_name + '/' + scene_name + '_vh_clean_2.0.010000.segs.json'
-            segment_ids = np.array(json.load(open(segment_path))['segIndices'])
+            segment_path = os.path.join(seg_base, 'scans', scene_name,
+                                        scene_name + '_vh_clean_2.0.010000.segs.json')
+            if os.path.exists(segment_path):
+                segment_ids = np.array(json.load(open(segment_path))['segIndices'])
         elif self.dataset_type == '3RScan':
-            segment_path = 'data/' + self.dataset_type + '/3RScan/' + scene_name + '/' + 'mesh.refined.0.010000.segs.v2.json'
-            segment_ids = np.array(json.load(open(segment_path))['segIndices'])
+            segment_path = os.path.join(seg_base, '3RScan', scene_name,
+                                        'mesh.refined.0.010000.segs.v2.json')
+            if os.path.exists(segment_path):
+                segment_ids = np.array(json.load(open(segment_path))['segIndices'])
         elif self.dataset_type == 'scenenn':
-            segment_path = 'data/' + self.dataset_type + '/mesh_segs/' + scene_name + '.segs.json'
-            segment_ids = np.array(json.load(open(segment_path))['segIndices'])
+            segment_path = os.path.join(seg_base, 'mesh_segs', scene_name + '.segs.json')
+            if os.path.exists(segment_path):
+                segment_ids = np.array(json.load(open(segment_path))['segIndices'])
 
         rec_pts = rec_pts.reshape(-1, self.load_dim).copy()
         if self.dataset_type == 'scenenn':

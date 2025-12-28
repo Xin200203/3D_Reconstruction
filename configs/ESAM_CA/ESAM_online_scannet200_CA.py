@@ -91,7 +91,11 @@ model = dict(
         merge_type='learnable_online'))
 
 dataset_type = 'ScanNet200SegMVDataset_'
-data_root = 'data/scannet200-mv/'
+data_root = '/datadisk1/xxy/data/data-ESAM/scannet200-sv/'
+
+# Reconstruction (rec_*) files are loaded by LoadAdjacentDataFromFile via a
+# separate root. MV runs folders usually don't contain scene-level rec files.
+rec_data_root = '/datadisk1/xxy/data/data-ESAM/scannet200-sv'
 
 # floor and chair are changed
 class_names = [
@@ -151,6 +155,7 @@ train_pipeline = [
         coord_type='DEPTH',
         shift_height=False,
         use_color=True,
+        use_FF=True,
         load_dim=6,
         use_dim=[0, 1, 2, 3, 4, 5],
         num_frames=8,
@@ -161,6 +166,7 @@ train_pipeline = [
         with_seg_3d=True,
         with_sp_mask_3d=True,
         with_rec=use_bbox, cat_rec=use_bbox,
+        rec_data_root=rec_data_root,
         dataset_type='scannet200'),
     dict(type='SwapChairAndFloorWithRec' if use_bbox else 'SwapChairAndFloor'),
     dict(type='PointSegClassMappingWithRec' if use_bbox else 'PointSegClassMapping'),
@@ -206,6 +212,7 @@ test_pipeline = [
         coord_type='DEPTH',
         shift_height=False,
         use_color=True,
+        use_FF=True,
         load_dim=6,
         use_dim=[0, 1, 2, 3, 4, 5],
         num_frames=-1,
@@ -216,6 +223,7 @@ test_pipeline = [
         with_seg_3d=True,
         with_sp_mask_3d=True,
         with_rec=True,
+        rec_data_root=rec_data_root,
         dataset_type='scannet200'),
     dict(type='SwapChairAndFloorWithRec'),
     dict(type='PointSegClassMappingWithRec'),
@@ -246,7 +254,7 @@ train_dataloader = dict(
     # num_workers=0,
     dataset=dict(
         type=dataset_type,
-        ann_file='scannet200_mv_oneformer3d_infos_train.pkl',
+        ann_file='scannet200_sv_oneformer3d_infos_train.pkl',
         data_root=data_root,
         metainfo=dict(classes=class_names),
         pipeline=train_pipeline,
@@ -258,7 +266,7 @@ val_dataloader = dict(
     # num_workers=0,
     dataset=dict(
         type=dataset_type,
-        ann_file='scannet200_mv_oneformer3d_infos_val.pkl',
+        ann_file='scannet200_sv_oneformer3d_infos_val.pkl',
         data_root=data_root,
         metainfo=dict(classes=class_names),
         pipeline=test_pipeline,
@@ -320,6 +328,6 @@ default_hooks = dict(
 load_from = 'work_dirs/ESAM_sv_scannet200_CA/epoch_128.pth'
 
 # training schedule for 1x
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=128)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
