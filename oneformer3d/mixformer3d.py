@@ -86,6 +86,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.train_cfg = train_cfg
         # DINO 调试计数（限制打印次数）
         self._dino_debug_count = 0
+        # 仅在需要时开启调试日志，避免污染纯 3D baseline 的训练/测试输出
+        self._dino_debug = os.environ.get('DINO_DEBUG', '') == '1'
 
     def initialize_training_optimization(self):
         """Placeholder for compatibility; no-op in lightweight build."""
@@ -124,6 +126,12 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
 
         # === DINO FPN 构建（单帧）===
         dino_feats: Optional[List[ME.SparseTensor]] = None
+        backbone_use_dino = bool(getattr(self.backbone, 'use_dino', False))
+        if (self.dino_require or self.dino_online_only or getattr(self, 'dino', None) is not None) and (not backbone_use_dino):
+            raise RuntimeError(
+                "DINO is enabled in model config, but the 3D backbone is not configured for DINO injection. "
+                "Set `model.backbone.dino_dim` (e.g. 1024) to enable `backbone.use_dino=True`."
+            )
 
         if getattr(self, 'dino_online_only', False):
             unexpected = []
@@ -139,7 +147,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     "Remove related pipeline steps / keys to ensure only online DINO is used."
                 )
         # 轻量调试：明确区分“离线/外部特征是否提供” vs “是否将在线构建”
-        if self._dino_debug_count < 5:
+        if self._dino_debug and self._dino_debug_count < 5:
             cam_info_field = batch_inputs_dict.get('cam_info', None)
             if isinstance(cam_info_field, list):
                 cam_len = len(cam_info_field)
@@ -181,25 +189,25 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             self._dino_debug_count += 1
 
         # 1) 优先使用外部提供的 dino_fpn / dino_feats（完全跳过内部构建）
-        if 'dino_fpn' in batch_inputs_dict:
+        if backbone_use_dino and 'dino_fpn' in batch_inputs_dict:
             try:
                 dino_feats = batch_inputs_dict['dino_fpn']
-                if self._dino_debug_count < 3:
+                if self._dino_debug and self._dino_debug_count < 3:
                     print("[DINO] use provided dino_fpn (single-frame)")
                     self._dino_debug_count += 1
             except Exception:
                 dino_feats = None
-        elif 'dino_feats' in batch_inputs_dict:
+        elif backbone_use_dino and 'dino_feats' in batch_inputs_dict:
             try:
                 dino_feats = batch_inputs_dict['dino_feats']
-                if self._dino_debug_count < 3:
+                if self._dino_debug and self._dino_debug_count < 3:
                     print("[DINO] use provided dino_feats (single-frame)")
                     self._dino_debug_count += 1
             except Exception:
                 dino_feats = None
 
         # 2) 若未提供，且模型中挂载了 DINOv2Backbone，则在线从 img + cam_info 构建 FPN
-        if dino_feats is None and getattr(self, 'dino', None) is not None:
+        if backbone_use_dino and dino_feats is None and getattr(self, 'dino', None) is not None:
             imgs = batch_inputs_dict.get('img', None)
             cam_raw = batch_inputs_dict.get('cam_info', None)
             if getattr(self, 'dino_require', False) and (imgs is None or cam_raw is None):
@@ -280,7 +288,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     dino_feats = self._build_dino_fpn_online(
                         points_list, feat_maps, cam_metas, batch_data_samples,
                         elastic_coords=elastic_coords)
-                    if dino_feats is not None and self._dino_debug_count < 3:
+                    if self._dino_debug and dino_feats is not None and self._dino_debug_count < 3:
                         shapes = [x.shape for x in dino_feats]
                         strides = [x.tensor_stride for x in dino_feats]
                         print(f"[DINO] build from online DINO backbone, shapes={shapes}, strides={strides}")
@@ -288,7 +296,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 except Exception as e:
                     if getattr(self, 'dino_require', False):
                         raise RuntimeError(f"DINO required but online build failed: {repr(e)}")
-                    if self._dino_debug_count < 3:
+                    if self._dino_debug and self._dino_debug_count < 3:
                         print(f"[DINO][error] build from online DINO failed: {e}")
                         self._dino_debug_count += 1
                     dino_feats = None
@@ -308,7 +316,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 )
 
         # 3) 兼容旧逻辑：直接给出点级 DINO 特征或 clip_pix
-        if dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
+        if backbone_use_dino and dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
             try:
                 coords_list, feats_list = [], []
                 for b_idx, pts in enumerate(points_list):
@@ -320,32 +328,32 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 coords_batch, feats_batch = ME.utils.sparse_collate(
                     coords_list, feats_list, device=feats_list[0].device)
                 dino_feats = build_sparse_fpn(coords_batch, feats_batch)
-                if self._dino_debug_count < 3:
+                if self._dino_debug and self._dino_debug_count < 3:
                     shapes = [x.shape for x in dino_feats]
                     strides = [x.tensor_stride for x in dino_feats]
                     print(f"[DINO] build from dino_point_feats, shapes={shapes}, strides={strides}")
                     self._dino_debug_count += 1
             except Exception as e:
-                if self._dino_debug_count < 3:
+                if self._dino_debug and self._dino_debug_count < 3:
                     print(f"[DINO][error] build from dino_point_feats failed: {e}")
                     self._dino_debug_count += 1
                 dino_feats = None
 
-        if dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
+        if backbone_use_dino and dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
             try:
                 dino_feats = self._build_dino_fpn_from_clip(batch_inputs_dict)
-                if dino_feats is not None and self._dino_debug_count < 3:
+                if self._dino_debug and dino_feats is not None and self._dino_debug_count < 3:
                     shapes = [x.shape for x in dino_feats]
                     strides = [x.tensor_stride for x in dino_feats]
                     print(f"[DINO] build from clip_pix, shapes={shapes}, strides={strides}")
                     self._dino_debug_count += 1
             except Exception as e:
-                if self._dino_debug_count < 3:
+                if self._dino_debug and self._dino_debug_count < 3:
                     print(f"[DINO][error] build from clip_pix failed: {e}")
                     self._dino_debug_count += 1
                 dino_feats = None
 
-        if dino_feats is None and self._dino_debug_count < 3:
+        if self._dino_debug and dino_feats is None and self._dino_debug_count < 3:
             print("[DINO] no dino_feats used (single-frame)")
             self._dino_debug_count += 1
 
@@ -891,7 +899,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         clip_raw = batch_inputs_dict.get('clip_pix', None)
         cam_raw = batch_inputs_dict.get('cam_info', None)
         if points_list is None or clip_raw is None or cam_raw is None:
-            if self._dino_debug_count < 3:
+            if self._dino_debug and self._dino_debug_count < 3:
                 print(f"[DINO][warn] skip build_from_clip: points={points_list is not None}, clip={clip_raw is not None}, cam_info={cam_raw is not None}")
                 self._dino_debug_count += 1
             return None
@@ -924,7 +932,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 clip_list = [clip_tensor for _ in range(len(points_list))]
 
         if not clip_list:
-            if self._dino_debug_count < 3:
+            if self._dino_debug and self._dino_debug_count < 3:
                 print("[DINO][warn] clip_list empty after normalization")
                 self._dino_debug_count += 1
             return None
@@ -998,14 +1006,14 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 )
                 if not hasattr(self, '_dino_caminfo_log'):
                     self._dino_caminfo_log = 0
-                if self._dino_caminfo_log < 3:
+                if self._dino_debug and self._dino_caminfo_log < 3:
                     intr_arr = np.asarray(raw_intr)
                     pose_shape = None if pose is None else np.asarray(pose).shape
                     print(f"[DINO][cam_debug] b={b_idx} intr_raw_shape={intr_arr.shape} intr_raw={intr_arr} pose_shape={pose_shape} max_depth={max_depth} feat_hw=({Hf},{Wf})")
                     self._dino_caminfo_log += 1
                 if not hasattr(self, '_dino_proj_log_count'):
                     self._dino_proj_log_count = 0
-                if self._dino_proj_log_count < 5:
+                if self._dino_debug and self._dino_proj_log_count < 5:
                     depth = xyz_cam[:, 2]
                     depth_valid = (depth > MIN_DEPTH) & (depth < max_depth)
                     depth_ratio = float(depth_valid.float().mean().item()) if depth.numel() > 0 else 0.0
@@ -1023,7 +1031,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 sampled = sample_img_feat(clip_tensor.unsqueeze(0), uv_feat, valid, align_corners=align_corners)
                 sampled = sampled.to(pts.device)
             except Exception as e:
-                if self._dino_debug_count < 3:
+                if self._dino_debug and self._dino_debug_count < 3:
                     print(f"[DINO][error] projection/sample failed: {e}")
                     self._dino_debug_count += 1
                 continue
@@ -1036,7 +1044,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         if not coords_list:
             return None
         # 调试：观察 collate 前各块形状
-        if self._dino_debug_count < 5:
+        if self._dino_debug and self._dino_debug_count < 5:
             try:
                 print(f"[DINO][debug] build_from_clip before collate: "
                       f"n_chunks={len(coords_list)}, "
@@ -1046,17 +1054,17 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         try:
             coords_batch, feats_batch = ME.utils.sparse_collate(
                 coords_list, feats_list, device=feats_list[0].device)
-            if self._dino_debug_count < 5:
+            if self._dino_debug and self._dino_debug_count < 5:
                 print(f"[DINO][debug] after sparse_collate: "
                       f"coords_batch={coords_batch.shape}, feats_batch={feats_batch.shape}")
             fpn = build_sparse_fpn(coords_batch, feats_batch)
-            if self._dino_debug_count < 5:
+            if self._dino_debug and self._dino_debug_count < 5:
                 shapes = [x.shape for x in fpn]
                 strides = [x.tensor_stride for x in fpn]
                 print(f"[DINO][debug] FPN built: shapes={shapes}, strides={strides}")
             return fpn
         except Exception as e:
-            if self._dino_debug_count < 5:
+            if self._dino_debug and self._dino_debug_count < 5:
                 print(f"[DINO][error] sparse_collate/build_sparse_fpn failed: {repr(e)}")
             return None
 
@@ -1642,6 +1650,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.map_to_rec_pcd = map_to_rec_pcd
         self._dino_debug_count = 0
+        self._dino_debug = os.environ.get('DINO_DEBUG', '') == '1'
         self.init_weights()
     
     def init_weights(self):
@@ -1659,8 +1668,9 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         未命中上述任一分支时，dino_feats=None，U-Net 注入自动跳过。
         """
         batch_size = len(batch_data_samples)
+        backbone_use_dino = bool(getattr(self.backbone, 'use_dino', False))
         # 调试：明确区分“外部是否提供离线 DINO” vs “是否具备在线/投影构建条件”（仅前几次打印）
-        if self._dino_debug_count < 3:
+        if self._dino_debug and self._dino_debug_count < 3:
             provided_offline = {
                 'dino_fpn': 'dino_fpn' in batch_inputs_dict,
                 'dino_feats': 'dino_feats' in batch_inputs_dict,
@@ -1676,34 +1686,35 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     clip_shapes = cp.shape
             cam_raw = batch_inputs_dict.get('cam_info', None)
             cam_info_len = len(cam_raw) if isinstance(cam_raw, list) else (1 if cam_raw is not None else 0)
-            online_ready = (getattr(self, 'dino', None) is not None) and ('img' in batch_inputs_dict) and (cam_raw is not None)
+            proj_ready = ('clip_pix' in batch_inputs_dict) and (cam_raw is not None)
             print(
                 "[DINO][debug] "
                 f"provided_offline={provided_offline}, "
-                f"online_ready={online_ready}, "
+                f"backbone_use_dino={backbone_use_dino}, proj_ready={proj_ready}, "
                 f"clip_shape={clip_shapes}, cam_info_len={cam_info_len}, frame={frame_i}"
             )
+            self._dino_debug_count += 1
         # 可选：外部传入的 DINO 稀疏金字塔或点级 DINO 特征，按帧索引取用
         dino_feats = None
         # 1) 直接传入的稀疏 FPN 列表 [s1..s16]
-        if 'dino_fpn' in batch_inputs_dict:
+        if backbone_use_dino and 'dino_fpn' in batch_inputs_dict:
             try:
                 dino_feats = batch_inputs_dict['dino_fpn'][frame_i]
-                if self._dino_debug_count < 5:
+                if self._dino_debug and self._dino_debug_count < 5:
                     print(f"[DINO] use provided dino_fpn frame={frame_i}")
                     self._dino_debug_count += 1
             except Exception:
                 dino_feats = None
-        elif 'dino_feats' in batch_inputs_dict:
+        elif backbone_use_dino and 'dino_feats' in batch_inputs_dict:
             try:
                 dino_feats = batch_inputs_dict['dino_feats'][frame_i]
-                if self._dino_debug_count < 5:
+                if self._dino_debug and self._dino_debug_count < 5:
                     print(f"[DINO] use provided dino_feats frame={frame_i}")
                     self._dino_debug_count += 1
             except Exception:
                 dino_feats = None
         # 2) 如果传入了点级 DINO 特征（与 points 同顺序），自动构建 FPN
-        if dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
+        if backbone_use_dino and dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
             try:
                 pt_feats_list = []
                 coords_list = []
@@ -1722,16 +1733,16 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     coords_list, pt_feats_list, device=pt_feats_list[0].device)
                 fpn = build_sparse_fpn(coords_batch, feats_batch)
                 dino_feats = fpn
-                if self._dino_debug_count < 3:
+                if self._dino_debug and self._dino_debug_count < 3:
                     print(f"[DINO] build from dino_point_feats frame={frame_i}, coords={coords_batch.shape}, feats={feats_batch.shape}")
                     self._dino_debug_count += 1
             except Exception:
                 dino_feats = None
         # 3) 若仍为空且存在 clip_pix + cam_info，尝试在线投影得到点级 DINO
-        if dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
+        if backbone_use_dino and dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
             try:
                 dino_feats = self._build_dino_fpn_from_clip(batch_inputs_dict, frame_i)
-                if dino_feats is not None and self._dino_debug_count < 3:
+                if self._dino_debug and dino_feats is not None and self._dino_debug_count < 3:
                     shapes = [x.shape for x in dino_feats]
                     strides = [x.tensor_stride for x in dino_feats]
                     print(f"[DINO] build from clip_pix frame={frame_i}, shapes={shapes}, strides={strides}")
@@ -1739,7 +1750,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             except Exception:
                 dino_feats = None
         # 4) 若最终仍未构建，打印一次提示
-        if dino_feats is None and self._dino_debug_count < 5:
+        if self._dino_debug and dino_feats is None and self._dino_debug_count < 5:
             print(f"[DINO] no dino_feats used at frame={frame_i}")
             self._dino_debug_count += 1
 
@@ -1783,11 +1794,12 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         # apply cls_layer
         features = []
         sp_xyz_list = []
+        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end, :-3])
-            sp_xyz_list.append(x[begin: end, -3:])
+            features.append(x[begin: end])
+            sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
 
     def _build_dino_fpn_from_clip(self, batch_inputs_dict: Dict[str, Any], frame_i: int):
@@ -1875,14 +1887,14 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             )
             if not hasattr(self, '_dino_caminfo_log'):
                 self._dino_caminfo_log = 0
-            if self._dino_caminfo_log < 3:
+            if self._dino_debug and self._dino_caminfo_log < 3:
                 intr_arr = np.asarray(meta_t.get('intrinsics', intr) if isinstance(meta_t, dict) else intr)
                 pose_shape = None if pose is None else np.asarray(pose).shape
                 print(f"[DINO][cam_debug] frame={frame_i} b={b_idx} intr_raw_shape={intr_arr.shape} intr_raw={intr_arr} pose_shape={pose_shape} max_depth={max_depth} feat_hw=({Hf},{Wf})")
                 self._dino_caminfo_log += 1
             if not hasattr(self, '_dino_proj_log_count'):
                 self._dino_proj_log_count = 0
-            if self._dino_proj_log_count < 5:
+            if self._dino_debug and self._dino_proj_log_count < 5:
                 depth = xyz_cam[:, 2]
                 depth_valid = (depth > MIN_DEPTH) & (depth < max_depth)
                 depth_ratio = float(depth_valid.float().mean().item()) if depth.numel() > 0 else 0.0
@@ -1913,7 +1925,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             return None
         coords_batch, feats_batch = ME.utils.sparse_collate(coords_list, feats_list, device=feats_list[0].device)
         fpn = build_sparse_fpn(coords_batch, feats_batch)
-        if self._dino_debug_count < 3:
+        if self._dino_debug and self._dino_debug_count < 3:
             shapes = [x.shape for x in fpn]
             strides = [x.tensor_stride for x in fpn]
             print(f"[DINO] proj+fpn frame={frame_i}, shapes={shapes}, strides={strides}")
@@ -2721,11 +2733,12 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         # apply cls_layer
         features = []
         sp_xyz_list = []
+        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end, :-3])
-            sp_xyz_list.append(x[begin: end, -3:])
+            features.append(x[begin: end])
+            sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
 
     def _f(self, x, img_features, img_metas):
@@ -2817,11 +2830,12 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         # apply cls_layer
         features = []
         sp_xyz_list = []
+        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end, :-3])
-            sp_xyz_list.append(x[begin: end, -3:])
+            features.append(x[begin: end])
+            sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
     
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
