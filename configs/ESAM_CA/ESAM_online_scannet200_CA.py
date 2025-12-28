@@ -11,6 +11,10 @@ use_bbox = True
 
 model = dict(
     type='ScanNet200MixFormer3D_Online',
+    # 纯 3D baseline（多帧在线融合）：默认不启用 DINO 注入。
+    # 若要启用 DINO 注入，需要：
+    # - `model.backbone.dino_dim` 配置为 DINO 通道数（例如 1024），使 backbone.use_dino=True；
+    # - 并在 pipeline 中提供 `dino_fpn`/`dino_feats`/`dino_point_feats` 或 `clip_pix+cam_info`（见 oneformer3d/mixformer3d.py）。
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     voxel_size=0.02,
     num_classes=num_instance_classes_eval,
@@ -320,6 +324,6 @@ default_hooks = dict(
 load_from = 'work_dirs/ESAM_sv_scannet200_CA/epoch_128.pth'
 
 # training schedule for 1x
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=128)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')

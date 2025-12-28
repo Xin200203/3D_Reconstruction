@@ -479,31 +479,79 @@ class LoadAdjacentDataFromFile(BaseTransform):
         Returns:
             dict: The dict containing loaded 3D mask annotations.
         """
-        scene_name = pts_filenames[0].split('/')[-2]
-        rec_pts_filename = 'data/' + self.dataset_type + '/points/' + scene_name + '.bin'
-        rec_ins_path = 'data/' + self.dataset_type + '/instance_mask/' + scene_name + '.bin'
-        rec_sem_path = 'data/' + self.dataset_type + '/semantic_mask/' + scene_name + '.bin'
+        scene_name = os.path.basename(os.path.dirname(pts_filenames[0]))
+        rec_pts_filename = os.path.join('data', self.dataset_type, 'points',
+                                        f'{scene_name}.bin')
+        rec_ins_path = os.path.join('data', self.dataset_type, 'instance_mask',
+                                    f'{scene_name}.bin')
+        rec_sem_path = os.path.join('data', self.dataset_type, 'semantic_mask',
+                                    f'{scene_name}.bin')
+
+        def _load_arr(filename: str, dtype):
+            try:
+                return np.frombuffer(
+                    get(filename, backend_args=self.backend_args), dtype=dtype)
+            except ConnectionError:
+                return np.fromfile(filename, dtype=dtype)
+
         try:
-            rec_pts = np.frombuffer(get(rec_pts_filename, backend_args=self.backend_args), dtype=np.float32)
-            rec_ins = np.frombuffer(get(rec_ins_path, backend_args=self.backend_args), dtype=np.int64)
-            rec_sem = np.frombuffer(get(rec_sem_path, backend_args=self.backend_args), dtype=np.int64).copy()
-        except ConnectionError:
-            rec_pts = np.fromfile(rec_pts_filename, dtype=np.float32)
-            rec_ins = np.fromfile(rec_ins_path, dtype=np.int64)
-            rec_sem = np.fromfile(rec_sem_path, dtype=np.int64)
+            rec_pts = _load_arr(rec_pts_filename, np.float32)
+            rec_ins = _load_arr(rec_ins_path, np.int64)
+            rec_sem = _load_arr(rec_sem_path, np.int64).copy()
+        except (FileNotFoundError, OSError):
+            # MV 数据集通常只有逐帧文件：points/<scene>/<frame>.bin。
+            # 当未准备 scene-level 的 rec 文件时，回退到使用第一帧作为 rec。
+            frame_pts_filename = pts_filenames[0]
+            if '/points/' in frame_pts_filename:
+                frame_ins_path = frame_pts_filename.replace(
+                    '/points/', '/instance_mask/', 1)
+                frame_sem_path = frame_pts_filename.replace(
+                    '/points/', '/semantic_mask/', 1)
+            else:
+                # 兜底：基于路径段替换 points 目录
+                parts = frame_pts_filename.split(os.sep)
+                if 'points' in parts:
+                    pidx = parts.index('points')
+                    frame_ins_path = os.sep.join(
+                        parts[:pidx] + ['instance_mask'] + parts[pidx + 1:])
+                    frame_sem_path = os.sep.join(
+                        parts[:pidx] + ['semantic_mask'] + parts[pidx + 1:])
+                else:
+                    raise
+
+            rec_pts = _load_arr(frame_pts_filename, np.float32)
+            rec_ins = _load_arr(frame_ins_path, np.int64)
+            rec_sem = _load_arr(frame_sem_path, np.int64).copy()
         
         # 初始化segment_ids，确保在所有情况下都有定义
         segment_ids = np.array([])
         
         if self.dataset_type == 'scannet' or self.dataset_type == 'scannet200':
-            segment_path = 'data/' + self.dataset_type + '/scans/' + scene_name + '/' + scene_name + '_vh_clean_2.0.010000.segs.json'
-            segment_ids = np.array(json.load(open(segment_path))['segIndices'])
+            segment_path = os.path.join('data', self.dataset_type, 'scans',
+                                        scene_name,
+                                        f'{scene_name}_vh_clean_2.0.010000.segs.json')
+            try:
+                segment_ids = np.array(
+                    json.load(open(segment_path))['segIndices'])
+            except FileNotFoundError:
+                segment_ids = np.array([])
         elif self.dataset_type == '3RScan':
-            segment_path = 'data/' + self.dataset_type + '/3RScan/' + scene_name + '/' + 'mesh.refined.0.010000.segs.v2.json'
-            segment_ids = np.array(json.load(open(segment_path))['segIndices'])
+            segment_path = os.path.join('data', self.dataset_type, '3RScan',
+                                        scene_name,
+                                        'mesh.refined.0.010000.segs.v2.json')
+            try:
+                segment_ids = np.array(
+                    json.load(open(segment_path))['segIndices'])
+            except FileNotFoundError:
+                segment_ids = np.array([])
         elif self.dataset_type == 'scenenn':
-            segment_path = 'data/' + self.dataset_type + '/mesh_segs/' + scene_name + '.segs.json'
-            segment_ids = np.array(json.load(open(segment_path))['segIndices'])
+            segment_path = os.path.join('data', self.dataset_type, 'mesh_segs',
+                                        f'{scene_name}.segs.json')
+            try:
+                segment_ids = np.array(
+                    json.load(open(segment_path))['segIndices'])
+            except FileNotFoundError:
+                segment_ids = np.array([])
 
         rec_pts = rec_pts.reshape(-1, self.load_dim).copy()
         if self.dataset_type == 'scenenn':
