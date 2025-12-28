@@ -217,6 +217,14 @@ class OnlineMerge():
         self.merge_counts = None
     
     def merge(self, masks, labels, scores, queries, query_feats, sem_preds, xyz_list, bboxes):
+        # 🆕 Initialize stats
+        stats = {
+            "supply": masks.shape[0],
+            "matched": 0,
+            "birth": 0,
+            "drop": 0,
+            "mem_size": 0
+        }
         points_per_mask = masks.shape[1]
         # masks, labels, scores, queries, query_feats, sem_preds, xyz_list = \
         #     self.intra_frame_merge(masks, labels, scores, queries, query_feats, sem_preds, xyz_list, bboxes, q)
@@ -231,6 +239,7 @@ class OnlineMerge():
             if self.use_bbox:
                 self.cur_bboxes = bboxes
             self.merge_counts = torch.zeros_like(scores).long()
+            stats["birth"] = masks.shape[0]
         else:
             # Static typing：确保前一帧已经初始化完毕
             assert self.cur_labels is not None and self.cur_query_feats is not None and \
@@ -384,6 +393,8 @@ class OnlineMerge():
                 mix_scores_mask = mix_scores[row_ind, col_ind].gt(0)
                 row_ind = row_ind[mix_scores_mask]
                 col_ind = col_ind[mix_scores_mask]
+            
+            stats["matched"] = len(row_ind)
 
             temp = torch.zeros(self.cur_masks.shape[0]).bool().to(self.cur_masks.device)
             temp[row_ind] = True
@@ -398,6 +409,8 @@ class OnlineMerge():
             former_padding = torch.zeros((no_merge_masks.nonzero().shape[0], points_per_mask * self.fi)).bool().to(next_masks.device)
             new_masks = torch.cat((former_padding, next_masks[no_merge_masks]), dim=1)
             self.cur_masks = torch.cat((self.cur_masks, new_masks), dim=0)
+            
+            stats["birth"] = new_masks.shape[0]
 
             self.merge_counts[row_ind] += 1  # type: ignore[index]
             if len(no_merge_masks) > 0:
@@ -430,8 +443,12 @@ class OnlineMerge():
         cur_labels = self.cur_labels[kept_ins]
         cur_queries = self.cur_queries[kept_ins]
         cur_bboxes = self.cur_xyz[kept_ins] if self.use_bbox else None
+        
+        stats["mem_size"] = len(cur_scores)
+        stats["drop"] = len(self.cur_scores) - len(cur_scores)
+
         # cur_labels = torch.zeros_like(self.cur_scores).long()
-        return cur_masks, cur_labels, cur_scores, cur_queries, cur_bboxes
+        return cur_masks, cur_labels, cur_scores, cur_queries, cur_bboxes, stats
     
     @staticmethod
     def _bbox_pred_to_bbox(points, bbox_pred):

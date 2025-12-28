@@ -334,6 +334,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
                  with_rec=False,
                  cat_rec=False,
                  use_FF=False,
+                 rec_data_root: Optional[str] = None,
                  backend_args: Optional[dict] = None,
                  dataset_type = 'scannet200') -> None:
         self.shift_height = shift_height
@@ -361,6 +362,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
         self.with_rec = with_rec
         self.cat_rec = cat_rec
         self.use_FF = use_FF
+        self.rec_data_root = rec_data_root
         self.backend_args = backend_args
         self.dataset_type = dataset_type
         

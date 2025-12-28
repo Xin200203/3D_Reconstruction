@@ -5,6 +5,7 @@ from torch_scatter import scatter_mean
 import MinkowskiEngine as ME
 import pointops
 import pdb, time
+import json
 import os
 from functools import partial
 from mmdet3d.registry import MODELS
@@ -2038,6 +2039,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         mv_mask2, mv_labels2, mv_scores2 = None, None, None
         mv_queries = None
         online_merger = None
+        scene_metrics = []
         
         if hasattr(self, 'memory'):
             self.memory.reset()
@@ -2066,7 +2068,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 if frame_i == 0:
                     online_merger = OnlineMerge(self.test_cfg.inscat_topk_insts, self.use_bbox)
                 if online_merger is not None:
-                    mv_mask, mv_labels, mv_scores, mv_queries, mv_bboxes = online_merger.merge(
+                    mv_mask, mv_labels, mv_scores, mv_queries, mv_bboxes, stats = online_merger.merge(
                         results[-1].pop('pts_instance_mask')[0],
                         results[-1].pop('instance_labels')[0],
                         results[-1].pop('instance_scores')[0],
@@ -2075,6 +2077,45 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         sem_preds_list.pop(-1)[0],
                         sp_xyz_list.pop(-1)[0],
                         bboxes_list.pop(-1)[0] if self.use_bbox else None)
+                    
+                    # 🆕 Collect Online Metrics
+                    if self.test_cfg.get('collect_online_metrics', False):
+                        try:
+                            # 1. Get GT masks for current frame
+                            gt_ins = batch_data_samples[0].gt_pts_seg.pts_instance_mask[frame_i]
+                            # Convert to binary masks (N_gt, P)
+                            gt_ids = torch.unique(gt_ins)
+                            gt_ids = gt_ids[gt_ids != -1] # Remove ignore
+                            
+                            matched_gt_count = 0
+                            if len(gt_ids) > 0:
+                                # Create binary masks for each GT instance (N_gt, P)
+                                gt_masks = (gt_ins.unsqueeze(0) == gt_ids.unsqueeze(1))
+                                
+                                # 2. Get Memory masks for current frame
+                                # online_merger.cur_masks is (N_mem, Total_points)
+                                # points_per_frame can vary if points are not fixed
+                                points_per_frame = batch_inputs_dict['points'][0][frame_i].shape[0]
+                                mem_masks = online_merger.cur_masks[:, -points_per_frame:]
+                                
+                                # 3. Calculate IoU
+                                # Intersection: (N_gt, N_mem)
+                                intersection = (gt_masks.unsqueeze(1) & mem_masks.unsqueeze(0)).sum(-1).float()
+                                # Union: (N_gt, N_mem)
+                                union = (gt_masks.unsqueeze(1) | mem_masks.unsqueeze(0)).sum(-1).float()
+                                ious = intersection / (union + 1e-6)
+                                
+                                # 4. Check matches > 0.1
+                                max_ious, _ = ious.max(dim=1) # Max IoU for each GT
+                                matched_gt_count = (max_ious > 0.1).sum().item()
+                            
+                            stats['GT_matched_0.1'] = matched_gt_count
+                            stats['GT_total'] = len(gt_ids)
+                            stats['frame_idx'] = frame_i
+                            scene_metrics.append(stats)
+                        except Exception as e:
+                            print(f"Error collecting online metrics: {e}")
+
                     # Empty cache. Only offline merging requires the whole list.
                     torch.cuda.empty_cache()
                     if frame_i == num_frames - 1:
@@ -2143,7 +2184,25 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         
         if self.use_bbox and mv_bboxes is not None:
             batch_data_samples[0].pred_bbox = mv_bboxes.cpu().numpy()
-        
+
+        # 🆕 Save Online Metrics
+        if self.test_cfg.get('collect_online_metrics', False) and len(scene_metrics) > 0:
+            try:
+                save_dir = os.path.join(self.test_cfg.get('work_dir', 'work_dirs'), 'online_metrics')
+                os.makedirs(save_dir, exist_ok=True)
+                # Try to get scene ID from metainfo
+                if 'sample_idx' in batch_data_samples[0].metainfo:
+                    scene_id = str(batch_data_samples[0].metainfo['sample_idx'])
+                elif 'file_name' in batch_data_samples[0].metainfo:
+                    scene_id = os.path.splitext(os.path.basename(batch_data_samples[0].metainfo['file_name']))[0]
+                else:
+                    scene_id = f"scene_{int(time.time())}"
+                
+                with open(os.path.join(save_dir, f"{scene_id}.json"), 'w') as f:
+                    json.dump(scene_metrics, f, indent=2)
+            except Exception as e:
+                print(f"Error saving online metrics: {e}")
+
         # Not mapping to reconstructed point clouds, return directly for visualization
         if not self.map_to_rec_pcd:
             merged_result = PointData(

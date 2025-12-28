@@ -29,6 +29,12 @@ class ScanNetSegDataset_(ScanNetSegDataset):
         info['img_path'] = osp.join(
             self.data_root or '', info['img_path'])
 
+        # Compatibility for Single View (SV) data with Online DINO pipeline
+        if 'img_paths' not in info and 'img_path' in info:
+            info['img_paths'] = [info['img_path']]
+        if 'poses' not in info and 'pose' in info:
+            info['poses'] = [info['pose']]
+
         info = super().parse_data_info(info)
 
         return info
