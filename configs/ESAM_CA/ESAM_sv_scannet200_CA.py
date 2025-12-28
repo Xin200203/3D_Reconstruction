@@ -10,6 +10,9 @@ num_instance_classes_eval = 1
 
 model = dict(
     type='ScanNet200MixFormer3D',
+    # 纯 3D baseline：不启用 DINO 注入（不提供 dino_cfg，且 backbone 不设置 dino_dim）
+    dino_require=False,
+    dino_online_only=False,
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     voxel_size=0.02,
     num_classes=num_instance_classes_eval,
