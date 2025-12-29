@@ -2239,14 +2239,25 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         return batch_data_samples
     
     def segment_smooth(self, results, device, segment_ids):
+        sem_mask = np.asarray(results.pts_semantic_mask[0])
+        ins_mask = np.asarray(results.pts_instance_mask[0])
+        if len(segment_ids) != sem_mask.shape[0] or ins_mask.shape[1] != sem_mask.shape[0]:
+            if not hasattr(self, '_segment_smooth_warned'):
+                print(
+                    "[segment_smooth] skip due to size mismatch: "
+                    f"segment_ids={len(segment_ids)}, sem_mask={sem_mask.shape}, ins_mask={ins_mask.shape}"
+                )
+                self._segment_smooth_warned = True
+            return results
+
         unique_ids = np.unique(segment_ids)
         new_segment_ids = np.zeros_like(segment_ids)
         for i, ids in enumerate(unique_ids):
             new_segment_ids[segment_ids == ids] = i
         segment_ids = new_segment_ids
         segment_ids = torch.from_numpy(segment_ids).to(device)
-        sem_mask = torch.from_numpy(results.pts_semantic_mask[0]).to(device)
-        ins_mask = torch.from_numpy(results.pts_instance_mask[0]).to(device)
+        sem_mask = torch.from_numpy(sem_mask).to(device)
+        ins_mask = torch.from_numpy(ins_mask).to(device)
         sem_mask = scatter_mean(F.one_hot(sem_mask).float(), segment_ids, dim=0)
         sem_mask = sem_mask.argmax(dim=1)[segment_ids]
         ins_mask = scatter_mean(ins_mask.float(), segment_ids, dim=1)

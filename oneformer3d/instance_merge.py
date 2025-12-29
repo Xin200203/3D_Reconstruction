@@ -355,9 +355,9 @@ class OnlineMerge():
                 if self.cur_xyz is None or next_xyz is None:
                     raise RuntimeError('xyz is None when merging instances')
 
-                query_feat_scores = (self.cur_query_feats.unsqueeze(1) * next_query_feats.unsqueeze(0)).sum(2)
+                query_feat_scores = (next_query_feats.unsqueeze(1) * self.cur_query_feats.unsqueeze(0)).sum(2)
                 sem_pred_scores = F.cosine_similarity(
-                    self.cur_sem_preds.unsqueeze(1), next_sem_preds.unsqueeze(0), dim=2)
+                    next_sem_preds.unsqueeze(1), self.cur_sem_preds.unsqueeze(0), dim=2)
 
                 mix_scores = query_feat_scores * xyz_scores
                 # 应用IoU预剪枝mask (去掉batch维度)
