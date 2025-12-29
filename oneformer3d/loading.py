@@ -494,6 +494,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
             except ConnectionError:
                 return np.fromfile(filename, dtype=dtype)
 
+        rec_from_frame = False
         try:
             rec_pts = _load_arr(rec_pts_filename, np.float32)
             rec_ins = _load_arr(rec_ins_path, np.int64)
@@ -522,6 +523,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
             rec_pts = _load_arr(frame_pts_filename, np.float32)
             rec_ins = _load_arr(frame_ins_path, np.int64)
             rec_sem = _load_arr(frame_sem_path, np.int64).copy()
+            rec_from_frame = True
         
         # 初始化segment_ids，确保在所有情况下都有定义
         segment_ids = np.array([])
@@ -563,7 +565,9 @@ class LoadAdjacentDataFromFile(BaseTransform):
         # 'eval_ann_info' will be passed to evaluator
         if 'eval_ann_info' in results:
             results['eval_ann_info']['rec_xyz'] = rec_pts
-            results['eval_ann_info']['segment_ids'] = segment_ids
+            # Only attach segment_ids when it aligns with rec_xyz.
+            if segment_ids.size > 0 and segment_ids.shape[0] == rec_pts.shape[0] and (not rec_from_frame):
+                results['eval_ann_info']['segment_ids'] = segment_ids
         return results
 
     def transform(self, results: dict) -> dict:
