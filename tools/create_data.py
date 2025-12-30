@@ -8,7 +8,7 @@ import mmengine
 from pathlib import Path
 
 
-def scannet_data_prep(root_path, info_prefix, out_dir, workers):
+def scannet_data_prep(root_path, info_prefix, out_dir, workers, mv_frame_stride: int = 40):
     """Prepare the info file for scannet dataset.
 
     Args:
@@ -18,7 +18,7 @@ def scannet_data_prep(root_path, info_prefix, out_dir, workers):
         workers (int): Number of threads to be used.
     """
     create_indoor_info_file(
-        root_path, info_prefix, out_dir, workers=workers)
+        root_path, info_prefix, out_dir, workers=workers, mv_frame_stride=mv_frame_stride)
     info_train_path = osp.join(out_dir, f'{info_prefix}_oneformer3d_infos_train.pkl')
     info_val_path = osp.join(out_dir, f'{info_prefix}_oneformer3d_infos_val.pkl')
     # info_test_path = osp.join(out_dir, f'{info_prefix}_oneformer3d_infos_test.pkl')
@@ -180,6 +180,11 @@ parser.add_argument(
 parser.add_argument('--extra-tag', type=str, default='kitti')
 parser.add_argument(
     '--workers', type=int, default=4, help='number of threads to be used')
+parser.add_argument(
+    '--mv-frame-stride',
+    type=int,
+    default=40,
+    help='Frame sampling stride for MV datasets (default: 40). Use 20 for stride20 runs; set <=0 to keep all frames.')
 parser.add_argument('--pack-clip', action='store_true', help='Generate extra *_clip.pkl with clip_feat paths')
 parser.add_argument('--clip-suffix', type=str, default='_clip', help='Suffix to append before .pkl when --pack-clip is on')
 args = parser.parse_args()
@@ -193,7 +198,8 @@ if __name__ == '__main__':
             root_path=args.root_path,
             info_prefix=args.extra_tag,
             out_dir=args.out_dir,
-            workers=args.workers)
+            workers=args.workers,
+            mv_frame_stride=args.mv_frame_stride)
         if args.pack_clip:
             # 定位生成的 pkl 并补丁 clip 路径
             for split in ['train', 'val']:

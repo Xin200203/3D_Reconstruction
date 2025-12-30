@@ -484,6 +484,7 @@ class BboxCalculation(BaseTransform):
              pts_ins_unique else len(pts_ins_unique)
         ori_pts_instance_mask = torch.tensor(input_dict['ori_pts_instance_mask'])
         ori_pts_ins_unique = ori_pts_instance_mask.unique().to(torch.long)
+        ori_pts_ins_unique = ori_pts_instance_mask.unique().to(torch.long)
         ori_rec_instance_mask = torch.tensor(input_dict['ori_rec_instance_mask'])
         ori_rec_ins_unique = ori_rec_instance_mask[rec_instance_mask != -1].unique().to(torch.long)
         keep_mask = (ori_rec_ins_unique[:, None] == ori_pts_ins_unique[None, :]).any(dim=1)

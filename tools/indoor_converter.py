@@ -13,7 +13,8 @@ def create_indoor_info_file(data_path,
                             pkl_prefix='sunrgbd',
                             save_path=None,
                             use_v1=False,
-                            workers=4):
+                            workers=4,
+                            mv_frame_stride: int = 40):
     """Create indoor information file.
 
     Get information of the raw data and save it to the pkl file.
@@ -49,8 +50,8 @@ def create_indoor_info_file(data_path,
         train_dataset = ScanNetSVData(root_path=data_path, split='train', save_path=save_path)
         val_dataset = ScanNetSVData(root_path=data_path, split='val', save_path=save_path)    
     elif pkl_prefix == 'scannet_mv':
-        train_dataset = ScanNetMVData(root_path=data_path, split='train', save_path=save_path)
-        val_dataset = ScanNetMVData(root_path=data_path, split='val', save_path=save_path)
+        train_dataset = ScanNetMVData(root_path=data_path, split='train', save_path=save_path, frame_stride=mv_frame_stride)
+        val_dataset = ScanNetMVData(root_path=data_path, split='val', save_path=save_path, frame_stride=mv_frame_stride)
     elif pkl_prefix == 'scannet200':  # ScanNet200
         # ScanNet has a train-val-test split
         train_dataset = ScanNetData(root_path=data_path, split='train',
@@ -66,9 +67,9 @@ def create_indoor_info_file(data_path,
                                     scannet200=True, save_path=save_path)
     elif pkl_prefix == 'scannet200_mv':   # ScanNet200-MV
         train_dataset = ScanNetMVData(root_path=data_path, split='train',
-                                    scannet200=True, save_path=save_path)
+                                    scannet200=True, save_path=save_path, frame_stride=mv_frame_stride)
         val_dataset = ScanNetMVData(root_path=data_path, split='val',
-                                    scannet200=True, save_path=save_path)
+                                    scannet200=True, save_path=save_path, frame_stride=mv_frame_stride)
     elif pkl_prefix == 'scenenn':
         val_dataset = SceneNNData(root_path=data_path, split='val')
     elif pkl_prefix == 'scenenn_mv':

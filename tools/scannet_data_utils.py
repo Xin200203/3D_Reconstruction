@@ -496,12 +496,18 @@ class ScanNetMVData(object):
         save_path (str, optional): Output directory.
     """
 
-    def __init__(self, root_path, split='train', scannet200=False, save_path=None):
+    def __init__(self,
+                 root_path,
+                 split='train',
+                 scannet200=False,
+                 save_path=None,
+                 frame_stride: int = 40):
         self.root_dir = root_path
         self.save_path = root_path if save_path is None else save_path
         self.split = split
         self.split_dir = osp.join(root_path)
         self.scannet200 = scannet200
+        self.frame_stride = int(frame_stride) if frame_stride is not None else 40
         if self.scannet200:
             self.classes = [
                 'chair', 'table', 'door', 'couch', 'cabinet', 'shelf', 'desk',
@@ -626,8 +632,9 @@ class ScanNetMVData(object):
             info['point_cloud'] = pc_info
             files = os.listdir(osp.join(self.root_dir, 'points', sample_idx))
             files.sort(key=lambda x: int(x.split('/')[-1][:-4]))
-            # interval = 40
-            files = [file for file in files if int(file.split('.')[0]) % 40 == 0]
+            # Default interval is 40 (legacy). For stride20 runs, pass frame_stride=20.
+            if self.frame_stride and self.frame_stride > 0:
+                files = [file for file in files if int(file.split('.')[0]) % self.frame_stride == 0]
             
             info['pts_paths'] = [osp.join('points', sample_idx, file) for file in files]
             info['super_pts_paths'] = [osp.join('super_points', sample_idx, file) for file in files]

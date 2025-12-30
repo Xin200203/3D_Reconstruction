@@ -5,6 +5,8 @@ from torch_scatter import scatter_mean
 import MinkowskiEngine as ME
 import pointops
 import pdb, time
+import json
+import os
 from functools import partial
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import PointData
@@ -86,6 +88,8 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.train_cfg = train_cfg
         # DINO 调试计数（限制打印次数）
         self._dino_debug_count = 0
+        # 仅在需要时开启调试日志，避免污染纯 3D baseline 的训练/测试输出
+        self._dino_debug = os.environ.get('DINO_DEBUG', '') == '1'
 
     def initialize_training_optimization(self):
         """Placeholder for compatibility; no-op in lightweight build."""
@@ -124,6 +128,12 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
 
         # === DINO FPN 构建（单帧）===
         dino_feats: Optional[List[ME.SparseTensor]] = None
+        backbone_use_dino = bool(getattr(self.backbone, 'use_dino', False))
+        if (self.dino_require or self.dino_online_only or getattr(self, 'dino', None) is not None) and (not backbone_use_dino):
+            raise RuntimeError(
+                "DINO is enabled in model config, but the 3D backbone is not configured for DINO injection. "
+                "Set `model.backbone.dino_dim` (e.g. 1024) to enable `backbone.use_dino=True`."
+            )
 
         if getattr(self, 'dino_online_only', False):
             unexpected = []
@@ -181,7 +191,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             self._dino_debug_count += 1
 
         # 1) 优先使用外部提供的 dino_fpn / dino_feats（完全跳过内部构建）
-        if 'dino_fpn' in batch_inputs_dict:
+        if backbone_use_dino and 'dino_fpn' in batch_inputs_dict:
             try:
                 dino_feats = batch_inputs_dict['dino_fpn']
                 if self.dino_debug and self._dino_debug_count < 3:
@@ -189,7 +199,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     self._dino_debug_count += 1
             except Exception:
                 dino_feats = None
-        elif 'dino_feats' in batch_inputs_dict:
+        elif backbone_use_dino and 'dino_feats' in batch_inputs_dict:
             try:
                 dino_feats = batch_inputs_dict['dino_feats']
                 if self.dino_debug and self._dino_debug_count < 3:
@@ -199,7 +209,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 dino_feats = None
 
         # 2) 若未提供，且模型中挂载了 DINOv2Backbone，则在线从 img + cam_info 构建 FPN
-        if dino_feats is None and getattr(self, 'dino', None) is not None:
+        if backbone_use_dino and dino_feats is None and getattr(self, 'dino', None) is not None:
             imgs = batch_inputs_dict.get('img', None)
             cam_raw = batch_inputs_dict.get('cam_info', None)
             if getattr(self, 'dino_require', False) and (imgs is None or cam_raw is None):
@@ -280,7 +290,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     dino_feats = self._build_dino_fpn_online(
                         points_list, feat_maps, cam_metas, batch_data_samples,
                         elastic_coords=elastic_coords)
-                    if dino_feats is not None and self._dino_debug_count < 3:
+                    if self._dino_debug and dino_feats is not None and self._dino_debug_count < 3:
                         shapes = [x.shape for x in dino_feats]
                         strides = [x.tensor_stride for x in dino_feats]
                         print(f"[DINO] build from online DINO backbone, shapes={shapes}, strides={strides}")
@@ -308,7 +318,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 )
 
         # 3) 兼容旧逻辑：直接给出点级 DINO 特征或 clip_pix
-        if dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
+        if backbone_use_dino and dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
             try:
                 coords_list, feats_list = [], []
                 for b_idx, pts in enumerate(points_list):
@@ -331,7 +341,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     self._dino_debug_count += 1
                 dino_feats = None
 
-        if dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
+        if backbone_use_dino and dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
             try:
                 dino_feats = self._build_dino_fpn_from_clip(batch_inputs_dict)
                 if dino_feats is not None and self.dino_debug and self._dino_debug_count < 3:
@@ -891,7 +901,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         clip_raw = batch_inputs_dict.get('clip_pix', None)
         cam_raw = batch_inputs_dict.get('cam_info', None)
         if points_list is None or clip_raw is None or cam_raw is None:
-            if self._dino_debug_count < 3:
+            if self._dino_debug and self._dino_debug_count < 3:
                 print(f"[DINO][warn] skip build_from_clip: points={points_list is not None}, clip={clip_raw is not None}, cam_info={cam_raw is not None}")
                 self._dino_debug_count += 1
             return None
@@ -924,7 +934,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 clip_list = [clip_tensor for _ in range(len(points_list))]
 
         if not clip_list:
-            if self._dino_debug_count < 3:
+            if self._dino_debug and self._dino_debug_count < 3:
                 print("[DINO][warn] clip_list empty after normalization")
                 self._dino_debug_count += 1
             return None
@@ -998,14 +1008,14 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 )
                 if not hasattr(self, '_dino_caminfo_log'):
                     self._dino_caminfo_log = 0
-                if self._dino_caminfo_log < 3:
+                if self._dino_debug and self._dino_caminfo_log < 3:
                     intr_arr = np.asarray(raw_intr)
                     pose_shape = None if pose is None else np.asarray(pose).shape
                     print(f"[DINO][cam_debug] b={b_idx} intr_raw_shape={intr_arr.shape} intr_raw={intr_arr} pose_shape={pose_shape} max_depth={max_depth} feat_hw=({Hf},{Wf})")
                     self._dino_caminfo_log += 1
                 if not hasattr(self, '_dino_proj_log_count'):
                     self._dino_proj_log_count = 0
-                if self._dino_proj_log_count < 5:
+                if self._dino_debug and self._dino_proj_log_count < 5:
                     depth = xyz_cam[:, 2]
                     depth_valid = (depth > MIN_DEPTH) & (depth < max_depth)
                     depth_ratio = float(depth_valid.float().mean().item()) if depth.numel() > 0 else 0.0
@@ -1023,7 +1033,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 sampled = sample_img_feat(clip_tensor.unsqueeze(0), uv_feat, valid, align_corners=align_corners)
                 sampled = sampled.to(pts.device)
             except Exception as e:
-                if self._dino_debug_count < 3:
+                if self._dino_debug and self._dino_debug_count < 3:
                     print(f"[DINO][error] projection/sample failed: {e}")
                     self._dino_debug_count += 1
                 continue
@@ -1036,7 +1046,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         if not coords_list:
             return None
         # 调试：观察 collate 前各块形状
-        if self._dino_debug_count < 5:
+        if self._dino_debug and self._dino_debug_count < 5:
             try:
                 print(f"[DINO][debug] build_from_clip before collate: "
                       f"n_chunks={len(coords_list)}, "
@@ -1046,17 +1056,17 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         try:
             coords_batch, feats_batch = ME.utils.sparse_collate(
                 coords_list, feats_list, device=feats_list[0].device)
-            if self._dino_debug_count < 5:
+            if self._dino_debug and self._dino_debug_count < 5:
                 print(f"[DINO][debug] after sparse_collate: "
                       f"coords_batch={coords_batch.shape}, feats_batch={feats_batch.shape}")
             fpn = build_sparse_fpn(coords_batch, feats_batch)
-            if self._dino_debug_count < 5:
+            if self._dino_debug and self._dino_debug_count < 5:
                 shapes = [x.shape for x in fpn]
                 strides = [x.tensor_stride for x in fpn]
                 print(f"[DINO][debug] FPN built: shapes={shapes}, strides={strides}")
             return fpn
         except Exception as e:
-            if self._dino_debug_count < 5:
+            if self._dino_debug and self._dino_debug_count < 5:
                 print(f"[DINO][error] sparse_collate/build_sparse_fpn failed: {repr(e)}")
             return None
 
@@ -1652,6 +1662,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         self.dino_require = bool(dino_require)
         self.dino_debug = bool(dino_debug)
         self._dino_debug_count = 0
+        self._dino_debug = os.environ.get('DINO_DEBUG', '') == '1'
         self.init_weights()
     
     def init_weights(self):
@@ -1809,9 +1820,12 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         features = []
         sp_xyz_list = []
         sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
+        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
+            features.append(x[begin: end])
+            sp_xyz_list.append(sp_xyz[begin: end])
             features.append(x[begin: end])
             sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
@@ -1901,14 +1915,14 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             )
             if not hasattr(self, '_dino_caminfo_log'):
                 self._dino_caminfo_log = 0
-            if self._dino_caminfo_log < 3:
+            if self._dino_debug and self._dino_caminfo_log < 3:
                 intr_arr = np.asarray(meta_t.get('intrinsics', intr) if isinstance(meta_t, dict) else intr)
                 pose_shape = None if pose is None else np.asarray(pose).shape
                 print(f"[DINO][cam_debug] frame={frame_i} b={b_idx} intr_raw_shape={intr_arr.shape} intr_raw={intr_arr} pose_shape={pose_shape} max_depth={max_depth} feat_hw=({Hf},{Wf})")
                 self._dino_caminfo_log += 1
             if not hasattr(self, '_dino_proj_log_count'):
                 self._dino_proj_log_count = 0
-            if self._dino_proj_log_count < 5:
+            if self._dino_debug and self._dino_proj_log_count < 5:
                 depth = xyz_cam[:, 2]
                 depth_valid = (depth > MIN_DEPTH) & (depth < max_depth)
                 depth_ratio = float(depth_valid.float().mean().item()) if depth.numel() > 0 else 0.0
@@ -1939,7 +1953,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             return None
         coords_batch, feats_batch = ME.utils.sparse_collate(coords_list, feats_list, device=feats_list[0].device)
         fpn = build_sparse_fpn(coords_batch, feats_batch)
-        if self._dino_debug_count < 3:
+        if self._dino_debug and self._dino_debug_count < 3:
             shapes = [x.shape for x in fpn]
             strides = [x.tensor_stride for x in fpn]
             print(f"[DINO] proj+fpn frame={frame_i}, shapes={shapes}, strides={strides}")
@@ -2234,7 +2248,25 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         
         if self.use_bbox and mv_bboxes is not None:
             batch_data_samples[0].pred_bbox = mv_bboxes.cpu().numpy()
-        
+
+        # 🆕 Save Online Metrics
+        if self.test_cfg.get('collect_online_metrics', False) and len(scene_metrics) > 0:
+            try:
+                save_dir = os.path.join(self.test_cfg.get('work_dir', 'work_dirs'), 'online_metrics')
+                os.makedirs(save_dir, exist_ok=True)
+                # Try to get scene ID from metainfo
+                if 'sample_idx' in batch_data_samples[0].metainfo:
+                    scene_id = str(batch_data_samples[0].metainfo['sample_idx'])
+                elif 'file_name' in batch_data_samples[0].metainfo:
+                    scene_id = os.path.splitext(os.path.basename(batch_data_samples[0].metainfo['file_name']))[0]
+                else:
+                    scene_id = f"scene_{int(time.time())}"
+                
+                with open(os.path.join(save_dir, f"{scene_id}.json"), 'w') as f:
+                    json.dump(scene_metrics, f, indent=2)
+            except Exception as e:
+                print(f"Error saving online metrics: {e}")
+
         # Not mapping to reconstructed point clouds, return directly for visualization
         if not self.map_to_rec_pcd:
             merged_result = PointData(
@@ -2781,9 +2813,12 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         features = []
         sp_xyz_list = []
         sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
+        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
+            features.append(x[begin: end])
+            sp_xyz_list.append(sp_xyz[begin: end])
             features.append(x[begin: end])
             sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
@@ -2878,9 +2913,12 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         features = []
         sp_xyz_list = []
         sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
+        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
+            features.append(x[begin: end])
+            sp_xyz_list.append(sp_xyz[begin: end])
             features.append(x[begin: end])
             sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list

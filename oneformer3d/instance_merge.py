@@ -250,6 +250,7 @@ class OnlineMerge():
             if self.use_bbox:
                 self.cur_bboxes = bboxes
             self.merge_counts = torch.zeros_like(scores).long()
+            stats["birth"] = masks.shape[0]
         else:
             # Static typing：确保前一帧已经初始化完毕
             assert self.cur_labels is not None and self.cur_query_feats is not None and \
@@ -367,7 +368,7 @@ class OnlineMerge():
                 # Keep matrix layout consistent with xyz_scores: (Nm, Nc)
                 query_feat_scores = (self.cur_query_feats.unsqueeze(1) * next_query_feats.unsqueeze(0)).sum(2)
                 sem_pred_scores = F.cosine_similarity(
-                    self.cur_sem_preds.unsqueeze(1), next_sem_preds.unsqueeze(0), dim=2)
+                    next_sem_preds.unsqueeze(1), self.cur_sem_preds.unsqueeze(0), dim=2)
 
                 mix_scores = query_feat_scores * xyz_scores
                 # 应用IoU预剪枝mask
@@ -413,6 +414,8 @@ class OnlineMerge():
             former_padding = torch.zeros((no_merge_masks.nonzero().shape[0], points_per_mask * self.fi)).bool().to(next_masks.device)
             new_masks = torch.cat((former_padding, next_masks[no_merge_masks]), dim=1)
             self.cur_masks = torch.cat((self.cur_masks, new_masks), dim=0)
+            
+            stats["birth"] = new_masks.shape[0]
 
             self.merge_counts[row_ind] += 1  # type: ignore[index]
             if len(no_merge_masks) > 0:
@@ -445,6 +448,10 @@ class OnlineMerge():
         cur_labels = self.cur_labels[kept_ins]
         cur_queries = self.cur_queries[kept_ins]
         cur_bboxes = self.cur_xyz[kept_ins] if self.use_bbox else None
+        
+        stats["mem_size"] = len(cur_scores)
+        stats["drop"] = len(self.cur_scores) - len(cur_scores)
+
         # cur_labels = torch.zeros_like(self.cur_scores).long()
 
         if self.monitor:

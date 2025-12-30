@@ -5,11 +5,10 @@ from torch import nn as nn
 from torch.nn import functional as F
 import torchvision
 import pdb
-from ultralytics.yolo.utils import is_git_dir
-from ultralytics.yolo.utils import ops
-from ultralytics.yolo.utils.torch_utils import select_device, smart_inference_mode
-from ultralytics.yolo.v8.segment import SegmentationPredictor
-from ultralytics.yolo.cfg import get_cfg
+from ultralytics.utils import ops
+from ultralytics.utils.torch_utils import select_device, smart_inference_mode
+from ultralytics.models.yolo.segment import SegmentationPredictor
+from ultralytics.cfg import get_cfg
 import sys
 from mmengine.model import BaseModule
 from mmdet3d.registry import MODELS

@@ -334,6 +334,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
                  with_rec=False,
                  cat_rec=False,
                  use_FF=False,
+                 rec_data_root: Optional[str] = None,
                  backend_args: Optional[dict] = None,
                  dataset_type = 'scannet200') -> None:
         self.shift_height = shift_height
@@ -361,6 +362,7 @@ class LoadAdjacentDataFromFile(BaseTransform):
         self.with_rec = with_rec
         self.cat_rec = cat_rec
         self.use_FF = use_FF
+        self.rec_data_root = rec_data_root
         self.backend_args = backend_args
         self.dataset_type = dataset_type
         
@@ -550,6 +552,9 @@ class LoadAdjacentDataFromFile(BaseTransform):
         # 'eval_ann_info' will be passed to evaluator
         if 'eval_ann_info' in results:
             results['eval_ann_info']['rec_xyz'] = rec_pts
+            # Only attach segment_ids when it aligns with rec_xyz.
+            if segment_ids.size > 0 and segment_ids.shape[0] == rec_pts.shape[0] and (not rec_from_frame):
+                results['eval_ann_info']['segment_ids'] = segment_ids
             # Only attach segment_ids when it aligns with rec_xyz.
             if segment_ids.size > 0 and segment_ids.shape[0] == rec_pts.shape[0] and (not rec_from_frame):
                 results['eval_ann_info']['segment_ids'] = segment_ids
