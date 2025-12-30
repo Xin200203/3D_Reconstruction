@@ -1820,12 +1820,9 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         features = []
         sp_xyz_list = []
         sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
-        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end])
-            sp_xyz_list.append(sp_xyz[begin: end])
             features.append(x[begin: end])
             sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
@@ -2108,6 +2105,48 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 },
                 "frames": [],
             }
+
+        # Optional: baseline statistics (GT-aware, per-frame + per-scene).
+        bs_cfg = self.test_cfg.get('baseline_stats', None) or {}
+        bs_enable = bool(bs_cfg.get('enable', False))
+        bs_record_online = bool(bs_cfg.get('record_online', True)) if bs_enable else False
+        baseline_stats = None
+        gt_seen_ids = set()
+        bs_gt_vis_npoint = int(bs_cfg.get('gt_vis_npoint', 100)) if bs_enable else 100
+        if bs_enable:
+            meta = getattr(batch_data_samples[0], 'img_metas', None)
+            if not isinstance(meta, dict):
+                try:
+                    meta = batch_data_samples[0].metainfo
+                except Exception:
+                    meta = {}
+            scene_id = (
+                meta.get('scene_id', None)
+                or meta.get('scan_id', None)
+                or meta.get('lidar_idx', None)
+                or meta.get('sample_idx', None)
+                or meta.get('ann_file', None)
+                or meta.get('pts_filename', None)
+                or 'unknown'
+            )
+            baseline_stats = {
+                "scene_id": str(scene_id),
+                "num_frames": int(num_frames),
+                "cfg": {
+                    "inst_score_thr": float(self.test_cfg.get('inst_score_thr', 0.0)),
+                    "npoint_thr": int(self.test_cfg.get('npoint_thr', 0)),
+                    "sp_score_thr": float(self.test_cfg.get('sp_score_thr', 0.0)),
+                    "topk_insts": int(self.test_cfg.get('topk_insts', -1)),
+                    "nms": bool(self.test_cfg.get('nms', False)),
+                    "inscat_topk_insts": int(self.test_cfg.get('inscat_topk_insts', -1)),
+                    "baseline_stats": {
+                        k: v
+                        for k, v in (dict(bs_cfg).items() if isinstance(bs_cfg, dict) else [])
+                        if isinstance(v, (bool, int, float, str))
+                    },
+                },
+                "frames": [],
+            }
         
         if hasattr(self, 'memory'):
             self.memory.reset()
@@ -2118,9 +2157,66 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             super_points = ([bds.gt_pts_seg.sp_pts_mask[frame_i] for bds in batch_data_samples], all_xyz_w)
             x = self.decoder(x=x, queries=x, sp_feats=x, p_feats=point_features, super_points=super_points)
             ## Post-processing
+            gt_inst_frame = None
+            if bs_enable:
+                try:
+                    gt_inst_frame = batch_data_samples[0].gt_pts_seg.pts_instance_mask[frame_i]
+                except Exception:
+                    gt_inst_frame = None
+                # Fallback: if GT masks are not packed into `gt_pts_seg`, try `eval_ann_info`.
+                if gt_inst_frame is None:
+                    try:
+                        ann = getattr(batch_data_samples[0], 'eval_ann_info', None)
+                        if isinstance(ann, dict) and 'pts_instance_mask' in ann:
+                            g = ann['pts_instance_mask']
+                            if not torch.is_tensor(g):
+                                g = torch.as_tensor(g)
+                            if g.dim() == 1:
+                                g = g.reshape(num_frames, -1)
+                            gt_inst_frame = g[frame_i]
+                    except Exception:
+                        gt_inst_frame = None
+
             pred_pts_seg, mapping = self.predict_by_feat(
-                x, batch_data_samples[0].gt_pts_seg.sp_pts_mask[frame_i])
+                x,
+                batch_data_samples[0].gt_pts_seg.sp_pts_mask[frame_i],
+                gt_pts_instance=gt_inst_frame,
+            )
             results.append(pred_pts_seg[0])
+
+            # Collect per-frame baseline stats (postproc stage counts + GT duplication + killed quality).
+            if bs_enable and baseline_stats is not None:
+                fr = {"frame_i": int(frame_i)}
+                try:
+                    # `results[-1]` is a PointData; prefer attribute access.
+                    st = getattr(results[-1], 'instance_stage_stats', None)
+                    if st is None and isinstance(results[-1], dict):
+                        st = results[-1].get('instance_stage_stats', None)
+                    if isinstance(st, list) and len(st) > 0 and isinstance(st[0], dict):
+                        fr.update(st[0])
+                except Exception:
+                    pass
+                # GT appearance/memory statistics (visible GT ids only).
+                try:
+                    if torch.is_tensor(gt_inst_frame):
+                        gt_np = gt_inst_frame.detach().cpu().numpy().reshape(-1)
+                        valid = gt_np >= 0
+                        ids = gt_np[valid].astype(np.int64, copy=False)
+                        vis_ids = set()
+                        if ids.size > 0:
+                            uniq, cnt = np.unique(ids, return_counts=True)
+                            vis_ids = set(uniq[cnt >= bs_gt_vis_npoint].tolist())
+                        birth = int(len(vis_ids - gt_seen_ids))
+                        gt_seen_ids |= vis_ids
+                        fr.setdefault("gt", {})
+                        if isinstance(fr["gt"], dict):
+                            fr["gt"]["n_gt_vis_frame"] = int(len(vis_ids))
+                            fr["gt"]["gt_birth"] = birth
+                            fr["gt"]["gt_mem"] = int(len(gt_seen_ids))
+                            fr["gt"]["gt_vis_npoint"] = int(bs_gt_vis_npoint)
+                except Exception:
+                    pass
+                baseline_stats["frames"].append(fr)
             ## Query projector, semantic and geometric information
             if hasattr(self, 'merge_head'):
                 query_feats = self.merge_head(x['queries'][0])
@@ -2137,7 +2233,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     online_merger = OnlineMerge(
                         self.test_cfg.inscat_topk_insts,
                         self.use_bbox,
-                        monitor=online_monitor_enable,
+                        monitor=(online_monitor_enable or bs_record_online),
                     )
                 if online_merger is not None:
                     inst_masks = results[-1].pop('pts_instance_mask')[0]
@@ -2158,6 +2254,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         sem_preds_list.pop(-1)[0],
                         sp_xyz_list.pop(-1)[0],
                         bboxes_list.pop(-1)[0] if self.use_bbox else None)
+
+                    # Attach online merge stats to baseline stats (same frame).
+                    if bs_enable and baseline_stats is not None and baseline_stats.get("frames") and isinstance(getattr(online_merger, "last_stats", None), dict):
+                        baseline_stats["frames"][-1]["online"] = dict(online_merger.last_stats)  # type: ignore[arg-type]
 
                     if online_monitor_enable and online_monitor is not None and isinstance(getattr(online_merger, 'last_stats', None), dict):
                         st = dict(online_merger.last_stats)  # type: ignore[arg-type]
@@ -2276,6 +2376,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 instance_scores=mv_scores.cpu().numpy())
             if online_monitor_enable and online_monitor is not None:
                 merged_result.online_monitor = online_monitor
+            if bs_enable and baseline_stats is not None:
+                merged_result.baseline_stats = baseline_stats
             batch_data_samples[0].pred_pts_seg = merged_result
             return batch_data_samples
         
@@ -2297,6 +2399,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             instance_scores=mv_scores.cpu().numpy())
         if online_monitor_enable and online_monitor is not None:
             merged_result.online_monitor = online_monitor
+        if bs_enable and baseline_stats is not None:
+            merged_result.baseline_stats = baseline_stats
 
         # Ensemble the predictions with mesh segments (eval_ann_info['segment_ids'])
         if 'segment_ids' in batch_data_samples[0].eval_ann_info:
@@ -2334,7 +2438,13 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         results.pts_instance_mask[0] = ins_mask.cpu().numpy()
         return results
     
-    def predict_by_feat(self, out: Dict[str, Any], superpoints: Any) -> Tuple[List[PointData], List[torch.Tensor]]:  # type: ignore[override]
+    def predict_by_feat(
+        self,
+        out: Dict[str, Any],
+        superpoints: Any,
+        *,
+        gt_pts_instance: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[PointData], List[torch.Tensor]]:  # type: ignore[override]
         """Predict instance, semantic, and panoptic masks for a single scene.
 
         Args:
@@ -2350,7 +2460,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 `pts_instance_mask`, `instance_labels`, `instance_scores`.
         """
         inst_res = self.predict_by_feat_instance(
-            out, superpoints, self.test_cfg.inst_score_thr)
+            out, superpoints, self.test_cfg.inst_score_thr, gt_pts_instance=gt_pts_instance)
         sem_res = self.predict_by_feat_semantic(out, superpoints)
 
         sem_map2 = self.predict_by_feat_semantic(
@@ -2379,10 +2489,19 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         )
         if len(instance_select_scores) == 2:
             pd_kwargs["instance_select_scores"] = instance_select_scores
+        if isinstance(inst_res, (tuple, list)) and len(inst_res) > 6 and isinstance(inst_res[6], dict):
+            pd_kwargs["instance_stage_stats"] = [inst_res[6]]
 
         return [PointData(**pd_kwargs)], mapping
     
-    def predict_by_feat_instance(self, out: Dict[str, Any], superpoints: Any, score_threshold: float) -> Tuple[Any, torch.Tensor, torch.Tensor, Any, torch.Tensor, torch.Tensor]:  # type: ignore[override]
+    def predict_by_feat_instance(
+        self,
+        out: Dict[str, Any],
+        superpoints: Any,
+        score_threshold: float,
+        *,
+        gt_pts_instance: Optional[torch.Tensor] = None,
+    ) -> Tuple[Any, torch.Tensor, torch.Tensor, Any, torch.Tensor, torch.Tensor, Optional[dict]]:  # type: ignore[override]
         """Predict instance masks for a single scene.
 
         Args:
@@ -2414,6 +2533,19 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             self.num_classes,
             device=scores.device).unsqueeze(0).repeat(
                 len(cls_preds), 1).flatten(0, 1)
+
+        # Baseline stats (optional): per-frame diagnostics for supply/drops and (optionally)
+        # GT-aware duplication / killed-quality analysis.
+        bs_cfg = self.test_cfg.get('baseline_stats', None) or {}
+        bs_enable = bool(bs_cfg.get('enable', False))
+        bs_has_gt = bool(bs_enable and gt_pts_instance is not None and torch.is_tensor(gt_pts_instance))
+        bs_iou_thr = float(bs_cfg.get('iou_thr', 0.5))
+        bs_iou_lo_thr = float(bs_cfg.get('iou_lo_thr', 0.1))
+        bs_gt_vis_npoint = int(bs_cfg.get('gt_vis_npoint', 100))
+        bs_pre_pool = str(bs_cfg.get('pre_pool', 'after_nms'))
+        bs_record_quality = bool(bs_cfg.get('record_killed_quality', True))
+        bs_record_dup = bool(bs_cfg.get('record_dup', True))
+        stage_stats: Optional[dict] = None
 
         sel_cfg = self.test_cfg.get('selection', None) or {}
         base_scores = scores
@@ -2507,41 +2639,94 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         queries = queries[topk_idx]
         mapping = mapping[topk_idx]
 
+        n_after_topk = int(mask_pred_sigmoid.shape[0])
+        n_after_obj_norm = int(mask_pred_sigmoid.shape[0])
+        n_after_nms = int(mask_pred_sigmoid.shape[0])
+        n_after_inst_thr = int(mask_pred_sigmoid.shape[0])
+        n_after_npoint_thr = int(mask_pred_sigmoid.shape[0])
+        n_after_copy_suppress = int(mask_pred_sigmoid.shape[0])
+
+        pre_pool_masks = None
+        pre_pool_scores = None
+        pre_pool_select_scores = None
+        masks_after_obj_norm_bin = None
+        masks_after_nms_bin = None
+        masks_after_npoint_bin = None
+        killed_inst_mask_prepool = None
+        killed_npoint_mask_prepool = None
+        killed_nms_mask_preobj = None
+        killed_copy_mask_precs = None
+
         if self.test_cfg.get('obj_normalization', None):
             mask_scores = (mask_pred_sigmoid * (mask_pred > 0)).sum(1) / \
                 ((mask_pred > 0).sum(1) + 1e-6)
             scores = scores * mask_scores
+        n_after_obj_norm = int(mask_pred_sigmoid.shape[0])
+
+        if bs_enable and bs_record_quality:
+            masks_after_obj_norm_bin = mask_pred_sigmoid > float(self.test_cfg.sp_score_thr)
+
+        if bs_enable and bs_pre_pool == 'after_obj_norm':
+            pre_pool_masks = masks_after_obj_norm_bin if masks_after_obj_norm_bin is not None else (
+                mask_pred_sigmoid > float(self.test_cfg.sp_score_thr)
+            )
+            pre_pool_scores = scores
+            pre_pool_select_scores = select_scores
 
         if self.test_cfg.get('nms', None):
             kernel = str(self.test_cfg.matrix_nms_kernel)
+            pre_nms_n = int(mask_pred_sigmoid.shape[0])
             scores, labels, mask_pred_sigmoid, keep_inds = mask_matrix_nms(  # type: ignore[arg-type]
                 mask_pred_sigmoid, labels, scores, kernel=kernel)
+            if bs_enable and bs_record_quality:
+                killed_nms_mask_preobj = torch.ones(
+                    (pre_nms_n,), device=mask_pred_sigmoid.device, dtype=torch.bool
+                )
+                killed_nms_mask_preobj[keep_inds] = False
             queries = queries[keep_inds]
             mapping = mapping[keep_inds]
             select_scores = select_scores[keep_inds]
+        n_after_nms = int(mask_pred_sigmoid.shape[0])
 
         mask_pred_sigmoid = mask_pred_sigmoid[:, ...]
         mask_pred = mask_pred_sigmoid > self.test_cfg.sp_score_thr
+        if bs_enable and bs_record_quality:
+            masks_after_nms_bin = mask_pred
+
+        if bs_enable and bs_pre_pool == 'after_nms':
+            pre_pool_masks = mask_pred
+            pre_pool_scores = scores
+            pre_pool_select_scores = select_scores
 
         # score_thr
         score_mask = scores > score_threshold
+        if bs_enable:
+            killed_inst_mask_prepool = ~score_mask
         scores = scores[score_mask]
         labels = labels[score_mask]
         mask_pred = mask_pred[score_mask]
         queries = queries[score_mask]
         mapping = mapping[score_mask]
         select_scores = select_scores[score_mask]
+        n_after_inst_thr = int(scores.shape[0])
 
         # npoint_thr
         mask_pointnum = mask_pred.sum(1)
         npoint_thr = int(self.test_cfg.npoint_thr)
         npoint_mask = mask_pointnum > npoint_thr
+        if bs_enable and killed_inst_mask_prepool is not None:
+            # Expand killed-by-npoint to the original pre-pool indexing.
+            killed_npoint_mask_prepool = torch.zeros_like(killed_inst_mask_prepool)
+            killed_npoint_mask_prepool[score_mask] = ~npoint_mask
         scores = scores[npoint_mask]
         labels = labels[npoint_mask]
         mask_pred = mask_pred[npoint_mask]
         queries = queries[npoint_mask]
         mapping = mapping[npoint_mask]
         select_scores = select_scores[npoint_mask]
+        n_after_npoint_thr = int(scores.shape[0])
+        if bs_enable and bs_record_quality:
+            masks_after_npoint_bin = mask_pred
 
         cs_cfg = self.test_cfg.get('copy_suppress', None) or {}
         if bool(cs_cfg.get('enable', False)) and mask_pred.shape[0] > 1:
@@ -2565,6 +2750,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             rank_scores = scores if sort_by == 'scores' else select_scores
             prefer_scores = scores if prefer_by == 'scores' else select_scores
 
+            pre_cs_n = int(scores.shape[0])
             order = torch.argsort(rank_scores, descending=True)
             if pre_max_num is not None and pre_max_num > 0 and order.numel() > pre_max_num:
                 order = order[:pre_max_num]
@@ -2601,6 +2787,9 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
 
             keep_t = torch.tensor(keep, device=order.device, dtype=torch.long)
             keep_inds = order[keep_t]
+            if bs_enable and bs_record_quality:
+                killed_copy_mask_precs = torch.ones((pre_cs_n,), device=order.device, dtype=torch.bool)
+                killed_copy_mask_precs[keep_inds] = False
             scores = scores[keep_inds]
             labels = labels[keep_inds]
             mask_pred = mask_pred[keep_inds]
@@ -2608,7 +2797,217 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             mapping = mapping[keep_inds]
             select_scores = select_scores[keep_inds]
 
-        return mask_pred, labels, scores, queries, mapping, select_scores
+        n_after_copy_suppress = int(scores.shape[0])
+
+        # Always return stage counts/drops when enabled (even if GT is unavailable).
+        if bs_enable:
+            stage_stats = {
+                "cfg": {
+                    "gt_vis_npoint": int(bs_gt_vis_npoint),
+                    "iou_thr": float(bs_iou_thr),
+                    "iou_lo_thr": float(bs_iou_lo_thr),
+                    "pre_pool": bs_pre_pool,
+                },
+                "counts": {
+                    "after_topk": int(n_after_topk),
+                    "after_obj_norm": int(n_after_obj_norm),
+                    "after_nms": int(n_after_nms),
+                    "after_inst_thr": int(n_after_inst_thr),
+                    "after_npoint_thr": int(n_after_npoint_thr),
+                    "after_copy_suppress": int(n_after_copy_suppress),
+                },
+                "drops": {
+                    "drop_nms": int(max(n_after_obj_norm - n_after_nms, 0)),
+                    "drop_inst_thr": int(max(n_after_nms - n_after_inst_thr, 0)),
+                    "drop_npoint_thr": int(max(n_after_inst_thr - n_after_npoint_thr, 0)),
+                    "drop_copy_suppress": int(max(n_after_npoint_thr - n_after_copy_suppress, 0)),
+                },
+            }
+
+        # GT-aware metrics.
+        if bs_has_gt:
+            try:
+                gt_np = gt_pts_instance.detach().cpu().numpy()
+
+                def _np_percentiles(x: np.ndarray) -> dict:
+                    x = np.asarray(x, dtype=np.float32)
+                    if x.size == 0:
+                        return {"n": 0, "p50": 0.0, "p90": 0.0, "p95": 0.0}
+                    return {
+                        "n": int(x.size),
+                        "p50": float(np.percentile(x, 50)),
+                        "p90": float(np.percentile(x, 90)),
+                        "p95": float(np.percentile(x, 95)),
+                    }
+
+                def _pack_dup(gt_hit_cnt: np.ndarray) -> dict:
+                    gt_hit_cnt = np.asarray(gt_hit_cnt, dtype=np.int64)
+                    if gt_hit_cnt.size == 0:
+                        return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+                    hit0 = float(np.mean(gt_hit_cnt == 0))
+                    hit_ge2 = float(np.mean(gt_hit_cnt >= 2))
+                    hit = gt_hit_cnt[gt_hit_cnt >= 1]
+                    mean_mult = float(np.mean(hit)) if hit.size else 0.0
+                    return {"n_gt": int(gt_hit_cnt.size), "hit0": hit0, "hit_ge2": hit_ge2, "mean_mult_hit": mean_mult}
+
+                def _eval_pred_vs_gt(gt_ids_t: np.ndarray, pred_masks_t: np.ndarray) -> dict:
+                    gt_ids_t = np.asarray(gt_ids_t, dtype=np.int64).reshape(-1)
+                    pred_masks_t = np.asarray(pred_masks_t, dtype=bool)
+                    if pred_masks_t.ndim != 2:
+                        return {}
+                    # Normalize pred shape to (Npred, Npts).
+                    if pred_masks_t.shape[1] != gt_ids_t.shape[0] and pred_masks_t.shape[0] == gt_ids_t.shape[0]:
+                        pred_masks_t = pred_masks_t.T
+                    if pred_masks_t.shape[1] != gt_ids_t.shape[0]:
+                        return {}
+
+                    valid = gt_ids_t >= 0
+                    ids = gt_ids_t[valid]
+                    if ids.size == 0:
+                        return {"gt": {"n_gt_vis": 0}}
+                    uniq, cnt = np.unique(ids, return_counts=True)
+                    vis = cnt >= int(bs_gt_vis_npoint)
+                    vis_ids = np.sort(uniq[vis])
+                    G = int(vis_ids.size)
+                    if G == 0:
+                        return {"gt": {"n_gt_vis": 0}}
+
+                    mapped = np.full_like(gt_ids_t, -1, dtype=np.int64)
+                    idx_valid = np.where(valid)[0]
+                    pos = np.searchsorted(vis_ids, gt_ids_t[idx_valid])
+                    in_vis = (pos < G) & (vis_ids[pos] == gt_ids_t[idx_valid])
+                    mapped_valid = np.full((idx_valid.size,), -1, dtype=np.int64)
+                    mapped_valid[in_vis] = pos[in_vis]
+                    mapped[idx_valid] = mapped_valid
+
+                    gt_sizes = np.bincount(mapped[mapped >= 0], minlength=G).astype(np.int64)
+                    gt_hit_cnt = np.zeros((G,), dtype=np.int64)
+                    gt_hit_cnt_lo = np.zeros((G,), dtype=np.int64)
+
+                    pred_best_iou = np.zeros((pred_masks_t.shape[0],), dtype=np.float32)
+                    pred_best_cov = np.zeros((pred_masks_t.shape[0],), dtype=np.float32)
+                    pred_best_pur = np.zeros((pred_masks_t.shape[0],), dtype=np.float32)
+                    pred_size_arr = np.zeros((pred_masks_t.shape[0],), dtype=np.int64)
+
+                    for pi in range(pred_masks_t.shape[0]):
+                        pm = pred_masks_t[pi] & valid
+                        pred_size = int(pm.sum())
+                        pred_size_arr[pi] = pred_size
+                        if pred_size <= 0:
+                            continue
+                        labels_ = mapped[pm]
+                        labels_ = labels_[labels_ >= 0]
+                        if labels_.size == 0:
+                            continue
+                        inter = np.bincount(labels_, minlength=G).astype(np.int64)
+                        union = (pred_size + gt_sizes - inter).astype(np.float32)
+                        union = np.maximum(union, 1.0)
+                        iou = inter.astype(np.float32) / union
+
+                        best_g = int(np.argmax(iou))
+                        pred_best_iou[pi] = float(iou[best_g])
+                        pred_best_pur[pi] = float(inter[best_g] / max(pred_size, 1))
+                        pred_best_cov[pi] = float(inter[best_g] / max(int(gt_sizes[best_g]), 1))
+
+                        gt_hit_cnt += (iou >= float(bs_iou_thr)).astype(np.int64)
+                        gt_hit_cnt_lo += (iou >= float(bs_iou_lo_thr)).astype(np.int64)
+
+                    return {
+                        "gt": {"n_gt_vis": int(G)},
+                        "dup_iou": {
+                            f"thr_{bs_iou_thr:.2f}": _pack_dup(gt_hit_cnt),
+                            f"thr_{bs_iou_lo_thr:.2f}": _pack_dup(gt_hit_cnt_lo),
+                        },
+                        "pred_arrays": {
+                            "best_iou": pred_best_iou,
+                            "best_cov": pred_best_cov,
+                            "best_pur": pred_best_pur,
+                            "pred_size": pred_size_arr,
+                        },
+                    }
+
+                if bs_record_dup and pre_pool_masks is not None:
+                    pre = _eval_pred_vs_gt(gt_np, pre_pool_masks.detach().cpu().numpy())
+                    pre_arr = pre.pop("pred_arrays", None)
+                    if isinstance(pre_arr, dict):
+                        pre["pred_summary"] = {
+                            "best_iou": _np_percentiles(pre_arr.get("best_iou", np.zeros((0,), dtype=np.float32))),
+                            "best_cov": _np_percentiles(pre_arr.get("best_cov", np.zeros((0,), dtype=np.float32))),
+                            "best_pur": _np_percentiles(pre_arr.get("best_pur", np.zeros((0,), dtype=np.float32))),
+                            "pred_size": _np_percentiles(pre_arr.get("pred_size", np.zeros((0,), dtype=np.float32))),
+                        }
+                    stage_stats["pre_pool"] = pre
+
+                if bs_record_dup:
+                    post = _eval_pred_vs_gt(gt_np, mask_pred.detach().cpu().numpy())
+                    post_arr = post.pop("pred_arrays", None)
+                    if isinstance(post_arr, dict):
+                        post["pred_summary"] = {
+                            "best_iou": _np_percentiles(post_arr.get("best_iou", np.zeros((0,), dtype=np.float32))),
+                            "best_cov": _np_percentiles(post_arr.get("best_cov", np.zeros((0,), dtype=np.float32))),
+                            "best_pur": _np_percentiles(post_arr.get("best_pur", np.zeros((0,), dtype=np.float32))),
+                            "pred_size": _np_percentiles(post_arr.get("pred_size", np.zeros((0,), dtype=np.float32))),
+                        }
+                    stage_stats["det_to_merge"] = post
+
+                if bs_record_quality:
+                    def _killed_pack_from(pred_arr: dict, mask_bool: Optional[np.ndarray]) -> dict:
+                        bi = np.asarray(pred_arr.get("best_iou", []), dtype=np.float32)
+                        bc = np.asarray(pred_arr.get("best_cov", []), dtype=np.float32)
+                        bp = np.asarray(pred_arr.get("best_pur", []), dtype=np.float32)
+                        psz = np.asarray(pred_arr.get("pred_size", []), dtype=np.float32)
+                        if mask_bool is None or bi.size == 0:
+                            return {"n": 0, "killed_useful_any05": 0.0, "killed_useful_iou05": 0.0, "killed_useful_cov05": 0.0}
+                        mask_bool = np.asarray(mask_bool, dtype=bool)
+                        if mask_bool.size != bi.size:
+                            return {"n": 0, "killed_useful_any05": 0.0, "killed_useful_iou05": 0.0, "killed_useful_cov05": 0.0}
+                        x_iou = bi[mask_bool]
+                        x_cov = bc[mask_bool]
+                        x_pur = bp[mask_bool]
+                        x_sz = psz[mask_bool] if psz.size == bi.size else np.zeros((0,), dtype=np.float32)
+                        return {
+                            "n": int(x_iou.size),
+                            "best_iou": _np_percentiles(x_iou),
+                            "best_cov": _np_percentiles(x_cov),
+                            "best_pur": _np_percentiles(x_pur),
+                            "pred_size": _np_percentiles(x_sz),
+                            "killed_useful_any05": float(np.mean((x_iou >= 0.5) | (x_cov >= 0.5))) if x_iou.size else 0.0,
+                            "killed_useful_iou05": float(np.mean(x_iou >= 0.5)) if x_iou.size else 0.0,
+                            "killed_useful_cov05": float(np.mean(x_cov >= 0.5)) if x_cov.size else 0.0,
+                        }
+
+                    ki = killed_inst_mask_prepool.detach().cpu().numpy() if torch.is_tensor(killed_inst_mask_prepool) else None
+                    kn = killed_npoint_mask_prepool.detach().cpu().numpy() if torch.is_tensor(killed_npoint_mask_prepool) else None
+                    knms = killed_nms_mask_preobj.detach().cpu().numpy() if torch.is_tensor(killed_nms_mask_preobj) else None
+                    kcs = killed_copy_mask_precs.detach().cpu().numpy() if torch.is_tensor(killed_copy_mask_precs) else None
+
+                    pre_nms_arr = {}
+                    if knms is not None and masks_after_obj_norm_bin is not None and np.any(knms):
+                        tmp = _eval_pred_vs_gt(gt_np, masks_after_obj_norm_bin.detach().cpu().numpy())
+                        pre_nms_arr = (tmp.get("pred_arrays", {}) or {}) if isinstance(tmp, dict) else {}
+
+                    after_nms_arr = {}
+                    if (ki is not None or kn is not None) and masks_after_nms_bin is not None:
+                        tmp = _eval_pred_vs_gt(gt_np, masks_after_nms_bin.detach().cpu().numpy())
+                        after_nms_arr = (tmp.get("pred_arrays", {}) or {}) if isinstance(tmp, dict) else {}
+
+                    pre_cs_arr = {}
+                    if kcs is not None and masks_after_npoint_bin is not None and np.any(kcs):
+                        tmp = _eval_pred_vs_gt(gt_np, masks_after_npoint_bin.detach().cpu().numpy())
+                        pre_cs_arr = (tmp.get("pred_arrays", {}) or {}) if isinstance(tmp, dict) else {}
+
+                    stage_stats["killed_by_nms"] = _killed_pack_from(pre_nms_arr, knms)
+                    stage_stats["killed_by_inst_thr"] = _killed_pack_from(after_nms_arr, ki)
+                    stage_stats["killed_by_npoint_thr"] = _killed_pack_from(after_nms_arr, kn)
+                    stage_stats["killed_by_copy_suppress"] = _killed_pack_from(pre_cs_arr, kcs)
+            except Exception:
+                # Keep stage counts/drops even if GT-aware diagnostics fail.
+                if isinstance(stage_stats, dict):
+                    stage_stats.setdefault("warnings", [])
+                    if isinstance(stage_stats["warnings"], list):
+                        stage_stats["warnings"].append("gt_diagnostics_failed")
+
+        return mask_pred, labels, scores, queries, mapping, select_scores, stage_stats
     
     def predict_by_feat_panoptic(self, sem_map: torch.Tensor, mask_pred: torch.Tensor, labels: torch.Tensor, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
         """Predict panoptic masks for a single scene.
@@ -2813,12 +3212,9 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         features = []
         sp_xyz_list = []
         sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
-        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end])
-            sp_xyz_list.append(sp_xyz[begin: end])
             features.append(x[begin: end])
             sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
@@ -2913,12 +3309,9 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         features = []
         sp_xyz_list = []
         sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
-        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end])
-            sp_xyz_list.append(sp_xyz[begin: end])
             features.append(x[begin: end])
             sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list

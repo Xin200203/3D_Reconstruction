@@ -1,0 +1,149 @@
+{
+  "counts": {
+    "scenes": 312,
+    "frames": 13430
+  },
+  "stage_counts": {
+    "after_topk": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "after_obj_norm": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "after_nms": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "after_inst_thr": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "after_npoint_thr": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "after_copy_suppress": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    }
+  },
+  "stage_drops": {
+    "drop_nms": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "drop_inst_thr": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "drop_npoint_thr": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "drop_copy_suppress": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    }
+  },
+  "killed_useful_iou05": {
+    "inst_thr": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "npoint_thr": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    }
+  },
+  "dup_gt_iou05": {
+    "pre_pool_hit0": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "pre_pool_hit_ge2": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "det_to_merge_hit0": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "det_to_merge_hit_ge2": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    }
+  },
+  "gt": {
+    "gt_birth": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    },
+    "gt_mem": {
+      "n": 0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0
+    }
+  },
+  "inflation": {
+    "n": 0,
+    "mean": 0.0,
+    "median": 0.0,
+    "p90": 0.0,
+    "p95": 0.0
+  }
+}

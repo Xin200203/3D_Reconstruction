@@ -46,6 +46,7 @@ class UnifiedSegMetric(SegMetric):
                  eval_mode: str = 'auto',
                  diagnostics: Optional[dict] = None,
                  online_monitor: Optional[dict] = None,
+                 baseline_stats: Optional[dict] = None,
                  **kwargs):
         self.thing_class_inds = thing_class_inds
         self.stuff_class_inds = stuff_class_inds
@@ -61,6 +62,7 @@ class UnifiedSegMetric(SegMetric):
         self.eval_mode = eval_mode
         self.diagnostics = diagnostics or {}
         self.online_monitor = online_monitor or {}
+        self.baseline_stats = baseline_stats or {}
         super().__init__(**kwargs)
 
     @staticmethod
@@ -162,6 +164,211 @@ class UnifiedSegMetric(SegMetric):
             "mem_size_full": _pack(mem_full),
             "mem_size_kept": _pack(mem_kept),
             "topk_drop": _pack(topk_drop),
+        }
+
+    @staticmethod
+    def _summarize_baseline_stats(stats_list: Sequence[dict]) -> dict:
+        """Summarize GT-aware baseline statistics dumped from model outputs."""
+        def _scenes():
+            for s in stats_list:
+                if isinstance(s, dict):
+                    yield s
+
+        def _frames():
+            for s in stats_list:
+                if not isinstance(s, dict):
+                    continue
+                frames = s.get("frames", [])
+                if not isinstance(frames, list):
+                    continue
+                for fr in frames:
+                    if isinstance(fr, dict):
+                        yield fr
+
+        def _pack(x: np.ndarray) -> dict:
+            if x.size == 0:
+                return {"n": 0, "mean": 0.0, "median": 0.0, "p90": 0.0, "p95": 0.0}
+            return {
+                "n": int(x.size),
+                "mean": float(np.mean(x)),
+                "median": float(np.median(x)),
+                "p90": float(np.percentile(x, 90)),
+                "p95": float(np.percentile(x, 95)),
+            }
+
+        def _collect(getter) -> np.ndarray:
+            vals = []
+            for fr in _frames():
+                try:
+                    v = getter(fr)
+                except Exception:
+                    v = None
+                if isinstance(v, (int, float, np.number)):
+                    vals.append(float(v))
+            return np.asarray(vals, dtype=np.float32)
+
+        # Stage counts / drops.
+        stage_keys = [
+            "after_topk",
+            "after_obj_norm",
+            "after_nms",
+            "after_inst_thr",
+            "after_npoint_thr",
+            "after_copy_suppress",
+        ]
+        drop_keys = ["drop_nms", "drop_inst_thr", "drop_npoint_thr", "drop_copy_suppress"]
+
+        stage = {k: _pack(_collect(lambda fr, kk=k: (fr.get("counts", {}) or {}).get(kk))) for k in stage_keys}
+        drops = {k: _pack(_collect(lambda fr, kk=k: (fr.get("drops", {}) or {}).get(kk))) for k in drop_keys}
+
+        # Killed useful rates (GT-aware): which gate is throwing away potentially
+        # useful candidates (IoU>=0.5 or Cov>=0.5)?
+        def _killed(fr, stage: str, key: str):
+            blk = fr.get(stage, {}) or {}
+            return blk.get(key, None)
+
+        killed_inst_any = _pack(_collect(lambda fr: _killed(fr, "killed_by_inst_thr", "killed_useful_any05")))
+        killed_inst_iou = _pack(_collect(lambda fr: _killed(fr, "killed_by_inst_thr", "killed_useful_iou05")))
+        killed_inst_cov = _pack(_collect(lambda fr: _killed(fr, "killed_by_inst_thr", "killed_useful_cov05")))
+
+        killed_np_any = _pack(_collect(lambda fr: _killed(fr, "killed_by_npoint_thr", "killed_useful_any05")))
+        killed_np_iou = _pack(_collect(lambda fr: _killed(fr, "killed_by_npoint_thr", "killed_useful_iou05")))
+        killed_np_cov = _pack(_collect(lambda fr: _killed(fr, "killed_by_npoint_thr", "killed_useful_cov05")))
+
+        killed_nms_any = _pack(_collect(lambda fr: _killed(fr, "killed_by_nms", "killed_useful_any05")))
+        killed_nms_iou = _pack(_collect(lambda fr: _killed(fr, "killed_by_nms", "killed_useful_iou05")))
+        killed_nms_cov = _pack(_collect(lambda fr: _killed(fr, "killed_by_nms", "killed_useful_cov05")))
+
+        killed_cs_any = _pack(_collect(lambda fr: _killed(fr, "killed_by_copy_suppress", "killed_useful_any05")))
+        killed_cs_iou = _pack(_collect(lambda fr: _killed(fr, "killed_by_copy_suppress", "killed_useful_iou05")))
+        killed_cs_cov = _pack(_collect(lambda fr: _killed(fr, "killed_by_copy_suppress", "killed_useful_cov05")))
+
+        # Killed-set quality percentiles (per-frame summaries of killed candidates).
+        def _killed_pct(fr, stage: str, metric: str, pct: str):
+            blk = fr.get(stage, {}) or {}
+            m = blk.get(metric, {}) or {}
+            return m.get(pct, None)
+
+        killed_quality = {}
+        for stage_name, stage_key in [
+            ("nms", "killed_by_nms"),
+            ("inst_thr", "killed_by_inst_thr"),
+            ("npoint_thr", "killed_by_npoint_thr"),
+            ("copy_suppress", "killed_by_copy_suppress"),
+        ]:
+            killed_quality[stage_name] = {}
+            for metric in ["best_iou", "best_cov", "best_pur", "pred_size"]:
+                killed_quality[stage_name][metric] = {
+                    "p50": _pack(_collect(lambda fr, sk=stage_key, m=metric: _killed_pct(fr, sk, m, "p50"))),
+                    "p90": _pack(_collect(lambda fr, sk=stage_key, m=metric: _killed_pct(fr, sk, m, "p90"))),
+                    "p95": _pack(_collect(lambda fr, sk=stage_key, m=metric: _killed_pct(fr, sk, m, "p95"))),
+                }
+
+        # Duplication (GT multiplicity) in pre-pool vs det_to_merge.
+        def _dup(fr, where: str, thr: str, key: str):
+            blk = fr.get(where, {}) or {}
+            dup = blk.get("dup_iou", {}) or {}
+            item = dup.get(thr, {}) or {}
+            return item.get(key, None)
+
+        hit0_pre = _pack(_collect(lambda fr: _dup(fr, "pre_pool", "thr_0.50", "hit0")))
+        hitge2_pre = _pack(_collect(lambda fr: _dup(fr, "pre_pool", "thr_0.50", "hit_ge2")))
+        mult_pre = _pack(_collect(lambda fr: _dup(fr, "pre_pool", "thr_0.50", "mean_mult_hit")))
+        hit0_post = _pack(_collect(lambda fr: _dup(fr, "det_to_merge", "thr_0.50", "hit0")))
+        hitge2_post = _pack(_collect(lambda fr: _dup(fr, "det_to_merge", "thr_0.50", "hit_ge2")))
+        mult_post = _pack(_collect(lambda fr: _dup(fr, "det_to_merge", "thr_0.50", "mean_mult_hit")))
+
+        hit0lo_pre = _pack(_collect(lambda fr: _dup(fr, "pre_pool", "thr_0.10", "hit0")))
+        hitge2lo_pre = _pack(_collect(lambda fr: _dup(fr, "pre_pool", "thr_0.10", "hit_ge2")))
+        multlo_pre = _pack(_collect(lambda fr: _dup(fr, "pre_pool", "thr_0.10", "mean_mult_hit")))
+        hit0lo_post = _pack(_collect(lambda fr: _dup(fr, "det_to_merge", "thr_0.10", "hit0")))
+        hitge2lo_post = _pack(_collect(lambda fr: _dup(fr, "det_to_merge", "thr_0.10", "hit_ge2")))
+        multlo_post = _pack(_collect(lambda fr: _dup(fr, "det_to_merge", "thr_0.10", "mean_mult_hit")))
+
+        # GT appearance/memory stats (if present).
+        gt_birth = _pack(_collect(lambda fr: (fr.get("gt", {}) or {}).get("gt_birth")))
+        gt_mem = _pack(_collect(lambda fr: (fr.get("gt", {}) or {}).get("gt_mem")))
+
+        # Inflation = mem_size_full / gt_mem (frame-level), if both exist.
+        def _infl(fr):
+            online = fr.get("online", {}) or {}
+            mem = online.get("mem_size_full", None)
+            gt = fr.get("gt", {}) or {}
+            gm = gt.get("gt_mem", None)
+            if isinstance(mem, (int, float, np.number)) and isinstance(gm, (int, float, np.number)) and float(gm) > 0:
+                return float(mem) / float(gm)
+            return None
+        inflation = _pack(_collect(_infl))
+
+        # Scene-level duplicate stats (map-level GT multiplicity), if present.
+        def _collect_scene(getter) -> np.ndarray:
+            vals = []
+            for s in _scenes():
+                try:
+                    v = getter(s)
+                except Exception:
+                    v = None
+                if isinstance(v, (int, float, np.number)):
+                    vals.append(float(v))
+            return np.asarray(vals, dtype=np.float32)
+
+        def _scene_dup(s, thr: str, key: str):
+            blk = s.get("scene_level_dup", {}) or {}
+            item = blk.get(thr, {}) or {}
+            return item.get(key, None)
+
+        scene_hit0_05 = _pack(_collect_scene(lambda s: _scene_dup(s, "thr_0.50", "hit0")))
+        scene_hitge2_05 = _pack(_collect_scene(lambda s: _scene_dup(s, "thr_0.50", "hit_ge2")))
+        scene_mult_05 = _pack(_collect_scene(lambda s: _scene_dup(s, "thr_0.50", "mean_mult_hit")))
+        scene_hit0_01 = _pack(_collect_scene(lambda s: _scene_dup(s, "thr_0.10", "hit0")))
+        scene_hitge2_01 = _pack(_collect_scene(lambda s: _scene_dup(s, "thr_0.10", "hit_ge2")))
+        scene_mult_01 = _pack(_collect_scene(lambda s: _scene_dup(s, "thr_0.10", "mean_mult_hit")))
+
+        return {
+            "counts": {
+                "scenes": int(len([s for s in stats_list if isinstance(s, dict)])),
+                "frames": int(sum(len(s.get("frames", [])) for s in stats_list if isinstance(s, dict) and isinstance(s.get("frames", None), list))),
+            },
+            "stage_counts": stage,
+            "stage_drops": drops,
+            "killed_useful_iou05": {
+                "inst_thr": {"any": killed_inst_any, "iou": killed_inst_iou, "cov": killed_inst_cov},
+                "npoint_thr": {"any": killed_np_any, "iou": killed_np_iou, "cov": killed_np_cov},
+                "nms": {"any": killed_nms_any, "iou": killed_nms_iou, "cov": killed_nms_cov},
+                "copy_suppress": {"any": killed_cs_any, "iou": killed_cs_iou, "cov": killed_cs_cov},
+            },
+            "killed_quality": killed_quality,
+            "dup_gt_iou05": {
+                "pre_pool_hit0": hit0_pre,
+                "pre_pool_hit_ge2": hitge2_pre,
+                "pre_pool_mean_mult_hit": mult_pre,
+                "det_to_merge_hit0": hit0_post,
+                "det_to_merge_hit_ge2": hitge2_post,
+                "det_to_merge_mean_mult_hit": mult_post,
+            },
+            "dup_gt_iou01": {
+                "pre_pool_hit0": hit0lo_pre,
+                "pre_pool_hit_ge2": hitge2lo_pre,
+                "pre_pool_mean_mult_hit": multlo_pre,
+                "det_to_merge_hit0": hit0lo_post,
+                "det_to_merge_hit_ge2": hitge2lo_post,
+                "det_to_merge_mean_mult_hit": multlo_post,
+            },
+            "gt": {
+                "gt_birth": gt_birth,
+                "gt_mem": gt_mem,
+            },
+            "inflation": inflation,
+            "scene_dup_iou05": {
+                "hit0": scene_hit0_05,
+                "hit_ge2": scene_hitge2_05,
+                "mean_mult_hit": scene_mult_05,
+            },
+            "scene_dup_iou01": {
+                "hit0": scene_hit0_01,
+                "hit_ge2": scene_hitge2_01,
+                "mean_mult_hit": scene_mult_01,
+            },
         }
 
     @staticmethod
@@ -696,6 +903,7 @@ class UnifiedSegMetric(SegMetric):
         pred_instance_scores = []
         pred_instance_select_scores = []
         online_monitor_results = []
+        baseline_stats_results = []
 
         gt_semantic_masks_sem_task = []
         pred_semantic_masks_sem_task = []
@@ -738,6 +946,8 @@ class UnifiedSegMetric(SegMetric):
                     torch.tensor(single_pred_results['instance_scores']))
             if 'online_monitor' in single_pred_results:
                 online_monitor_results.append(single_pred_results['online_monitor'])
+            if 'baseline_stats' in single_pred_results:
+                baseline_stats_results.append(single_pred_results['baseline_stats'])
 
         # ret_pan = panoptic_seg_eval(
         #     gt_masks_pan, pred_masks_pan, classes, thing_classes,
@@ -846,6 +1056,101 @@ class UnifiedSegMetric(SegMetric):
                 logger.info(f"[UnifiedSegMetric] online monitor saved to: {out_dir}")
         except Exception as e:
             logger.warning(f"[UnifiedSegMetric] online monitor dump failed: {e}")
+
+        # Optional: baseline statistics dump (GT-aware; per-frame/per-scene).
+        try:
+            bs_cfg = self.baseline_stats or {}
+            if bool(bs_cfg.get("enable", False)) and len(baseline_stats_results) > 0:
+                # Attach scene-level duplicate stats (map-level GT multiplicity) to each scene record.
+                # This bridges online behavior stats (birth/mem/topk_drop) with GT-level redundancy.
+                try:
+                    gt_vis_npoint = int(bs_cfg.get("gt_vis_npoint", 100))
+                    iou_thr = float(bs_cfg.get("iou_thr", 0.5))
+                    iou_lo_thr = float(bs_cfg.get("iou_lo_thr", 0.1))
+
+                    def _pack_dup(gt_hit_cnt):
+                        gt_hit_cnt = np.asarray(gt_hit_cnt, dtype=np.int64)
+                        if gt_hit_cnt.size == 0:
+                            return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+                        hit0 = float(np.mean(gt_hit_cnt == 0))
+                        hit_ge2 = float(np.mean(gt_hit_cnt >= 2))
+                        hit = gt_hit_cnt[gt_hit_cnt >= 1]
+                        mean_mult = float(np.mean(hit)) if hit.size else 0.0
+                        return {"n_gt": int(gt_hit_cnt.size), "hit0": hit0, "hit_ge2": hit_ge2, "mean_mult_hit": mean_mult}
+
+                    def _scene_dup(gt_ids, pred_masks, thr):
+                        gt_ids = np.asarray(gt_ids, dtype=np.int64).reshape(-1)
+                        pred_masks = self._to_numpy_bool(pred_masks)
+                        if pred_masks.ndim != 2:
+                            return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+                        # Normalize pred shape to (Npred, Npts).
+                        if pred_masks.shape[1] != gt_ids.shape[0] and pred_masks.shape[0] == gt_ids.shape[0]:
+                            pred_masks = pred_masks.T
+                        if pred_masks.shape[1] != gt_ids.shape[0]:
+                            return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+
+                        valid = gt_ids >= 0
+                        ids = gt_ids[valid]
+                        if ids.size == 0:
+                            return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+                        uniq, cnt = np.unique(ids, return_counts=True)
+                        vis = cnt >= int(gt_vis_npoint)
+                        vis_ids = np.sort(uniq[vis])
+                        G = int(vis_ids.size)
+                        if G == 0:
+                            return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+
+                        mapped = np.full_like(gt_ids, -1, dtype=np.int64)
+                        idx_valid = np.where(valid)[0]
+                        pos = np.searchsorted(vis_ids, gt_ids[idx_valid])
+                        in_vis = (pos < G) & (vis_ids[pos] == gt_ids[idx_valid])
+                        mapped_valid = np.full((idx_valid.size,), -1, dtype=np.int64)
+                        mapped_valid[in_vis] = pos[in_vis]
+                        mapped[idx_valid] = mapped_valid
+
+                        gt_sizes = np.bincount(mapped[mapped >= 0], minlength=G).astype(np.int64)
+                        gt_hit_cnt = np.zeros((G,), dtype=np.int64)
+                        thr = float(thr)
+                        for pi in range(pred_masks.shape[0]):
+                            pm = pred_masks[pi] & valid
+                            pred_size = int(pm.sum())
+                            if pred_size <= 0:
+                                continue
+                            labels_ = mapped[pm]
+                            labels_ = labels_[labels_ >= 0]
+                            if labels_.size == 0:
+                                continue
+                            inter = np.bincount(labels_, minlength=G).astype(np.int64)
+                            union = (pred_size + gt_sizes - inter).astype(np.float32)
+                            union = np.maximum(union, 1.0)
+                            iou = inter.astype(np.float32) / union
+                            gt_hit_cnt += (iou >= thr).astype(np.int64)
+                        return _pack_dup(gt_hit_cnt)
+
+                    # Align by index: baseline_stats_results are appended in the same order as `results`.
+                    for i in range(min(len(baseline_stats_results), len(gt_instance_masks_inst_task), len(pred_instance_masks_inst_task))):
+                        baseline_stats_results[i]["scene_level_dup"] = {
+                            "cfg": {"gt_vis_npoint": int(gt_vis_npoint)},
+                            f"thr_{iou_thr:.2f}": _scene_dup(gt_instance_masks_inst_task[i], pred_instance_masks_inst_task[i], iou_thr),
+                            f"thr_{iou_lo_thr:.2f}": _scene_dup(gt_instance_masks_inst_task[i], pred_instance_masks_inst_task[i], iou_lo_thr),
+                        }
+                except Exception:
+                    pass
+
+                out_dir = str(bs_cfg.get("out_dir", "baseline_stats"))
+                out_dir = self._resolve_diagnostics_dir(logger, out_dir)
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+                with open(os.path.join(out_dir, "baseline_stats.json"), "w", encoding="utf-8") as f:
+                    json.dump(baseline_stats_results, f, indent=2, ensure_ascii=False, default=str)
+
+                summary = self._summarize_baseline_stats(baseline_stats_results)
+                with open(os.path.join(out_dir, "baseline_stats_summary.json"), "w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
+
+                logger.info(f"[UnifiedSegMetric] baseline stats saved to: {out_dir}")
+        except Exception as e:
+            logger.warning(f"[UnifiedSegMetric] baseline stats dump failed: {e}")
 
         metrics = dict()
         # for ret, keys in zip((ret_sem, ret_inst, ret_pan), self.logger_keys):

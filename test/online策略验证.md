@@ -74,6 +74,26 @@
   - `online_monitor/online_monitor.json`（每 scene 的 per-frame 统计）
   - `online_monitor/online_monitor_summary.json`（全数据集汇总：均值/中位数/p90/p95）
 
+### 4.3 baseline_stats：逐帧“过滤杀掉什么 + 同帧重复”统计（本轮新增）
+
+目的：回答三个可证伪问题（baseline-only，不改策略）：
+1) `det_to_merge` 为何不大：到底被 `nms / inst_score_thr / npoint_thr / copy_suppress` 哪个闸门控制？
+2) 过滤掉的是垃圾还是“有用但被杀”的关键碎片（`killed_useful@0.5`）？
+3) 过滤前后的同帧重复（GT 视角 `hit_ge2@0.5/hit0@0.5`）是否真的被压下，代价是什么？
+
+实现落点（与代码一致）：
+- 统计在 `predict_by_feat_instance()` 内完成（逐帧点云空间），并在 `ScanNet200MixFormer3D_Online.predict()` 汇总 GT birth/mem 与 OnlineMerge 行为量。
+
+开关与输出：
+- 模型侧：`model.test_cfg.baseline_stats.enable=True`
+  - 建议同时设置 `model.test_cfg.baseline_stats.record_online=True`（默认 True）：即使不开 `online_monitor`，也会让 `OnlineMerge` 生成 `last_stats`，从而在 baseline_stats 里写入 `mem_size_full/topk_drop/...` 并计算 `inflation`。
+  - 可选参数（建议先用默认）：`gt_vis_npoint=100`, `iou_thr=0.5`, `iou_lo_thr=0.1`, `pre_pool=after_nms`
+- evaluator 侧落盘：`test_evaluator.baseline_stats.enable=True`
+  - `test_evaluator.baseline_stats.out_dir=baseline_stats`（相对路径自动落在 `--work-dir` 下）
+- 输出：
+  - `baseline_stats/baseline_stats.json`（raw，按 scene→frames）
+  - `baseline_stats/baseline_stats_summary.json`（汇总：stage counts/drops、killed_useful、dup pre/post、GT birth/mem、inflation）
+
 ### 4.1.1 健康门槛（本轮新增：A/B 前置验收）
 跑任何 A/B 前，先跑一次 O0-baseline，并检查 `online_monitor_summary.json`：
 - `match_rate.mean`：建议 ≥ 0.70（本次修复后约 0.82）
@@ -153,6 +173,12 @@
 - `--cfg-options model.test_cfg.online_monitor.enable=True test_evaluator.online_monitor.enable=True`
 - 建议同时指定 `out_dir`（相对路径即可；`tools/test.py` 会强制解析到 `--work-dir` 下，避免不同实验互相覆盖）：
   - `test_evaluator.online_monitor.out_dir=online_monitor`
+
+### 6.3 开启 baseline_stats（本轮统计实验）
+建议先在小子集 scene 上跑通（避免全量过慢），再跑全量：
+- `--cfg-options model.test_cfg.baseline_stats.enable=True test_evaluator.baseline_stats.enable=True`
+- 建议指定输出目录：
+  - `test_evaluator.baseline_stats.out_dir=baseline_stats`
 
 ### 6.2 （可选）开启 scene-level instance diagnostics（解释最终结果）
 - `test_evaluator.diagnostics.enable=True`

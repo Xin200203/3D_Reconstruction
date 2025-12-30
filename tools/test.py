@@ -158,6 +158,34 @@ def _rewrite_online_monitor_out_dir(cfg):
                 _rewrite_one(e)
 
 
+def _rewrite_baseline_stats_out_dir(cfg):
+    """Resolve `baseline_stats.out_dir` under runner `work_dir`.
+
+    Similar to diagnostics/online_monitor, baseline_stats dumps should be
+    experiment-scoped to avoid cross-run overwrites.
+    """
+
+    def _rewrite_one(evaluator):
+        if not isinstance(evaluator, dict):
+            return
+        bs = evaluator.get('baseline_stats', None)
+        if not isinstance(bs, dict):
+            return
+        out_dir = bs.get('out_dir', 'baseline_stats')
+        out_dir = str(out_dir)
+        if not osp.isabs(out_dir):
+            bs['out_dir'] = osp.abspath(osp.join(cfg.work_dir, out_dir))
+
+    for key in ('val_evaluator', 'test_evaluator'):
+        if key not in cfg:
+            continue
+        if isinstance(cfg[key], dict):
+            _rewrite_one(cfg[key])
+        elif isinstance(cfg[key], (list, tuple)):
+            for e in cfg[key]:
+                _rewrite_one(e)
+
+
 def _warn_checkpoint_cfg_mismatch(cfg, checkpoint_path: str) -> None:
     """Warn when checkpoint meta['cfg'] disagrees with current config.
 
@@ -256,6 +284,8 @@ def main():
     _rewrite_diagnostics_out_dir(cfg)
     # Ensure online monitor output does not overwrite across experiments.
     _rewrite_online_monitor_out_dir(cfg)
+    # Ensure baseline stats output does not overwrite across experiments.
+    _rewrite_baseline_stats_out_dir(cfg)
 
     # Guardrail: warn about common silent config/ckpt mismatches.
     _warn_checkpoint_cfg_mismatch(cfg, args.checkpoint)

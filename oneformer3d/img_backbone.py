@@ -1,101 +1,130 @@
-from ultralytics import YOLO
+"""Image backbone and helper utilities.
+
+This module contains both:
+1) Generic geometry/projection utilities used by 3D models; and
+2) Optional FastSAM/YOLO wrappers used by some configs.
+
+Important: some repos vendor a partial `ultralytics` package (e.g. via FastSAM)
+that may not include `ultralytics.utils`. To keep 3D-only configs runnable, all
+Ultralytics/FastSAM-related imports are optional and only required when the
+corresponding backbone is instantiated.
+"""
+
 from PIL import Image
 import torch
 from torch import nn as nn
 from torch.nn import functional as F
 import torchvision
 import pdb
-from ultralytics.utils import ops
-from ultralytics.utils.torch_utils import select_device, smart_inference_mode
-from ultralytics.models.yolo.segment import SegmentationPredictor
-from ultralytics.cfg import get_cfg
+
+# Optional dependency: Ultralytics (full package). If it's missing (or a
+# partial vendored copy is present), we keep this module importable.
+try:
+    from ultralytics import YOLO  # type: ignore
+    from ultralytics.utils import ops  # type: ignore
+    from ultralytics.utils.torch_utils import select_device, smart_inference_mode  # type: ignore
+    from ultralytics.models.yolo.segment import SegmentationPredictor  # type: ignore
+    from ultralytics.cfg import get_cfg  # type: ignore
+    _HAS_ULTRALYTICS = True
+except Exception:  # pragma: no cover - environment dependent
+    YOLO = None  # type: ignore[assignment]
+    ops = None  # type: ignore[assignment]
+    select_device = None  # type: ignore[assignment]
+    get_cfg = None  # type: ignore[assignment]
+    _HAS_ULTRALYTICS = False
+
+    # Define a no-op decorator so that function definitions remain valid.
+    def smart_inference_mode(*args, **kwargs):  # type: ignore[override]
+        def _wrap(fn):
+            return fn
+
+        return _wrap
+
+    class SegmentationPredictor:  # type: ignore[override]
+        pass
 import sys
 from mmengine.model import BaseModule
 from mmdet3d.registry import MODELS
 
-class MyYOLO(YOLO):
-    @smart_inference_mode()
-    def predict(self, source=None, stream=False, **kwargs):
-        """
-        Perform prediction using the YOLO model.
+if _HAS_ULTRALYTICS:
+    class MyYOLO(YOLO):
+        @smart_inference_mode()
+        def predict(self, source=None, stream=False, **kwargs):
+            """Perform prediction using the YOLO model."""
+            is_cli = (sys.argv[0].endswith('yolo') or sys.argv[0].endswith('ultralytics')) and any(
+                x in sys.argv for x in ('predict', 'track', 'mode=predict', 'mode=track'))
+            overrides = self.overrides.copy()
+            overrides['conf'] = 0.25
+            overrides.update(kwargs)  # prefer kwargs
+            overrides['mode'] = kwargs.get('mode', 'predict')
+            assert overrides['mode'] in ['track', 'predict']
+            if not is_cli:
+                overrides['save'] = kwargs.get('save', False)  # do not save by default if called in Python
+            if not self.predictor:
+                self.task = overrides.get('task') or self.task
+                self.predictor = MyPredictor(overrides=overrides, _callbacks=self.callbacks)
+                self.predictor.setup_model(model=self.model, verbose=is_cli)
+            else:  # only update args if predictor is already setup
+                self.predictor.args = get_cfg(self.predictor.args, overrides)
+                if 'project' in overrides or 'name' in overrides:
+                    self.predictor.save_dir = self.predictor.get_save_dir()
+            return self.predictor.predict_cli(source=source) if is_cli else self.predictor(source=source, stream=stream)
 
-        Args:
-            source (str | int | PIL | np.ndarray): The source of the image to make predictions on.
-                          Accepts all source types accepted by the YOLO model.
-            stream (bool): Whether to stream the predictions or not. Defaults to False.
-            **kwargs : Additional keyword arguments passed to the predictor.
-                       Check the 'configuration' section in the documentation for all available options.
+    class MyPredictor(SegmentationPredictor):
+        @smart_inference_mode()
+        def stream_inference(self, source=None, model=None):
+            """Streams real-time inference on camera feed and saves results to file."""
+            # Setup model
+            if not self.model:
+                self.setup_model(model)
+            # Setup source every time predict is called
+            self.setup_source(source if source is not None else self.args.source)
 
-        Returns:
-            (List[ultralytics.yolo.engine.results.Results]): The prediction results.
-        """
-        is_cli = (sys.argv[0].endswith('yolo') or sys.argv[0].endswith('ultralytics')) and any(
-            x in sys.argv for x in ('predict', 'track', 'mode=predict', 'mode=track'))
-        overrides = self.overrides.copy()
-        overrides['conf'] = 0.25
-        overrides.update(kwargs)  # prefer kwargs
-        overrides['mode'] = kwargs.get('mode', 'predict')
-        assert overrides['mode'] in ['track', 'predict']
-        if not is_cli:
-            overrides['save'] = kwargs.get('save', False)  # do not save by default if called in Python
-        if not self.predictor:
-            self.task = overrides.get('task') or self.task
-            self.predictor = MyPredictor(overrides=overrides, _callbacks=self.callbacks)
-            self.predictor.setup_model(model=self.model, verbose=is_cli)
-        else:  # only update args if predictor is already setup
-            self.predictor.args = get_cfg(self.predictor.args, overrides)
-            if 'project' in overrides or 'name' in overrides:
-                self.predictor.save_dir = self.predictor.get_save_dir()
-        return self.predictor.predict_cli(source=source) if is_cli else self.predictor(source=source, stream=stream)
+            # Warmup model
+            if not self.done_warmup:
+                self.model.warmup(imgsz=(1 if self.model.pt or self.model.triton else self.dataset.bs, 3, *self.imgsz))
+                self.done_warmup = True
 
+            self.seen, self.windows, self.batch, profilers = 0, [], None, (ops.Profile(), ops.Profile(), ops.Profile())
+            self.run_callbacks('on_predict_start')
+            for batch in self.dataset:
+                self.run_callbacks('on_predict_batch_start')
+                self.batch = batch
+                path, im0s, vid_cap, s = batch
 
-class MyPredictor(SegmentationPredictor):
-    @smart_inference_mode()
-    def stream_inference(self, source=None, model=None):
-        """Streams real-time inference on camera feed and saves results to file."""
+                # Preprocess
+                with profilers[0]:
+                    im = self.preprocess(im0s)
 
-        # Setup model
-        if not self.model:
-            self.setup_model(model)
-        # Setup source every time predict is called
-        self.setup_source(source if source is not None else self.args.source)
+                # Inference
+                with profilers[1]:
+                    preds = self.model(im, augment=self.args.augment)
+            return preds
 
-        # Warmup model
-        if not self.done_warmup:
-            self.model.warmup(imgsz=(1 if self.model.pt or self.model.triton else self.dataset.bs, 3, *self.imgsz))
-            self.done_warmup = True
+    @MODELS.register_module()
+    class FastSAM_Backbone(BaseModule):
+        def __init__(self):
+            super(FastSAM_Backbone, self).__init__()
+            self.yolo = MyYOLO('./data/FastSAM-x.pt')
+            self.yolo.model.model = self.yolo.model.model[:15]
 
-        self.seen, self.windows, self.batch, profilers = 0, [], None, (ops.Profile(), ops.Profile(), ops.Profile())
-        self.run_callbacks('on_predict_start')
-        for batch in self.dataset:
-            self.run_callbacks('on_predict_batch_start')
-            self.batch = batch
-            path, im0s, vid_cap, s = batch
+        def init_weights(self):
+            for param in self.yolo.model.parameters():
+                param.requires_grad = False
+            self.yolo.model.eval()
 
-            # Preprocess
-            with profilers[0]:
-                im = self.preprocess(im0s)
-
-            # Inference
-            with profilers[1]:
-                preds = self.model(im, augment=self.args.augment)
-        return preds
-
-@MODELS.register_module()
-class FastSAM_Backbone(BaseModule):
-    def __init__(self):
-        super(FastSAM_Backbone, self).__init__()
-        self.yolo = MyYOLO('./data/FastSAM-x.pt')
-        self.yolo.model.model = self.yolo.model.model[:15]
-
-    def init_weights(self):
-        for param in self.yolo.model.parameters():
-            param.requires_grad = False
-        self.yolo.model.eval()
-
-    def forward(self, x):
-        x = self.yolo.predict(x, device='cuda', retina_masks=True, imgsz=640)
-        return x
+        def forward(self, x):
+            return self.yolo.predict(x, device='cuda', retina_masks=True, imgsz=640)
+else:
+    @MODELS.register_module()
+    class FastSAM_Backbone(BaseModule):
+        def __init__(self):
+            raise ImportError(
+                "FastSAM_Backbone requires a full 'ultralytics' installation "
+                "(with ultralytics.utils). The vendored FastSAM copy in this "
+                "repo is incomplete; install ultralytics via pip/conda or fix "
+                "PYTHONPATH to point to a complete ultralytics package."
+            )
 
 
 

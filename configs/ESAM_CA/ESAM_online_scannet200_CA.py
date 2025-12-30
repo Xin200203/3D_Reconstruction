@@ -95,11 +95,15 @@ model = dict(
         merge_type='learnable_online'))
 
 dataset_type = 'ScanNet200SegMVDataset_'
-data_root = '/datadisk1/xxy/data/data-ESAM/scannet200-sv/'
+# Online runs expect multi-view (MV) frame streams; default to the preprocessed
+# `scannet200-mv_fast` pack under this repo's `data/` symlink.
+# You can override via `--cfg-options val_dataloader.dataset.data_root=...`
+# and `--cfg-options val_dataloader.dataset.ann_file=...`.
+data_root = 'data/scannet200-mv_fast/'
 
 # Reconstruction (rec_*) files are loaded by LoadAdjacentDataFromFile via a
-# separate root. MV runs folders usually don't contain scene-level rec files.
-rec_data_root = '/datadisk1/xxy/data/data-ESAM/scannet200-sv'
+# separate root. Use the repo's scene-level reconstruction pack by default.
+rec_data_root = 'data/scannet200'
 
 # floor and chair are changed
 class_names = [
@@ -248,7 +252,12 @@ test_pipeline = [
                 merge_non_stuff_cls=False,
                 with_rec=True),
         ]),
-    dict(type='Pack3DDetInputs_Online', keys=['points', 'sp_pts_mask'])
+    # NOTE: include GT masks in test pipeline so that optional baseline_stats
+    # (GT-aware per-frame diagnostics) can run without requiring a separate
+    # dataset/pipeline.
+    dict(
+        type='Pack3DDetInputs_Online',
+        keys=['points', 'sp_pts_mask', 'pts_instance_mask', 'pts_semantic_mask'])
 ]
 
 train_dataloader = dict(
@@ -258,7 +267,7 @@ train_dataloader = dict(
     # num_workers=0,
     dataset=dict(
         type=dataset_type,
-        ann_file='scannet200_sv_oneformer3d_infos_train.pkl',
+        ann_file='scannet200_mv_oneformer3d_infos_train.pkl',
         data_root=data_root,
         metainfo=dict(classes=class_names),
         pipeline=train_pipeline,
@@ -270,7 +279,7 @@ val_dataloader = dict(
     # num_workers=0,
     dataset=dict(
         type=dataset_type,
-        ann_file='scannet200_sv_oneformer3d_infos_val.pkl',
+        ann_file='scannet200_mv_oneformer3d_infos_val.pkl',
         data_root=data_root,
         metainfo=dict(classes=class_names),
         pipeline=test_pipeline,
