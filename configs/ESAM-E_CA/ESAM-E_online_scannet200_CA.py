@@ -13,6 +13,8 @@ voxel_size = 0.02
 model = dict(
     type='ScanNet200MixFormer3D_Online',
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
+    # Baseline route: keep pure-3D by default (avoid accidental DINO/dinosaur feature injection).
+    dino_enable=False,
     voxel_size=voxel_size,
     num_classes=num_instance_classes_eval,
     query_thr=0.5,

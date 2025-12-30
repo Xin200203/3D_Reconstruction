@@ -237,7 +237,10 @@ class QueryDecoder(BaseModule):
             if hasattr(self, 'query'):
                 result_query.append(self.query.weight)
             if queries is not None:
-                result_query.append(self.query_proj(queries[i]))
+                q_in = queries[i]
+                if self.input_adapter is not None and q_in.shape[-1] != self.expected_in_channels:
+                    q_in = self.input_adapter(q_in)
+                result_query.append(self.query_proj(q_in))
             result_queries.append(torch.cat(result_query))
         return result_queries
 
@@ -679,7 +682,13 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         else:
             inst_pts_feats = None
 
-        mask_feats = [self.x_mask(y) for y in sp_feats] if "SP" in self.mask_pred_mode else None
+        if "SP" in self.mask_pred_mode:
+            if self.input_adapter is not None and sp_feats and sp_feats[0].shape[-1] != self.expected_in_channels:
+                mask_feats = [self.x_mask(self.input_adapter(y)) for y in sp_feats]
+            else:
+                mask_feats = [self.x_mask(y) for y in sp_feats]
+        else:
+            mask_feats = None
         mask_pts_feats = [self.x_mask(y) if self.share_mask_mlp else self.x_pts_mask(y)
              for y in p_feats] if "P" in self.mask_pred_mode else None
         queries = self._get_queries(queries, len(sp_feats))

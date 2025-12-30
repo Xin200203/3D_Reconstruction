@@ -59,6 +59,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                  dino_cfg=None,
                  dino_require: bool = False,
                  dino_online_only: bool = False,
+                 dino_debug: bool = False,
                  data_preprocessor=None,
                  init_cfg=None):
         super(Base3DDetector, self).__init__(
@@ -76,6 +77,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         # - dino_online_only=True: 禁止使用外部离线特征键（dino_fpn/dino_feats/dino_point_feats/clip_pix）
         self.dino_require = bool(dino_require)
         self.dino_online_only = bool(dino_online_only)
+        self.dino_debug = bool(dino_debug)
         self.criterion = MODELS.build(_cfg(criterion, 'criterion'))
         self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.voxel_size = voxel_size
@@ -137,7 +139,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                     "Remove related pipeline steps / keys to ensure only online DINO is used."
                 )
         # 轻量调试：明确区分“离线/外部特征是否提供” vs “是否将在线构建”
-        if self._dino_debug_count < 5:
+        if self.dino_debug and self._dino_debug_count < 5:
             cam_info_field = batch_inputs_dict.get('cam_info', None)
             if isinstance(cam_info_field, list):
                 cam_len = len(cam_info_field)
@@ -182,7 +184,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         if 'dino_fpn' in batch_inputs_dict:
             try:
                 dino_feats = batch_inputs_dict['dino_fpn']
-                if self._dino_debug_count < 3:
+                if self.dino_debug and self._dino_debug_count < 3:
                     print("[DINO] use provided dino_fpn (single-frame)")
                     self._dino_debug_count += 1
             except Exception:
@@ -190,7 +192,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         elif 'dino_feats' in batch_inputs_dict:
             try:
                 dino_feats = batch_inputs_dict['dino_feats']
-                if self._dino_debug_count < 3:
+                if self.dino_debug and self._dino_debug_count < 3:
                     print("[DINO] use provided dino_feats (single-frame)")
                     self._dino_debug_count += 1
             except Exception:
@@ -286,7 +288,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 except Exception as e:
                     if getattr(self, 'dino_require', False):
                         raise RuntimeError(f"DINO required but online build failed: {repr(e)}")
-                    if self._dino_debug_count < 3:
+                    if self.dino_debug and self._dino_debug_count < 3:
                         print(f"[DINO][error] build from online DINO failed: {e}")
                         self._dino_debug_count += 1
                     dino_feats = None
@@ -318,13 +320,13 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 coords_batch, feats_batch = ME.utils.sparse_collate(
                     coords_list, feats_list, device=feats_list[0].device)
                 dino_feats = build_sparse_fpn(coords_batch, feats_batch)
-                if self._dino_debug_count < 3:
+                if self.dino_debug and self._dino_debug_count < 3:
                     shapes = [x.shape for x in dino_feats]
                     strides = [x.tensor_stride for x in dino_feats]
                     print(f"[DINO] build from dino_point_feats, shapes={shapes}, strides={strides}")
                     self._dino_debug_count += 1
             except Exception as e:
-                if self._dino_debug_count < 3:
+                if self.dino_debug and self._dino_debug_count < 3:
                     print(f"[DINO][error] build from dino_point_feats failed: {e}")
                     self._dino_debug_count += 1
                 dino_feats = None
@@ -332,18 +334,18 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         if dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
             try:
                 dino_feats = self._build_dino_fpn_from_clip(batch_inputs_dict)
-                if dino_feats is not None and self._dino_debug_count < 3:
+                if dino_feats is not None and self.dino_debug and self._dino_debug_count < 3:
                     shapes = [x.shape for x in dino_feats]
                     strides = [x.tensor_stride for x in dino_feats]
                     print(f"[DINO] build from clip_pix, shapes={shapes}, strides={strides}")
                     self._dino_debug_count += 1
             except Exception as e:
-                if self._dino_debug_count < 3:
+                if self.dino_debug and self._dino_debug_count < 3:
                     print(f"[DINO][error] build from clip_pix failed: {e}")
                     self._dino_debug_count += 1
                 dino_feats = None
 
-        if dino_feats is None and self._dino_debug_count < 3:
+        if dino_feats is None and self.dino_debug and self._dino_debug_count < 3:
             print("[DINO] no dino_feats used (single-frame)")
             self._dino_debug_count += 1
 
@@ -1613,6 +1615,9 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                  criterion=None,
                  train_cfg=None,
                  test_cfg=None,
+                 dino_enable: Optional[bool] = None,
+                 dino_require: bool = False,
+                 dino_debug: bool = False,
                  data_preprocessor=None,
                  init_cfg=None):
         super(Base3DDetector, self).__init__(
@@ -1639,6 +1644,13 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         self.train_cfg = train_cfg
         self.test_cfg: Any = ConfigDict(test_cfg or {})
         self.map_to_rec_pcd = map_to_rec_pcd
+        # Online “dinosaur” 特征注入开关：
+        # - dino_enable=None: 仅当 pipeline 提供相关 key 时才尝试使用（向后兼容）。
+        # - dino_enable=False: 强制纯 3D（即使 pipeline 提供了 dino_* / clip_pix，也忽略）。
+        # - dino_enable=True: 强制使用注入链路（若 dino_require=True 且无法构建，则直接报错）。
+        self.dino_enable = dino_enable
+        self.dino_require = bool(dino_require)
+        self.dino_debug = bool(dino_debug)
         self._dino_debug_count = 0
         self.init_weights()
     
@@ -1657,89 +1669,104 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         未命中上述任一分支时，dino_feats=None，U-Net 注入自动跳过。
         """
         batch_size = len(batch_data_samples)
-        # 调试：明确区分“外部是否提供离线 DINO” vs “是否具备在线/投影构建条件”（仅前几次打印）
-        if self._dino_debug_count < 3:
-            provided_offline = {
+
+        # === Online dinosaur 特征注入（可选，默认不影响纯 3D baseline）===
+        provided_offline = any(k in batch_inputs_dict for k in ('dino_fpn', 'dino_feats', 'dino_point_feats'))
+        has_clip_pix = batch_inputs_dict.get('clip_pix', None) is not None
+        if self.dino_enable is None:
+            dino_enabled = bool(provided_offline or has_clip_pix)
+        else:
+            dino_enabled = bool(self.dino_enable)
+
+        # 调试：仅在显式开启 dino_debug 时打印（避免 baseline 日志“被污染”）
+        if dino_enabled and self.dino_debug and self._dino_debug_count < 3:
+            provided = {
                 'dino_fpn': 'dino_fpn' in batch_inputs_dict,
                 'dino_feats': 'dino_feats' in batch_inputs_dict,
                 'dino_point_feats': 'dino_point_feats' in batch_inputs_dict,
-                'clip_pix': 'clip_pix' in batch_inputs_dict,
+                'clip_pix': has_clip_pix,
             }
             clip_shapes = None
-            if 'clip_pix' in batch_inputs_dict:
-                cp = batch_inputs_dict['clip_pix']
+            if has_clip_pix:
+                cp = batch_inputs_dict.get('clip_pix', None)
                 if isinstance(cp, list) and len(cp) > frame_i and torch.is_tensor(cp[frame_i]):
                     clip_shapes = cp[frame_i].shape
                 elif torch.is_tensor(cp):
                     clip_shapes = cp.shape
             cam_raw = batch_inputs_dict.get('cam_info', None)
             cam_info_len = len(cam_raw) if isinstance(cam_raw, list) else (1 if cam_raw is not None else 0)
-            online_ready = (getattr(self, 'dino', None) is not None) and ('img' in batch_inputs_dict) and (cam_raw is not None)
             print(
                 "[DINO][debug] "
-                f"provided_offline={provided_offline}, "
-                f"online_ready={online_ready}, "
+                f"provided_offline={provided}, "
                 f"clip_shape={clip_shapes}, cam_info_len={cam_info_len}, frame={frame_i}"
             )
+
         # 可选：外部传入的 DINO 稀疏金字塔或点级 DINO 特征，按帧索引取用
         dino_feats = None
-        # 1) 直接传入的稀疏 FPN 列表 [s1..s16]
-        if 'dino_fpn' in batch_inputs_dict:
-            try:
-                dino_feats = batch_inputs_dict['dino_fpn'][frame_i]
-                if self._dino_debug_count < 5:
-                    print(f"[DINO] use provided dino_fpn frame={frame_i}")
+        if dino_enabled:
+            # 1) 直接传入的稀疏 FPN 列表 [s1..s16]
+            if 'dino_fpn' in batch_inputs_dict:
+                try:
+                    dino_feats = batch_inputs_dict['dino_fpn'][frame_i]
+                    if self.dino_debug and self._dino_debug_count < 5:
+                        print(f"[DINO] use provided dino_fpn frame={frame_i}")
+                        self._dino_debug_count += 1
+                except Exception:
+                    dino_feats = None
+            elif 'dino_feats' in batch_inputs_dict:
+                try:
+                    dino_feats = batch_inputs_dict['dino_feats'][frame_i]
+                    if self.dino_debug and self._dino_debug_count < 5:
+                        print(f"[DINO] use provided dino_feats frame={frame_i}")
+                        self._dino_debug_count += 1
+                except Exception:
+                    dino_feats = None
+            # 2) 如果传入了点级 DINO 特征（与 points 同顺序），自动构建 FPN
+            if dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
+                try:
+                    pt_feats_list = []
+                    coords_list = []
+                    for b_idx, pts in enumerate(batch_inputs_dict['points']):
+                        xyz = pts[frame_i, :, :3]  # (N,3) 已包含 elastic 等增强
+                        feats_2d = batch_inputs_dict['dino_point_feats'][b_idx][frame_i]  # (N,C_dino)
+                        # voxel 坐标（向下取整），添加 batch 维
+                        coords = torch.cat([
+                            torch.full((xyz.shape[0], 1), b_idx, dtype=torch.int32, device=xyz.device),
+                            (xyz / self.voxel_size).floor().to(torch.int32)
+                        ], dim=1)
+                        coords_list.append(coords.cpu())  # Minkowski 要求 int32，后续 sparse_collate 处理
+                        pt_feats_list.append(feats_2d.cpu())
+                    # 批量稀疏拼接
+                    coords_batch, feats_batch = ME.utils.sparse_collate(
+                        coords_list, pt_feats_list, device=pt_feats_list[0].device)
+                    fpn = build_sparse_fpn(coords_batch, feats_batch)
+                    dino_feats = fpn
+                    if self.dino_debug and self._dino_debug_count < 3:
+                        print(f"[DINO] build from dino_point_feats frame={frame_i}, coords={coords_batch.shape}, feats={feats_batch.shape}")
+                        self._dino_debug_count += 1
+                except Exception:
+                    dino_feats = None
+            # 3) 若仍为空且存在 clip_pix + cam_info，尝试在线投影得到点级 DINO
+            if dino_feats is None and has_clip_pix and 'cam_info' in batch_inputs_dict:
+                try:
+                    dino_feats = self._build_dino_fpn_from_clip(batch_inputs_dict, frame_i)
+                    if dino_feats is not None and self.dino_debug and self._dino_debug_count < 3:
+                        shapes = [x.shape for x in dino_feats]
+                        strides = [x.tensor_stride for x in dino_feats]
+                        print(f"[DINO] build from clip_pix frame={frame_i}, shapes={shapes}, strides={strides}")
+                        self._dino_debug_count += 1
+                except Exception:
+                    dino_feats = None
+            # 4) 若最终仍未构建，打印一次提示
+            if dino_feats is None:
+                if self.dino_require:
+                    raise RuntimeError(
+                        f"DINO enabled/required but no features are available at frame={frame_i}. "
+                        "Check pipeline keys: dino_fpn/dino_feats/dino_point_feats/clip_pix + cam_info."
+                    )
+                if self.dino_debug and self._dino_debug_count < 5:
+                    print(f"[DINO] no dino_feats used at frame={frame_i}")
                     self._dino_debug_count += 1
-            except Exception:
-                dino_feats = None
-        elif 'dino_feats' in batch_inputs_dict:
-            try:
-                dino_feats = batch_inputs_dict['dino_feats'][frame_i]
-                if self._dino_debug_count < 5:
-                    print(f"[DINO] use provided dino_feats frame={frame_i}")
-                    self._dino_debug_count += 1
-            except Exception:
-                dino_feats = None
-        # 2) 如果传入了点级 DINO 特征（与 points 同顺序），自动构建 FPN
-        if dino_feats is None and 'dino_point_feats' in batch_inputs_dict:
-            try:
-                pt_feats_list = []
-                coords_list = []
-                for b_idx, pts in enumerate(batch_inputs_dict['points']):
-                    xyz = pts[frame_i, :, :3]  # (N,3) 已包含 elastic 等增强
-                    feats_2d = batch_inputs_dict['dino_point_feats'][b_idx][frame_i]  # (N,C_dino)
-                    # voxel 坐标（向下取整），添加 batch 维
-                    coords = torch.cat([
-                        torch.full((xyz.shape[0], 1), b_idx, dtype=torch.int32, device=xyz.device),
-                        (xyz / self.voxel_size).floor().to(torch.int32)
-                    ], dim=1)
-                    coords_list.append(coords.cpu())  # Minkowski 要求 int32，后续 sparse_collate 处理
-                    pt_feats_list.append(feats_2d.cpu())
-                # 批量稀疏拼接
-                coords_batch, feats_batch = ME.utils.sparse_collate(
-                    coords_list, pt_feats_list, device=pt_feats_list[0].device)
-                fpn = build_sparse_fpn(coords_batch, feats_batch)
-                dino_feats = fpn
-                if self._dino_debug_count < 3:
-                    print(f"[DINO] build from dino_point_feats frame={frame_i}, coords={coords_batch.shape}, feats={feats_batch.shape}")
-                    self._dino_debug_count += 1
-            except Exception:
-                dino_feats = None
-        # 3) 若仍为空且存在 clip_pix + cam_info，尝试在线投影得到点级 DINO
-        if dino_feats is None and 'clip_pix' in batch_inputs_dict and 'cam_info' in batch_inputs_dict:
-            try:
-                dino_feats = self._build_dino_fpn_from_clip(batch_inputs_dict, frame_i)
-                if dino_feats is not None and self._dino_debug_count < 3:
-                    shapes = [x.shape for x in dino_feats]
-                    strides = [x.tensor_stride for x in dino_feats]
-                    print(f"[DINO] build from clip_pix frame={frame_i}, shapes={shapes}, strides={strides}")
-                    self._dino_debug_count += 1
-            except Exception:
-                dino_feats = None
-        # 4) 若最终仍未构建，打印一次提示
-        if dino_feats is None and self._dino_debug_count < 5:
-            print(f"[DINO] no dino_feats used at frame={frame_i}")
-            self._dino_debug_count += 1
 
         # construct tensor field
         coordinates, features = [], []
@@ -1781,11 +1808,12 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         # apply cls_layer
         features = []
         sp_xyz_list = []
+        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end, :-3])
-            sp_xyz_list.append(x[begin: end, -3:])
+            features.append(x[begin: end])
+            sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
 
     def _build_dino_fpn_from_clip(self, batch_inputs_dict: Dict[str, Any], frame_i: int):
@@ -2025,6 +2053,47 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         mv_mask2, mv_labels2, mv_scores2 = None, None, None
         mv_queries = None
         online_merger = None
+
+        # Optional: online behavior monitoring (per-frame matched/birth/memory stats).
+        online_monitor_cfg = self.test_cfg.get('online_monitor', None) or {}
+        online_monitor_enable = bool(online_monitor_cfg.get('enable', False))
+        online_monitor = None
+        if online_monitor_enable:
+            meta = getattr(batch_data_samples[0], 'img_metas', None)
+            if not isinstance(meta, dict):
+                try:
+                    meta = batch_data_samples[0].metainfo
+                except Exception:
+                    meta = {}
+            scene_id = (
+                meta.get('scene_id', None)
+                or meta.get('scan_id', None)
+                or meta.get('lidar_idx', None)
+                or meta.get('sample_idx', None)
+                or meta.get('ann_file', None)
+                or meta.get('pts_filename', None)
+                or 'unknown'
+            )
+            # Keep this JSON-serializable.
+            online_monitor = {
+                "scene_id": str(scene_id),
+                "num_frames": int(num_frames),
+                "test_cfg": {
+                    "merge_type": str(self.test_cfg.get('merge_type', '')),
+                    "topk_insts": int(self.test_cfg.get('topk_insts', -1)),
+                    "inst_score_thr": float(self.test_cfg.get('inst_score_thr', 0.0)),
+                    "sp_score_thr": float(self.test_cfg.get('sp_score_thr', 0.0)),
+                    "npoint_thr": int(self.test_cfg.get('npoint_thr', 0)),
+                    "obj_normalization": bool(self.test_cfg.get('obj_normalization', False)),
+                    "inscat_topk_insts": int(self.test_cfg.get('inscat_topk_insts', -1)),
+                },
+                "monitor_cfg": {
+                    k: v
+                    for k, v in (dict(online_monitor_cfg).items() if isinstance(online_monitor_cfg, dict) else [])
+                    if isinstance(v, (bool, int, float, str))
+                },
+                "frames": [],
+            }
         
         if hasattr(self, 'memory'):
             self.memory.reset()
@@ -2051,17 +2120,52 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             ## Online merging
             if self.test_cfg.merge_type == 'learnable_online':
                 if frame_i == 0:
-                    online_merger = OnlineMerge(self.test_cfg.inscat_topk_insts, self.use_bbox)
+                    online_merger = OnlineMerge(
+                        self.test_cfg.inscat_topk_insts,
+                        self.use_bbox,
+                        monitor=online_monitor_enable,
+                    )
                 if online_merger is not None:
+                    inst_masks = results[-1].pop('pts_instance_mask')[0]
+                    inst_labels = results[-1].pop('instance_labels')[0]
+                    inst_scores = results[-1].pop('instance_scores')[0]
+                    inst_queries = results[-1].pop('instance_queries')[0]
+                    try:
+                        inst_select_scores = results[-1].pop('instance_select_scores')[0]
+                    except Exception:
+                        inst_select_scores = inst_scores
+
                     mv_mask, mv_labels, mv_scores, mv_queries, mv_bboxes = online_merger.merge(
-                        results[-1].pop('pts_instance_mask')[0],
-                        results[-1].pop('instance_labels')[0],
-                        results[-1].pop('instance_scores')[0],
-                        results[-1].pop('instance_queries')[0],
+                        inst_masks,
+                        inst_labels,
+                        inst_scores,
+                        inst_queries,
                         query_feats_list.pop(-1)[0],
                         sem_preds_list.pop(-1)[0],
                         sp_xyz_list.pop(-1)[0],
                         bboxes_list.pop(-1)[0] if self.use_bbox else None)
+
+                    if online_monitor_enable and online_monitor is not None and isinstance(getattr(online_merger, 'last_stats', None), dict):
+                        st = dict(online_merger.last_stats)  # type: ignore[arg-type]
+                        st["frame_i"] = int(frame_i)
+                        # Rank-of-matched detection in this frame (by select score).
+                        try:
+                            matched_idx = st.get("matched_det_idx", [])
+                            if isinstance(matched_idx, list) and len(matched_idx) > 0 and torch.is_tensor(inst_select_scores):
+                                order = torch.argsort(inst_select_scores, descending=True)
+                                rank_map = torch.empty_like(order)
+                                rank_map[order] = torch.arange(order.numel(), device=order.device)
+                                mi = torch.as_tensor(matched_idx, device=rank_map.device, dtype=torch.long)
+                                mi = mi[(mi >= 0) & (mi < rank_map.numel())]
+                                if mi.numel() > 0:
+                                    ranks = (rank_map[mi] + 1).detach().cpu().numpy()
+                                    st["matched_det_rank_median"] = float(np.median(ranks))
+                                    st["matched_det_rank_p90"] = float(np.percentile(ranks, 90))
+                                    st["matched_det_rank_gt20"] = float(np.mean(ranks > 20))
+                                    st["matched_det_rank_gt50"] = float(np.mean(ranks > 50))
+                        except Exception:
+                            pass
+                        online_monitor["frames"].append(st)
                     # Empty cache. Only offline merging requires the whole list.
                     torch.cuda.empty_cache()
                     if frame_i == num_frames - 1:
@@ -2138,6 +2242,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 pts_instance_mask=[mv_mask.cpu().numpy()],
                 instance_labels=mv_labels.cpu().numpy(),
                 instance_scores=mv_scores.cpu().numpy())
+            if online_monitor_enable and online_monitor is not None:
+                merged_result.online_monitor = online_monitor
             batch_data_samples[0].pred_pts_seg = merged_result
             return batch_data_samples
         
@@ -2157,6 +2263,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             pts_instance_mask=[mv_mask[:, indices].cpu().numpy()],
             instance_labels=mv_labels.cpu().numpy(),
             instance_scores=mv_scores.cpu().numpy())
+        if online_monitor_enable and online_monitor is not None:
+            merged_result.online_monitor = online_monitor
 
         # Ensemble the predictions with mesh segments (eval_ann_info['segment_ids'])
         if 'segment_ids' in batch_data_samples[0].eval_ann_info:
@@ -2167,14 +2275,25 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         return batch_data_samples
     
     def segment_smooth(self, results, device, segment_ids):
+        sem_mask_np = np.asarray(results.pts_semantic_mask[0])
+        ins_mask_np = np.asarray(results.pts_instance_mask[0])
+        if len(segment_ids) != sem_mask_np.shape[0] or ins_mask_np.shape[1] != sem_mask_np.shape[0]:
+            if not hasattr(self, '_segment_smooth_warned'):
+                print(
+                    "[segment_smooth] skip due to size mismatch: "
+                    f"segment_ids={len(segment_ids)}, sem_mask={sem_mask_np.shape}, ins_mask={ins_mask_np.shape}"
+                )
+                self._segment_smooth_warned = True
+            return results
+
         unique_ids = np.unique(segment_ids)
         new_segment_ids = np.zeros_like(segment_ids)
         for i, ids in enumerate(unique_ids):
             new_segment_ids[segment_ids == ids] = i
         segment_ids = new_segment_ids
         segment_ids = torch.from_numpy(segment_ids).to(device)
-        sem_mask = torch.from_numpy(results.pts_semantic_mask[0]).to(device)
-        ins_mask = torch.from_numpy(results.pts_instance_mask[0]).to(device)
+        sem_mask = torch.from_numpy(sem_mask_np).to(device)
+        ins_mask = torch.from_numpy(ins_mask_np).to(device)
         sem_mask = scatter_mean(F.one_hot(sem_mask).float(), segment_ids, dim=0)
         sem_mask = sem_mask.argmax(dim=1)[segment_ids]
         ins_mask = scatter_mean(ins_mask.float(), segment_ids, dim=1)
@@ -2661,11 +2780,12 @@ class ScanNet200MixFormer3D_FF_Online(ScanNet200MixFormer3D_Online):
         # apply cls_layer
         features = []
         sp_xyz_list = []
+        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end, :-3])
-            sp_xyz_list.append(x[begin: end, -3:])
+            features.append(x[begin: end])
+            sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
 
     def _f(self, x, img_features, img_metas):
@@ -2757,11 +2877,12 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         # apply cls_layer
         features = []
         sp_xyz_list = []
+        sp_xyz = scatter_mean(torch.cat(all_xyz, dim=0), sp_idx, dim=0)
         for i in range(len(n_super_points)):
             begin = sum(n_super_points[:i])
             end = sum(n_super_points[:i + 1])
-            features.append(x[begin: end, :-3])
-            sp_xyz_list.append(x[begin: end, -3:])
+            features.append(x[begin: end])
+            sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
     
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
@@ -2773,6 +2894,46 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         
         # Initialize variables that may be used later
         mv_mask, mv_labels, mv_scores, mv_bboxes = None, None, None, None
+
+        # Optional: online behavior monitoring for stream mode.
+        online_monitor_cfg = self.test_cfg.get('online_monitor', None) or {}
+        online_monitor_enable = bool(online_monitor_cfg.get('enable', False))
+        online_monitor = None
+        if online_monitor_enable:
+            meta = getattr(batch_data_samples[0], 'img_metas', None)
+            if not isinstance(meta, dict):
+                try:
+                    meta = batch_data_samples[0].metainfo
+                except Exception:
+                    meta = {}
+            scene_id = (
+                meta.get('scene_id', None)
+                or meta.get('scan_id', None)
+                or meta.get('lidar_idx', None)
+                or meta.get('sample_idx', None)
+                or meta.get('ann_file', None)
+                or meta.get('pts_filename', None)
+                or 'unknown'
+            )
+            online_monitor = {
+                "scene_id": str(scene_id),
+                "num_frames": 1,
+                "test_cfg": {
+                    "merge_type": str(self.test_cfg.get('merge_type', '')),
+                    "topk_insts": int(self.test_cfg.get('topk_insts', -1)),
+                    "inst_score_thr": float(self.test_cfg.get('inst_score_thr', 0.0)),
+                    "sp_score_thr": float(self.test_cfg.get('sp_score_thr', 0.0)),
+                    "npoint_thr": int(self.test_cfg.get('npoint_thr', 0)),
+                    "obj_normalization": bool(self.test_cfg.get('obj_normalization', False)),
+                    "inscat_topk_insts": int(self.test_cfg.get('inscat_topk_insts', -1)),
+                },
+                "monitor_cfg": {
+                    k: v
+                    for k, v in (dict(online_monitor_cfg).items() if isinstance(online_monitor_cfg, dict) else [])
+                    if isinstance(v, (bool, int, float, str))
+                },
+                "frames": [],
+            }
         
         if hasattr(self, 'memory'):
             self.memory.reset()
@@ -2800,16 +2961,53 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
         ## Online merging
         if self.test_cfg.merge_type == 'learnable_online':
             if not hasattr(self, 'online_merger'):
-                self.online_merger = OnlineMerge(self.test_cfg.inscat_topk_insts, self.use_bbox)
+                self.online_merger = OnlineMerge(
+                    self.test_cfg.inscat_topk_insts,
+                    self.use_bbox,
+                    monitor=online_monitor_enable,
+                )
+            elif getattr(self.online_merger, 'monitor', None) != online_monitor_enable:
+                # Keep monitor toggle consistent across runs.
+                self.online_merger.monitor = bool(online_monitor_enable)
+                self.online_merger.last_stats = None
+
+            inst_masks = results[-1].pop('pts_instance_mask')[0]
+            inst_labels = results[-1].pop('instance_labels')[0]
+            inst_scores = results[-1].pop('instance_scores')[0]
+            inst_queries = results[-1].pop('instance_queries')[0]
+            try:
+                inst_select_scores = results[-1].pop('instance_select_scores')[0]
+            except Exception:
+                inst_select_scores = inst_scores
             mv_mask, mv_labels, mv_scores, _, mv_bboxes = self.online_merger.merge(
-                results[-1].pop('pts_instance_mask')[0],
-                results[-1].pop('instance_labels')[0],
-                results[-1].pop('instance_scores')[0],
-                results[-1].pop('instance_queries')[0],
+                inst_masks,
+                inst_labels,
+                inst_scores,
+                inst_queries,
                 query_feats_list.pop(-1)[0],
                 sem_preds_list.pop(-1)[0],
                 sp_xyz_list.pop(-1)[0],
                 bboxes_list.pop(-1)[0] if self.use_bbox else None)
+            if online_monitor_enable and online_monitor is not None and isinstance(getattr(self.online_merger, 'last_stats', None), dict):
+                st = dict(self.online_merger.last_stats)  # type: ignore[arg-type]
+                st["frame_i"] = int(st.get("fi", 0))
+                try:
+                    matched_idx = st.get("matched_det_idx", [])
+                    if isinstance(matched_idx, list) and len(matched_idx) > 0 and torch.is_tensor(inst_select_scores):
+                        order = torch.argsort(inst_select_scores, descending=True)
+                        rank_map = torch.empty_like(order)
+                        rank_map[order] = torch.arange(order.numel(), device=order.device)
+                        mi = torch.as_tensor(matched_idx, device=rank_map.device, dtype=torch.long)
+                        mi = mi[(mi >= 0) & (mi < rank_map.numel())]
+                        if mi.numel() > 0:
+                            ranks = (rank_map[mi] + 1).detach().cpu().numpy()
+                            st["matched_det_rank_median"] = float(np.median(ranks))
+                            st["matched_det_rank_p90"] = float(np.percentile(ranks, 90))
+                            st["matched_det_rank_gt20"] = float(np.mean(ranks > 20))
+                            st["matched_det_rank_gt50"] = float(np.mean(ranks > 50))
+                except Exception:
+                    pass
+                online_monitor["frames"].append(st)
         ## Clean. Empty cache. Only offline merging requires the whole list.
         if self.test_cfg.merge_type == 'learnable_online':
             torch.cuda.empty_cache()
@@ -2865,6 +3063,8 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
             pts_instance_mask=[mv_mask.cpu().numpy()],
             instance_labels=mv_labels.cpu().numpy(),
             instance_scores=mv_scores.cpu().numpy())
+        if online_monitor_enable and online_monitor is not None:
+            merged_result.online_monitor = online_monitor
         batch_data_samples[0].pred_pts_seg = merged_result
         return batch_data_samples
 

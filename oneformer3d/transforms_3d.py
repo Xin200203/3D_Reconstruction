@@ -483,10 +483,10 @@ class BboxCalculation(BaseTransform):
         num_obj_adjacent = len(pts_ins_unique) - 1 if -1 in \
              pts_ins_unique else len(pts_ins_unique)
         ori_pts_instance_mask = torch.tensor(input_dict['ori_pts_instance_mask'])
-        ori_pts_ins_unique = ori_pts_instance_mask.unique()
+        ori_pts_ins_unique = ori_pts_instance_mask.unique().to(torch.long)
         ori_rec_instance_mask = torch.tensor(input_dict['ori_rec_instance_mask'])
-        ori_rec_ins_unique = ori_rec_instance_mask[rec_instance_mask != -1].unique()
-        keep_mask = torch.tensor([idx in ori_pts_ins_unique for idx in ori_rec_ins_unique])
+        ori_rec_ins_unique = ori_rec_instance_mask[rec_instance_mask != -1].unique().to(torch.long)
+        keep_mask = (ori_rec_ins_unique[:, None] == ori_pts_ins_unique[None, :]).any(dim=1)
 
         # Code from TD3D (arxiv:2302.02871)
         if torch.sum(rec_instance_mask == -1) != 0:
@@ -672,4 +672,3 @@ class ApplyRigidTransformToPose(BaseTransform):
 
         results['rigid_transform_applied'] = False
         return results
-

@@ -45,6 +45,7 @@ class UnifiedSegMetric(SegMetric):
                               ('pq',)],
                  eval_mode: str = 'auto',
                  diagnostics: Optional[dict] = None,
+                 online_monitor: Optional[dict] = None,
                  **kwargs):
         self.thing_class_inds = thing_class_inds
         self.stuff_class_inds = stuff_class_inds
@@ -59,6 +60,7 @@ class UnifiedSegMetric(SegMetric):
             "eval_mode must be 'auto', 'multi_class', or 'cat_agnostic'"
         self.eval_mode = eval_mode
         self.diagnostics = diagnostics or {}
+        self.online_monitor = online_monitor or {}
         super().__init__(**kwargs)
 
     @staticmethod
@@ -95,6 +97,72 @@ class UnifiedSegMetric(SegMetric):
         if os.path.isabs(out_dir):
             return out_dir
         return os.path.join(str(base), out_dir)
+
+    @staticmethod
+    def _summarize_online_monitor(monitors: Sequence[dict]) -> dict:
+        """Summarize online behavior stats over all scenes/frames.
+
+        Expected input format is a list of dicts with key "frames", where each
+        frame is a dict of scalar stats (det_to_merge/matched/birth/mem sizes).
+        """
+        def _collect(key: str) -> np.ndarray:
+            vals = []
+            for s in monitors:
+                frames = s.get("frames", [])
+                if not isinstance(frames, list):
+                    continue
+                for fr in frames:
+                    if isinstance(fr, dict) and key in fr:
+                        v = fr.get(key)
+                        if isinstance(v, (int, float, np.number)):
+                            vals.append(float(v))
+            return np.asarray(vals, dtype=np.float32)
+
+        def _pack(x: np.ndarray) -> dict:
+            if x.size == 0:
+                return {"n": 0, "mean": 0.0, "median": 0.0, "p90": 0.0, "p95": 0.0}
+            return {
+                "n": int(x.size),
+                "mean": float(np.mean(x)),
+                "median": float(np.median(x)),
+                "p90": float(np.percentile(x, 90)),
+                "p95": float(np.percentile(x, 95)),
+            }
+
+        det = _collect("det_to_merge")
+        matched = _collect("matched")
+        birth = _collect("birth")
+        mem_full = _collect("mem_size_full")
+        mem_kept = _collect("mem_size_kept")
+        topk_drop = _collect("topk_drop")
+
+        # Derived rates (frame-level).
+        if det.size and matched.size and matched.size == det.size:
+            match_rate = np.divide(matched, np.maximum(det, 1.0))
+        else:
+            match_rate = np.asarray([], dtype=np.float32)
+        if det.size and birth.size and birth.size == det.size:
+            birth_rate = np.divide(birth, np.maximum(det, 1.0))
+        else:
+            birth_rate = np.asarray([], dtype=np.float32)
+
+        n_scenes = int(len(monitors))
+        n_frames = int(det.size) if det.size else int(sum(len(s.get("frames", [])) for s in monitors if isinstance(s.get("frames", None), list)))
+
+        return {
+            "counts": {
+                "scenes": n_scenes,
+                "frames": n_frames,
+            },
+            "det_to_merge": _pack(det),
+            "matched": _pack(matched),
+            "birth": _pack(birth),
+            "match_rate": _pack(match_rate),
+            "birth_rate": _pack(birth_rate),
+            "mem_size_full": _pack(mem_full),
+            "mem_size_kept": _pack(mem_kept),
+            "topk_drop": _pack(topk_drop),
+        }
 
     @staticmethod
     def _diagnose_bottleneck(
@@ -627,6 +695,7 @@ class UnifiedSegMetric(SegMetric):
         pred_instance_labels = []
         pred_instance_scores = []
         pred_instance_select_scores = []
+        online_monitor_results = []
 
         gt_semantic_masks_sem_task = []
         pred_semantic_masks_sem_task = []
@@ -667,6 +736,8 @@ class UnifiedSegMetric(SegMetric):
             else:
                 pred_instance_select_scores.append(
                     torch.tensor(single_pred_results['instance_scores']))
+            if 'online_monitor' in single_pred_results:
+                online_monitor_results.append(single_pred_results['online_monitor'])
 
         # ret_pan = panoptic_seg_eval(
         #     gt_masks_pan, pred_masks_pan, classes, thing_classes,
@@ -756,6 +827,25 @@ class UnifiedSegMetric(SegMetric):
                 )
         except Exception as e:
             logger.warning(f"[UnifiedSegMetric] diagnostics failed: {e}")
+
+        # Optional: online behavior monitoring dump (per-scene per-frame stats).
+        try:
+            mon_cfg = self.online_monitor or {}
+            if bool(mon_cfg.get("enable", False)) and len(online_monitor_results) > 0:
+                out_dir = str(mon_cfg.get("out_dir", "online_monitor"))
+                out_dir = self._resolve_diagnostics_dir(logger, out_dir)
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+                with open(os.path.join(out_dir, "online_monitor.json"), "w", encoding="utf-8") as f:
+                    json.dump(online_monitor_results, f, indent=2, ensure_ascii=False, default=str)
+
+                summary = self._summarize_online_monitor(online_monitor_results)
+                with open(os.path.join(out_dir, "online_monitor_summary.json"), "w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
+
+                logger.info(f"[UnifiedSegMetric] online monitor saved to: {out_dir}")
+        except Exception as e:
+            logger.warning(f"[UnifiedSegMetric] online monitor dump failed: {e}")
 
         metrics = dict()
         # for ret, keys in zip((ret_sem, ret_inst, ret_pan), self.logger_keys):

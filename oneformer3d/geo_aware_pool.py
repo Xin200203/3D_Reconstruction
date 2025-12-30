@@ -31,6 +31,7 @@ class GeoAwarePooling(BaseModule):
         
         # 输入特征适配层 (延迟初始化)
         self.input_adapter = None
+        self._adapter_logged = False
     
     def scatter_norm(self, points, idx):
         ''' Normalize positions of same-segment in a unit sphere of diameter 1
@@ -57,7 +58,9 @@ class GeoAwarePooling(BaseModule):
                     nn.ReLU(),
                     nn.LayerNorm(self.channel_proj)
                 ).to(x.device)
-                print(f"[GeoAwarePooling] Created input adapter: {input_dim} -> {self.channel_proj}")
+                if not self._adapter_logged:
+                    print(f"[GeoAwarePooling] Created input adapter: {input_dim} -> {self.channel_proj}")
+                    self._adapter_logged = True
             
             # 应用适配层
             x_adapted = self.input_adapter(x)
@@ -92,17 +95,7 @@ class GeoAwarePooling(BaseModule):
                                         device=all_xyz_segment.device, dtype=all_xyz_segment.dtype)
                     all_xyz_segment = torch.cat([all_xyz_segment, padding], dim=0)
             x_final = x_pooled + all_xyz_segment
-            
-        # 如果使用了适配器，需要将结果映射回原始维度
-        if self.input_adapter is not None and input_dim != self.channel_proj:
-            if not hasattr(self, 'output_adapter') or self.output_adapter is None:
-                # 创建输出适配层
-                self.output_adapter = nn.Sequential(
-                    nn.Linear(self.channel_proj, input_dim),
-                    nn.ReLU(),
-                    nn.LayerNorm(input_dim)
-                ).to(x.device)
-                print(f"[GeoAwarePooling] Created output adapter: {self.channel_proj} -> {input_dim}")
-            x_final = self.output_adapter(x_final)
-            
+
+        # NOTE: pool 输出通道应与 `channel_proj`（或 with_xyz=True 时为 channel_proj+3）保持一致，
+        # 下游 decoder/heads 依赖该维度；不要再映射回原始输入维度。
         return x_final, all_xyz_w

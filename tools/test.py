@@ -2,6 +2,7 @@
 import argparse
 import os
 import os.path as osp
+import re
 
 from mmengine.config import Config, ConfigDict, DictAction
 from mmengine.registry import RUNNERS
@@ -128,6 +129,91 @@ def _rewrite_diagnostics_out_dir(cfg):
             for e in cfg[key]:
                 _rewrite_one(e)
 
+def _rewrite_online_monitor_out_dir(cfg):
+    """Resolve `online_monitor.out_dir` under runner `work_dir`.
+
+    Online monitor dumps are frequently configured as relative paths like
+    `online_monitorcd`. If resolved against CWD, multiple experiments will
+    overwrite each other. Here we force it to live under `cfg.work_dir`.
+    """
+
+    def _rewrite_one(evaluator):
+        if not isinstance(evaluator, dict):
+            return
+        mon = evaluator.get('online_monitor', None)
+        if not isinstance(mon, dict):
+            return
+        out_dir = mon.get('out_dir', 'online_monitor')
+        out_dir = str(out_dir)
+        if not osp.isabs(out_dir):
+            mon['out_dir'] = osp.abspath(osp.join(cfg.work_dir, out_dir))
+
+    for key in ('val_evaluator', 'test_evaluator'):
+        if key not in cfg:
+            continue
+        if isinstance(cfg[key], dict):
+            _rewrite_one(cfg[key])
+        elif isinstance(cfg[key], (list, tuple)):
+            for e in cfg[key]:
+                _rewrite_one(e)
+
+
+def _warn_checkpoint_cfg_mismatch(cfg, checkpoint_path: str) -> None:
+    """Warn when checkpoint meta['cfg'] disagrees with current config.
+
+    This repo has multiple experiment branches (baseline / online merge / DINO),
+    and a silent mismatch can produce *valid but meaningless* metrics.
+    """
+    try:
+        import torch
+    except Exception:
+        return
+
+    try:
+        ckpt = torch.load(checkpoint_path, map_location='cpu')
+    except Exception:
+        return
+
+    meta = ckpt.get('meta', {}) if isinstance(ckpt, dict) else {}
+    ck_cfg = meta.get('cfg', None) if isinstance(meta, dict) else None
+    if not isinstance(ck_cfg, str):
+        return
+
+    def _extract(pattern: str):
+        m = re.search(pattern, ck_cfg)
+        return m.group(1) if m else None
+
+    ck_merge_norm = _extract(r"merge_head=dict\([^)]*norm='([^']+)'")
+    ck_data_root = _extract(r"data_root\s*=\s*'([^']+)'")
+
+    cur_merge_norm = None
+    try:
+        mh = cfg.get('model', {}).get('merge_head', None)
+        if isinstance(mh, dict):
+            cur_merge_norm = mh.get('norm', None)
+    except Exception:
+        cur_merge_norm = None
+
+    cur_data_root = cfg.get('data_root', None)
+
+    warned = False
+    if ck_merge_norm is not None and (cur_merge_norm or None) != ck_merge_norm:
+        print(
+            f"[CKPT][cfg-mismatch] merge_head.norm: checkpoint='{ck_merge_norm}' vs config='{cur_merge_norm}'. "
+            "This commonly causes AP collapse."
+        )
+        warned = True
+
+    if ck_data_root is not None and cur_data_root is not None and str(cur_data_root) != ck_data_root:
+        print(
+            f"[CKPT][cfg-mismatch] data_root: checkpoint='{ck_data_root}' vs config='{cur_data_root}'. "
+            "Check you are evaluating on the intended dataset variant."
+        )
+        warned = True
+
+    if warned:
+        print("[CKPT][cfg-mismatch] If this is intended, ignore; otherwise rerun with the matching config.")
+
 
 def main():
     args = parse_args()
@@ -168,6 +254,11 @@ def main():
 
     # Ensure diagnostics output does not overwrite across experiments.
     _rewrite_diagnostics_out_dir(cfg)
+    # Ensure online monitor output does not overwrite across experiments.
+    _rewrite_online_monitor_out_dir(cfg)
+
+    # Guardrail: warn about common silent config/ckpt mismatches.
+    _warn_checkpoint_cfg_mismatch(cfg, args.checkpoint)
 
     if args.show or args.show_dir:
         cfg = trigger_visualization_hook(cfg, args)

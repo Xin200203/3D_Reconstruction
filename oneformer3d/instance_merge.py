@@ -181,12 +181,22 @@ class GTMerge():
 
 
 class OnlineMerge():
-    def __init__(self, inscat_topk_insts, use_bbox=False, merge_type="count", tformer_cfg=None, iou_thr=0.1):
+    def __init__(
+        self,
+        inscat_topk_insts,
+        use_bbox=False,
+        merge_type="count",
+        tformer_cfg=None,
+        iou_thr=0.1,
+        monitor: bool = False,
+    ):
         assert merge_type in ['count', 'frame']
         self.merge_type = merge_type
         self.inscat_topk_insts = inscat_topk_insts
         self.use_bbox = use_bbox
         self.iou_thr = iou_thr  # IoU预剪枝阈值
+        self.monitor = bool(monitor)
+        self.last_stats = None
         if self.use_bbox:
             self.iou_calculator = AxisAlignedBboxOverlaps3D()
         # 初始化跨帧 Transformer
@@ -215,8 +225,17 @@ class OnlineMerge():
         self.cur_xyz = None
         self.cur_bboxes = None
         self.merge_counts = None
+        self.last_stats = None
     
     def merge(self, masks, labels, scores, queries, query_feats, sem_preds, xyz_list, bboxes):
+        # Online behavior stats (optional; written to self.last_stats).
+        det_to_merge = int(masks.shape[0])
+        prev_mem_size = int(self.cur_scores.shape[0]) if self.cur_scores is not None else 0
+        matched_cnt = 0
+        birth_cnt = det_to_merge
+        matched_mem_idx = []
+        matched_det_idx = []
+
         points_per_mask = masks.shape[1]
         # masks, labels, scores, queries, query_feats, sem_preds, xyz_list = \
         #     self.intra_frame_merge(masks, labels, scores, queries, query_feats, sem_preds, xyz_list, bboxes, q)
@@ -244,19 +263,17 @@ class OnlineMerge():
             # 步骤1: IoU预剪枝 (统一计算，TDT和传统方法共用)
             if self.use_bbox:
                 iou_matrix = self.iou_calculator(self.cur_xyz, next_xyz, is_aligned=False)
-                # IoU计算器返回的是(Memory, Current)，我们需要(Current, Memory)
-                xyz_scores = iou_matrix.T  # 转置为(Nc, Nm)
+                # IoU计算器返回的是(Memory, Current) = (Nm, Nc)
+                xyz_scores = iou_matrix
             else:
                 xyz_dists = torch.cdist(self.cur_xyz, next_xyz, p=2)
-                # cdist返回的是(Memory, Current)，我们需要(Current, Memory)  
-                xyz_scores = (1 / (xyz_dists + 1e-6)).T  # 转置为(Nc, Nm)
+                # cdist返回的是(Memory, Current) = (Nm, Nc)
+                xyz_scores = 1 / (xyz_dists + 1e-6)
             
-            # 🆕 生成IoU预剪枝掩码 (Nc x Nm)，并确保维度正确
-            attention_mask = xyz_scores > self.iou_thr  # True=允许注意力，False=禁止
-            
-            # 确保attention_mask的维度正确：(Nc, Nm) -> (1, Nc, Nm)
-            if attention_mask.dim() == 2:
-                attention_mask = attention_mask.unsqueeze(0)  # 添加batch维度
+            # 预剪枝掩码（Memory x Current）= (Nm, Nc)
+            attention_mask_mem_cur = xyz_scores > self.iou_thr  # True=允许匹配，False=禁止
+            # Transformer attention mask 常见约定为 (B, tgt, src) = (1, Nc, Nm)
+            attention_mask_tgt_src = attention_mask_mem_cur.T.unsqueeze(0)
             
             if self.tformer is not None and self.cur_queries is not None:
                 # 步骤2a: 使用Time Divided Transformer with attention mask
@@ -324,9 +341,10 @@ class OnlineMerge():
                     p_c.unsqueeze(0), 
                     p_m.unsqueeze(0),
                     mask_mem=torch.ones(1, self.cur_queries.shape[0], dtype=torch.bool, device=next_queries.device),
-                    attention_mask=attention_mask  # 🆕 传入注意力掩码
+                    attention_mask=attention_mask_tgt_src  # (1, Nc, Nm)
                 )
-                mix_scores = attn_mat.squeeze(0)  # Nc x Nm
+                # attn_mat: (1, Nc, Nm) -> Hungarian expects (Nm, Nc) for memory-row assignment
+                mix_scores = attn_mat.squeeze(0).T  # Nm x Nc
                 
                 # 🆕 使用TDT更新的特征来更新Memory (EMA更新)
                 if hasattr(self, 'ema_alpha'):
@@ -346,44 +364,40 @@ class OnlineMerge():
                 if self.cur_xyz is None or next_xyz is None:
                     raise RuntimeError('xyz is None when merging instances')
 
+                # Keep matrix layout consistent with xyz_scores: (Nm, Nc)
                 query_feat_scores = (self.cur_query_feats.unsqueeze(1) * next_query_feats.unsqueeze(0)).sum(2)
                 sem_pred_scores = F.cosine_similarity(
                     self.cur_sem_preds.unsqueeze(1), next_sem_preds.unsqueeze(0), dim=2)
 
                 mix_scores = query_feat_scores * xyz_scores
-                # 应用IoU预剪枝mask (去掉batch维度)
-                mix_scores = torch.where(attention_mask.squeeze(0), mix_scores, torch.zeros_like(mix_scores))
+                # 应用IoU预剪枝mask
+                mix_scores = torch.where(attention_mask_mem_cur, mix_scores, torch.zeros_like(mix_scores))
             
-            # 确保标签匹配矩阵的维度与mix_scores一致 (Nc, Nm)
+            # 确保标签匹配矩阵的维度与mix_scores一致 (Nm, Nc)
             inst_label_scores = torch.where(
-                next_labels.unsqueeze(1) == self.cur_labels.unsqueeze(0), 
-                torch.ones((next_labels.shape[0], self.cur_labels.shape[0])).to(self.cur_labels.device), 
-                torch.zeros((next_labels.shape[0], self.cur_labels.shape[0])).to(self.cur_labels.device)
+                self.cur_labels.unsqueeze(1) == next_labels.unsqueeze(0),
+                torch.ones((self.cur_labels.shape[0], next_labels.shape[0])).to(self.cur_labels.device),
+                torch.zeros((self.cur_labels.shape[0], next_labels.shape[0])).to(self.cur_labels.device)
             )
             
             mix_scores = torch.where(mix_scores > 0, mix_scores, torch.zeros_like(mix_scores))
             mix_scores = mix_scores * inst_label_scores
-            if mix_scores.shape[0] < mix_scores.shape[1]:
-                mix_scores = torch.cat((mix_scores, torch.zeros((mix_scores.shape[1]
-                     - mix_scores.shape[0], mix_scores.shape[1])).to(mix_scores.device)), dim=0)
-            # Hungarian assign
+
+            # Hungarian assign (supports rectangular matrices)
             row_ind, col_ind = linear_sum_assignment(-mix_scores.detach().cpu())
             row_ind = torch.tensor(row_ind).to(mix_scores.device)
             col_ind = torch.tensor(col_ind).to(mix_scores.device)
-            
-            # 🆕 添加索引边界检查，确保不会超出范围
-            valid_row_mask = (row_ind < self.cur_masks.shape[0])
-            valid_col_mask = (col_ind < next_masks.shape[0])
-            valid_mask = valid_row_mask & valid_col_mask
-            
-            row_ind = row_ind[valid_mask]
-            col_ind = col_ind[valid_mask]
             
             # 只保留有效的匹配分数
             if len(row_ind) > 0:
                 mix_scores_mask = mix_scores[row_ind, col_ind].gt(0)
                 row_ind = row_ind[mix_scores_mask]
                 col_ind = col_ind[mix_scores_mask]
+
+            # Online matching statistics (post-filter).
+            matched_cnt = int(row_ind.numel())
+            matched_mem_idx = row_ind.detach().cpu().tolist()
+            matched_det_idx = col_ind.detach().cpu().tolist()
 
             temp = torch.zeros(self.cur_masks.shape[0]).bool().to(self.cur_masks.device)
             temp[row_ind] = True
@@ -395,6 +409,7 @@ class OnlineMerge():
             self.cur_masks = torch.cat((self.cur_masks, next_masks_), dim=1)
             no_merge_masks = torch.ones(next_masks.shape[0]).bool().to(next_masks.device)
             no_merge_masks[col_ind] = False
+            birth_cnt = int(no_merge_masks.sum().item()) if no_merge_masks.numel() else 0
             former_padding = torch.zeros((no_merge_masks.nonzero().shape[0], points_per_mask * self.fi)).bool().to(next_masks.device)
             new_masks = torch.cat((former_padding, next_masks[no_merge_masks]), dim=1)
             self.cur_masks = torch.cat((self.cur_masks, new_masks), dim=0)
@@ -431,6 +446,22 @@ class OnlineMerge():
         cur_queries = self.cur_queries[kept_ins]
         cur_bboxes = self.cur_xyz[kept_ins] if self.use_bbox else None
         # cur_labels = torch.zeros_like(self.cur_scores).long()
+
+        if self.monitor:
+            mem_full = int(self.cur_scores.shape[0]) if self.cur_scores is not None else 0
+            mem_kept = int(kept_ins.numel()) if torch.is_tensor(kept_ins) else int(len(kept_ins))
+            self.last_stats = {
+                "fi": int(self.fi),
+                "det_to_merge": int(det_to_merge),
+                "matched": int(matched_cnt),
+                "birth": int(birth_cnt),
+                "mem_size_prev": int(prev_mem_size),
+                "mem_size_full": int(mem_full),
+                "mem_size_kept": int(mem_kept),
+                "topk_drop": int(max(mem_full - mem_kept, 0)),
+                "matched_mem_idx": matched_mem_idx,
+                "matched_det_idx": matched_det_idx,
+            }
         return cur_masks, cur_labels, cur_scores, cur_queries, cur_bboxes
     
     @staticmethod
