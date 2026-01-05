@@ -134,6 +134,8 @@ class UnifiedSegMetric(SegMetric):
         det = _collect("det_to_merge")
         matched = _collect("matched")
         birth = _collect("birth")
+        absorbed = _collect("absorbed")
+        supporters = _collect("supporters")
         mem_full = _collect("mem_size_full")
         mem_kept = _collect("mem_size_kept")
         topk_drop = _collect("topk_drop")
@@ -159,6 +161,8 @@ class UnifiedSegMetric(SegMetric):
             "det_to_merge": _pack(det),
             "matched": _pack(matched),
             "birth": _pack(birth),
+            "absorbed": _pack(absorbed),
+            "supporters": _pack(supporters),
             "match_rate": _pack(match_rate),
             "birth_rate": _pack(birth_rate),
             "mem_size_full": _pack(mem_full),
@@ -212,14 +216,54 @@ class UnifiedSegMetric(SegMetric):
             "after_topk",
             "after_obj_norm",
             "after_nms",
+            "after_geom_merge",
             "after_inst_thr",
             "after_npoint_thr",
             "after_copy_suppress",
         ]
-        drop_keys = ["drop_nms", "drop_inst_thr", "drop_npoint_thr", "drop_copy_suppress"]
+        drop_keys = ["drop_nms", "drop_geom_merge", "drop_inst_thr", "drop_npoint_thr", "drop_copy_suppress"]
 
         stage = {k: _pack(_collect(lambda fr, kk=k: (fr.get("counts", {}) or {}).get(kk))) for k in stage_keys}
         drops = {k: _pack(_collect(lambda fr, kk=k: (fr.get("drops", {}) or {}).get(kk))) for k in drop_keys}
+
+        # Geom-merge diagnostics (Step0): cap effectiveness + union expansion evidence.
+        def _geom(fr, key: str):
+            blk = fr.get("geom_merge", {}) or {}
+            return blk.get(key, None)
+
+        geom_merge = {
+            "merge_drop": _pack(_collect(lambda fr: _geom(fr, "merge_drop"))),
+            "cap_drop": _pack(_collect(lambda fr: _geom(fr, "cap_drop"))),
+            "num_clusters_total": _pack(_collect(lambda fr: _geom(fr, "num_clusters_total"))),
+            "num_out_before_cap": _pack(_collect(lambda fr: _geom(fr, "num_out_before_cap"))),
+            "num_out_after_cap": _pack(_collect(lambda fr: _geom(fr, "num_out_after_cap"))),
+            "cap_active_rate": _pack(_collect(lambda fr: float(bool(_geom(fr, "cap_active"))))),
+            "cluster_size_p50": _pack(_collect(lambda fr: _geom(fr, "cluster_size_p50"))),
+            "cluster_size_p90": _pack(_collect(lambda fr: _geom(fr, "cluster_size_p90"))),
+            "clusters_ge2_ratio": _pack(_collect(lambda fr: _geom(fr, "clusters_ge2_ratio"))),
+        }
+
+        def _geom_evt(fr, metric: str, key: str):
+            blk = fr.get("geom_merge", {}) or {}
+            evt = blk.get("merge_event", {}) or {}
+            m = evt.get(metric, {}) or {}
+            return m.get(key, None)
+
+        geom_merge_event = {
+            "num_events_total": _pack(_collect(lambda fr: (fr.get("geom_merge", {}) or {}).get("merge_event", {}).get("num_events_total"))),
+            "expansion_ratio_p90": _pack(_collect(lambda fr: _geom_evt(fr, "expansion_ratio", "p90"))),
+            "expansion_ratio_p95": _pack(_collect(lambda fr: _geom_evt(fr, "expansion_ratio", "p95"))),
+            "expansion_ratio_gt_1p2_rate": _pack(_collect(lambda fr: (fr.get("geom_merge", {}) or {}).get("merge_event", {}).get("expansion_ratio_gt_1p2_rate"))),
+            "expansion_ratio_gt_1p5_rate": _pack(_collect(lambda fr: (fr.get("geom_merge", {}) or {}).get("merge_event", {}).get("expansion_ratio_gt_1p5_rate"))),
+            "bbox_expand_ratio_p90": _pack(_collect(lambda fr: _geom_evt(fr, "bbox_expand_ratio", "p90"))),
+            "bbox_expand_ratio_p95": _pack(_collect(lambda fr: _geom_evt(fr, "bbox_expand_ratio", "p95"))),
+            "bbox_expand_ratio_gt_1p5_rate": _pack(_collect(lambda fr: (fr.get("geom_merge", {}) or {}).get("merge_event", {}).get("bbox_expand_ratio_gt_1p5_rate"))),
+            "bbox_expand_ratio_gt_2p0_rate": _pack(_collect(lambda fr: (fr.get("geom_merge", {}) or {}).get("merge_event", {}).get("bbox_expand_ratio_gt_2p0_rate"))),
+            "delta_best_iou_neg_rate": _pack(_collect(lambda fr: _geom_evt(fr, "delta_best_iou", "neg_rate"))),
+            "delta_best_iou_lt_-0p05_rate": _pack(_collect(lambda fr: _geom_evt(fr, "delta_best_iou", "lt_-0p05_rate"))),
+            "sem_same_rate_p50": _pack(_collect(lambda fr: _geom_evt(fr, "sem_same_rate", "p50"))),
+            "query_cos_mean_p50": _pack(_collect(lambda fr: _geom_evt(fr, "query_cos_mean", "p50"))),
+        }
 
         # Killed useful rates (GT-aware): which gate is throwing away potentially
         # useful candidates (IoU>=0.5 or Cov>=0.5)?
@@ -331,6 +375,8 @@ class UnifiedSegMetric(SegMetric):
             },
             "stage_counts": stage,
             "stage_drops": drops,
+            "geom_merge": geom_merge,
+            "geom_merge_event": geom_merge_event,
             "killed_useful_iou05": {
                 "inst_thr": {"any": killed_inst_any, "iou": killed_inst_iou, "cov": killed_inst_cov},
                 "npoint_thr": {"any": killed_np_any, "iou": killed_np_iou, "cov": killed_np_cov},

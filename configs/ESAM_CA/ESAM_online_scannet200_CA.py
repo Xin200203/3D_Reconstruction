@@ -92,6 +92,23 @@ model = dict(
         nms=True,
         matrix_nms_kernel='linear',
         stuff_classes=[0, 1],
+        # E1: optional single-frame geometric merge (duplicate merge; runs before inst_score_thr).
+        # Default is disabled for backward compatibility.
+        geom_merge=dict(
+            enable=False,
+            apply_to='inst',  # 'inst' | 'pan' | 'both'
+            max_num=20,
+            sort_by='scores',        # 'scores' | 'select_scores'
+            prefer_by='scores',      # 'scores' | 'select_scores'
+            geom_source='mask_aabb', # currently only supports mask-derived AABB
+            duplicate_criteria=dict(
+                iou_box_thr=0.7,
+                center_norm_thr=0.25,
+                size_ratio_min=0.25,
+                use_point_iou_refine=False,
+                iou_pts_thr=0.6,
+            ),
+        ),
         merge_type='learnable_online'))
 
 dataset_type = 'ScanNet200SegMVDataset_'

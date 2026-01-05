@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2177,10 +2179,21 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     except Exception:
                         gt_inst_frame = None
 
+            # Provide per-point XYZ to downstream post-processing (e.g. geom_merge).
+            pts_xyz_frame = None
+            try:
+                if 'elastic_coords' in batch_inputs_dict:
+                    pts_xyz_frame = batch_inputs_dict['elastic_coords'][0][frame_i] * float(self.voxel_size)
+                else:
+                    pts_xyz_frame = batch_inputs_dict['points'][0][frame_i, :, :3]
+            except Exception:
+                pts_xyz_frame = None
+
             pred_pts_seg, mapping = self.predict_by_feat(
                 x,
                 batch_data_samples[0].gt_pts_seg.sp_pts_mask[frame_i],
                 gt_pts_instance=gt_inst_frame,
+                pts_xyz=pts_xyz_frame,
             )
             results.append(pred_pts_seg[0])
 
@@ -2233,6 +2246,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     online_merger = OnlineMerge(
                         self.test_cfg.inscat_topk_insts,
                         self.use_bbox,
+                        absorb_cfg=(self.test_cfg.get('many_to_one_absorb', None) or {}),
+                        support_cfg=(self.test_cfg.get('one_to_many_support', None) or {}),
                         monitor=(online_monitor_enable or bs_record_online),
                     )
                 if online_merger is not None:
@@ -2444,6 +2459,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         superpoints: Any,
         *,
         gt_pts_instance: Optional[torch.Tensor] = None,
+        pts_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple[List[PointData], List[torch.Tensor]]:  # type: ignore[override]
         """Predict instance, semantic, and panoptic masks for a single scene.
 
@@ -2460,13 +2476,18 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 `pts_instance_mask`, `instance_labels`, `instance_scores`.
         """
         inst_res = self.predict_by_feat_instance(
-            out, superpoints, self.test_cfg.inst_score_thr, gt_pts_instance=gt_pts_instance)
+            out,
+            superpoints,
+            self.test_cfg.inst_score_thr,
+            gt_pts_instance=gt_pts_instance,
+            pts_xyz=pts_xyz,
+        )
         sem_res = self.predict_by_feat_semantic(out, superpoints)
 
         sem_map2 = self.predict_by_feat_semantic(
             out, superpoints, self.test_cfg.stuff_classes)
         inst_res2 = self.predict_by_feat_instance(
-            out, superpoints, self.test_cfg.pan_score_thr)
+            out, superpoints, self.test_cfg.pan_score_thr, pts_xyz=pts_xyz)
 
         pts_semantic_mask = [sem_res, sem_map2]
         pts_instance_mask = [inst_res[0].bool(), inst_res2[0].bool()]
@@ -2501,6 +2522,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         score_threshold: float,
         *,
         gt_pts_instance: Optional[torch.Tensor] = None,
+        pts_xyz: Optional[torch.Tensor] = None,
     ) -> Tuple[Any, torch.Tensor, torch.Tensor, Any, torch.Tensor, torch.Tensor, Optional[dict]]:  # type: ignore[override]
         """Predict instance masks for a single scene.
 
@@ -2520,6 +2542,13 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         """
         mapping = torch.arange(len(out['cls_preds'][0])).to(superpoints.device)
         cls_preds = out['cls_preds'][0]
+        sem_preds = None
+        try:
+            sem_preds = out.get('sem_preds', None)
+            if isinstance(sem_preds, (list, tuple)) and len(sem_preds) > 0:
+                sem_preds = sem_preds[0]
+        except Exception:
+            sem_preds = None
         pred_masks = out['masks'][0]
         queries = out['queries'][0]
         assert self.num_classes == 1 or self.num_classes == cls_preds.shape[1] - 1
@@ -2638,6 +2667,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         mask_pred_sigmoid = mask_pred.sigmoid()
         queries = queries[topk_idx]
         mapping = mapping[topk_idx]
+        if torch.is_tensor(sem_preds):
+            sem_preds = sem_preds[topk_idx]
 
         n_after_topk = int(mask_pred_sigmoid.shape[0])
         n_after_obj_norm = int(mask_pred_sigmoid.shape[0])
@@ -2649,6 +2680,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         pre_pool_masks = None
         pre_pool_scores = None
         pre_pool_select_scores = None
+        mask_pred_after_nms = None
+        scores_after_nms = None
+        select_scores_after_nms = None
+        masks_before_inst_thr_bin = None
         masks_after_obj_norm_bin = None
         masks_after_nms_bin = None
         masks_after_npoint_bin = None
@@ -2686,17 +2721,527 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             queries = queries[keep_inds]
             mapping = mapping[keep_inds]
             select_scores = select_scores[keep_inds]
+            if torch.is_tensor(sem_preds):
+                sem_preds = sem_preds[keep_inds]
         n_after_nms = int(mask_pred_sigmoid.shape[0])
 
         mask_pred_sigmoid = mask_pred_sigmoid[:, ...]
         mask_pred = mask_pred_sigmoid > self.test_cfg.sp_score_thr
+        # Snapshot "after_nms" pool (before optional geom_merge) for diagnostics.
+        mask_pred_after_nms = mask_pred
+        scores_after_nms = scores
+        select_scores_after_nms = select_scores
         if bs_enable and bs_record_quality:
             masks_after_nms_bin = mask_pred
 
-        if bs_enable and bs_pre_pool == 'after_nms':
-            pre_pool_masks = mask_pred
+        # Optional: single-frame geometric merge (E1).
+        geom_cfg = self.test_cfg.get('geom_merge', None) or {}
+        geom_enable = bool(geom_cfg.get('enable', False))
+        geom_apply_to = str(geom_cfg.get('apply_to', 'inst'))
+        if geom_apply_to not in ('inst', 'pan', 'both'):
+            geom_apply_to = 'inst'
+        if geom_apply_to != 'both':
+            inst_thr = float(self.test_cfg.get('inst_score_thr', 0.0))
+            pan_thr = float(self.test_cfg.get('pan_score_thr', 0.0))
+            if geom_apply_to == 'inst' and abs(float(score_threshold) - inst_thr) > 1e-6:
+                geom_enable = False
+            if geom_apply_to == 'pan' and abs(float(score_threshold) - pan_thr) > 1e-6:
+                geom_enable = False
+
+        def _geom_warn_once(msg: str):
+            if not hasattr(self, '_geom_merge_warned'):
+                setattr(self, '_geom_merge_warned', set())
+            warned = getattr(self, '_geom_merge_warned')
+            if isinstance(warned, set) and msg not in warned:
+                print(f"[geom_merge][warn] {msg}")
+                warned.add(msg)
+
+        geom_pool_masks = None
+        if geom_enable:
+            try:
+                if pts_xyz is None or (not torch.is_tensor(pts_xyz)):
+                    _geom_warn_once("pts_xyz is None; skip geom_merge.")
+                    geom_enable = False
+                else:
+                    pts_xyz_ = pts_xyz[:, :3]
+                    if pts_xyz_.dim() != 2 or pts_xyz_.shape[1] != 3:
+                        _geom_warn_once(f"unexpected pts_xyz shape={tuple(pts_xyz_.shape)}; skip geom_merge.")
+                        geom_enable = False
+            except Exception:
+                geom_enable = False
+
+        n_after_geom_merge = int(mask_pred.shape[0])
+        geom_stats = None
+        if geom_enable and pts_xyz is not None and torch.is_tensor(pts_xyz):
+            try:
+                # Ensure mask dimension aligns with points. If masks are in superpoint space, expand to points.
+                mask_for_geom = mask_pred
+                if pts_xyz.shape[0] != mask_pred.shape[1]:
+                    if torch.is_tensor(superpoints) and superpoints.numel() == pts_xyz.shape[0]:
+                        n_sp = int(superpoints.max().item()) + 1 if superpoints.numel() > 0 else 0
+                        if n_sp > 0 and mask_pred.shape[1] == n_sp:
+                            mask_for_geom = mask_pred[:, superpoints]
+                            # Promote downstream to point masks for consistent npoint_thr.
+                            mask_pred = mask_for_geom
+                        else:
+                            _geom_warn_once(
+                                f"mask dim {mask_pred.shape[1]} != pts {pts_xyz.shape[0]} and not (n_sp={n_sp}); skip geom_merge."
+                            )
+                            geom_enable = False
+                    else:
+                        _geom_warn_once(
+                            f"mask dim {mask_pred.shape[1]} != pts {pts_xyz.shape[0]} and superpoints unavailable; skip geom_merge."
+                        )
+                        geom_enable = False
+
+                if geom_enable:
+                    # Parameters (duplicate merge: high-consistency).
+                    max_num = int(geom_cfg.get('max_num', 20))
+                    max_num = max(1, max_num)
+                    sort_by = str(geom_cfg.get('sort_by', 'scores'))
+                    if sort_by not in ('scores', 'select_scores'):
+                        sort_by = 'scores'
+                    prefer_by = str(geom_cfg.get('prefer_by', 'scores'))
+                    if prefer_by not in ('scores', 'select_scores'):
+                        prefer_by = 'scores'
+                    merge_mode = str(geom_cfg.get('mode', 'union'))
+                    if merge_mode not in ('union', 'keep_best', 'controlled_union'):
+                        merge_mode = 'union'
+                    cu_cfg = geom_cfg.get('controlled_union', None) or {}
+                    cu_small_ratio_max = float(cu_cfg.get('small_ratio_max', 0.3))
+                    cu_cov_thr = float(cu_cfg.get('cov_thr', 0.9))
+                    cu_expansion_ratio_max = float(cu_cfg.get('expansion_ratio_max', 1.2))
+                    cu_bbox_expand_ratio_max = float(cu_cfg.get('bbox_expand_ratio_max', 1.5))
+
+                    crit = geom_cfg.get('duplicate_criteria', None) or {}
+                    iou_box_thr = float(crit.get('iou_box_thr', 0.7))
+                    center_norm_thr = float(crit.get('center_norm_thr', 0.25))
+                    size_ratio_min = float(crit.get('size_ratio_min', 0.25))
+                    use_point_refine = bool(crit.get('use_point_iou_refine', False))
+                    iou_pts_thr = float(crit.get('iou_pts_thr', 0.6))
+
+                    # Step0-only diagnostics (no behavior change): cap/merge stats + union expansion evidence.
+                    stats_cfg = geom_cfg.get('stats', None) or {}
+                    stats_enable = bool(stats_cfg.get('enable', False))
+                    stats_record_union = bool(stats_cfg.get('record_union_metrics', True))
+                    stats_record_gt_delta = bool(stats_cfg.get('record_gt_delta_iou', True))
+                    stats_record_sem = bool(stats_cfg.get('record_semantic', False))
+                    stats_max_events = int(stats_cfg.get('max_events_per_frame', 0))
+                    if stats_max_events < 0:
+                        stats_max_events = 0
+
+                    # Optional semantic/feature veto for duplicate grouping (no effect unless enabled).
+                    veto_cfg = geom_cfg.get('semantic_veto', None) or {}
+                    veto_enable = bool(veto_cfg.get('enable', False))
+                    veto_conf_thr = float(veto_cfg.get('conf_thr', 0.6))
+                    veto_use_sem_label = bool(veto_cfg.get('use_semantic_label_gate', False))
+                    veto_use_query_cos = bool(veto_cfg.get('use_query_cos_veto', False))
+                    veto_query_cos_thr = float(veto_cfg.get('query_cos_thr', 0.2))
+                    veto_use_sem_cos = bool(veto_cfg.get('use_semantic_cos_veto', False))
+                    veto_sem_cos_thr = float(veto_cfg.get('sem_cos_thr', 0.2))
+
+                    # Geometry source (currently supports mask-derived AABB).
+                    geom_source = str(geom_cfg.get('geom_source', 'mask_aabb'))
+                    if geom_source not in ('mask_aabb', 'pred_bbox', 'hybrid'):
+                        geom_source = 'mask_aabb'
+                    if geom_source != 'mask_aabb':
+                        _geom_warn_once(f"geom_source={geom_source} not implemented; fallback to mask_aabb.")
+
+                    K = int(mask_pred.shape[0])
+                    if K <= 1:
+                        geom_enable = False
+                    else:
+                        pts = pts_xyz[:, :3].to(mask_pred.device)
+                        m = mask_pred
+                        areas = m.sum(1).to(torch.float32)
+                        valid = areas > 0
+                        if int(valid.sum().item()) <= 1:
+                            geom_enable = False
+                        else:
+                            # AABB from mask points (vectorized masked reduction).
+                            eps = 1e-6
+                            inf = torch.finfo(pts.dtype).max
+                            pts_b = pts.unsqueeze(0)  # 1,N,3
+                            mm = m.unsqueeze(-1)      # K,N,1
+                            mins = pts_b.masked_fill(~mm, inf).amin(dim=1)
+                            maxs = pts_b.masked_fill(~mm, -inf).amax(dim=1)
+                            size = (maxs - mins).clamp_min(0.0)
+                            diag = size.norm(dim=1).clamp_min(eps)
+                            centers = (mins + maxs) * 0.5
+
+                            vol = (size[:, 0] * size[:, 1] * size[:, 2]).clamp_min(0.0)
+                            inter_min = torch.maximum(mins[:, None, :], mins[None, :, :])
+                            inter_max = torch.minimum(maxs[:, None, :], maxs[None, :, :])
+                            inter_sz = (inter_max - inter_min).clamp_min(0.0)
+                            inter_vol = inter_sz[..., 0] * inter_sz[..., 1] * inter_sz[..., 2]
+                            union = (vol[:, None] + vol[None, :] - inter_vol).clamp_min(eps)
+                            iou_box = inter_vol / union
+
+                            dist = torch.cdist(centers, centers, p=2)
+                            diag_max = torch.maximum(diag[:, None], diag[None, :]).clamp_min(eps)
+                            dist_norm = dist / diag_max
+
+                            area_safe = areas.clamp_min(1.0)
+                            ratio = area_safe[:, None] / area_safe[None, :]
+                            ratio = torch.minimum(ratio, 1.0 / ratio)
+
+                            same_label = labels[:, None] == labels[None, :]
+                            dup = (iou_box >= iou_box_thr) & (dist_norm <= center_norm_thr) & (ratio >= size_ratio_min)
+                            dup = dup & same_label & valid[:, None] & valid[None, :]
+                            dup.fill_diagonal_(False)
+
+                            # Optional refinement: require point IoU for gated pairs.
+                            if use_point_refine:
+                                gated = dup.clone()
+                                if gated.any():
+                                    # Compute point IoU only for gated pairs.
+                                    # For efficiency, compute full IoU if gated is dense; else compute by matmul.
+                                    mf = m.float()
+                                    inter = mf @ mf.t()
+                                    union_pts = (areas[:, None] + areas[None, :] - inter).clamp_min(1.0)
+                                    iou_pts = inter / union_pts
+                                    dup = dup & (iou_pts >= iou_pts_thr)
+                                    dup.fill_diagonal_(False)
+
+                            # Optional semantic/query veto to reduce near-neighbor false merges (CA-safe).
+                            if veto_enable and torch.is_tensor(sem_preds) and torch.is_tensor(queries) and K > 1:
+                                try:
+                                    allow = torch.ones((K, K), device=m.device, dtype=torch.bool)
+                                    if veto_use_query_cos:
+                                        qn = F.normalize(queries, dim=1)
+                                        cos = (qn @ qn.t()).clamp(-1.0, 1.0)
+                                        allow = allow & (cos >= veto_query_cos_thr)
+                                    if veto_use_sem_label or veto_use_sem_cos:
+                                        sp = torch.softmax(sem_preds[:, :-1], dim=1) if sem_preds.shape[1] >= 2 else None
+                                        if sp is not None:
+                                            conf, lab = torch.max(sp, dim=1)
+                                            if veto_use_sem_label:
+                                                both_hi = (conf >= veto_conf_thr)
+                                                both_hi = both_hi[:, None] & both_hi[None, :]
+                                                same = (lab[:, None] == lab[None, :])
+                                                allow = allow & (~both_hi | same)
+                                            if veto_use_sem_cos:
+                                                sn = F.normalize(sp, dim=1)
+                                                scos = (sn @ sn.t()).clamp(-1.0, 1.0)
+                                                allow = allow & (scos >= veto_sem_cos_thr)
+                                    allow.fill_diagonal_(True)
+                                    dup = dup & allow
+                                    dup.fill_diagonal_(False)
+                                except Exception:
+                                    pass
+
+                            rank_scores = scores if sort_by == 'scores' else select_scores
+                            prefer_scores = scores if prefer_by == 'scores' else select_scores
+                            order = torch.argsort(rank_scores, descending=True)
+
+                            used = torch.zeros((K,), device=m.device, dtype=torch.bool)
+                            out_masks = []
+                            out_scores = []
+                            out_labels = []
+                            out_queries = []
+                            out_mapping = []
+                            out_select_scores = []
+                            out_rank_scores = []
+                            cluster_sizes = []
+                            merge_drop = 0
+
+                            # Per-merge event diagnostics (only when enabled).
+                            expansion_ratios: list[float] = []
+                            bbox_expand_ratios: list[float] = []
+                            delta_best_iou: list[float] = []
+                            delta_best_iou_neg: list[int] = []
+                            delta_best_iou_lt005: list[int] = []
+                            sem_same_rate: list[float] = []
+                            sem_conf_min: list[float] = []
+                            query_cos_mean: list[float] = []
+                            num_merge_events_total = 0
+
+                            gt_ctx = None  # (best_iou_fn, m_cpu)
+                            if stats_enable and stats_record_gt_delta and bs_has_gt:
+                                try:
+                                    gt_np = gt_pts_instance.detach().cpu().numpy().reshape(-1)
+                                    if int(gt_np.size) == int(m.shape[1]):
+                                        valid_gt = gt_np >= 0
+                                        ids = gt_np[valid_gt].astype(np.int64, copy=False)
+                                        if ids.size > 0:
+                                            uniq, cnt = np.unique(ids, return_counts=True)
+                                            vis = cnt >= int(bs_gt_vis_npoint)
+                                            vis_ids = np.sort(uniq[vis]).astype(np.int64, copy=False)
+                                            G = int(vis_ids.size)
+                                            if G > 0:
+                                                mapped = np.full_like(gt_np, -1, dtype=np.int64)
+                                                idx_valid = np.where(valid_gt)[0]
+                                                pos = np.searchsorted(vis_ids, gt_np[idx_valid])
+                                                in_vis = (pos < G) & (vis_ids[pos] == gt_np[idx_valid])
+                                                mapped_valid = np.full((idx_valid.size,), -1, dtype=np.int64)
+                                                mapped_valid[in_vis] = pos[in_vis]
+                                                mapped[idx_valid] = mapped_valid
+                                                gt_sizes = np.bincount(mapped[mapped >= 0], minlength=G).astype(np.int64)
+
+                                                def _best_iou(mask_bool: np.ndarray) -> float:
+                                                    pm = (mask_bool.astype(bool, copy=False) & valid_gt)
+                                                    pred_size = int(pm.sum())
+                                                    if pred_size <= 0:
+                                                        return 0.0
+                                                    lab = mapped[pm]
+                                                    lab = lab[lab >= 0]
+                                                    if lab.size == 0:
+                                                        return 0.0
+                                                    inter = np.bincount(lab, minlength=G).astype(np.int64)
+                                                    union_ = (pred_size + gt_sizes - inter).astype(np.float32)
+                                                    union_ = np.maximum(union_, 1.0)
+                                                    iou_ = inter.astype(np.float32) / union_
+                                                    return float(np.max(iou_)) if iou_.size else 0.0
+
+                                                gt_ctx = (_best_iou, m.detach().cpu().numpy())
+                                except Exception:
+                                    gt_ctx = None
+
+                            sem_label = None
+                            sem_conf = None
+                            q_norm = None
+                            if stats_enable and stats_record_sem:
+                                try:
+                                    if torch.is_tensor(sem_preds) and sem_preds.shape[0] == m.shape[0] and sem_preds.shape[1] >= 2:
+                                        prob = torch.softmax(sem_preds[:, :-1], dim=1)
+                                        sem_conf, sem_label = torch.max(prob, dim=1)
+                                    if torch.is_tensor(queries) and queries.shape[0] == m.shape[0]:
+                                        q_norm = F.normalize(queries, dim=1)
+                                except Exception:
+                                    sem_label = None
+                                    sem_conf = None
+                                    q_norm = None
+
+                            for idx in order.tolist():
+                                if bool(used[idx].item()):
+                                    continue
+                                # seed + its duplicates (one-hop; conservative for duplicate merge)
+                                neigh = dup[idx] & (~used)
+                                cand = torch.nonzero(neigh, as_tuple=False).reshape(-1)
+                                cand = torch.cat([cand, cand.new_tensor([idx])], dim=0)
+                                cand = torch.unique(cand)
+                                used[cand] = True
+                                if cand.numel() > 1:
+                                    merge_drop += int(cand.numel() - 1)
+                                cluster_sizes.append(int(cand.numel()))
+                                # representative
+                                rep = idx
+                                if cand.numel() > 1:
+                                    pv = prefer_scores[cand]
+                                    rep = int(cand[int(torch.argmax(pv).item())].item())
+
+                                # merge (mode-dependent)
+                                merged_mask = None
+                                if merge_mode == 'keep_best':
+                                    merged_mask = m[rep]
+                                elif merge_mode == 'union':
+                                    merged_mask = m[cand].any(dim=0)
+                                else:
+                                    # controlled union: start from representative mask, absorb only safe fragments
+                                    merged_mask = m[rep].clone()
+                                    rep_sz = float(merged_mask.sum().item())
+                                    rep_mins = mins[rep].clone()
+                                    rep_maxs = maxs[rep].clone()
+                                    rep_vol = float(vol[rep].item())
+                                    # absorb smaller members with high containment and bounded expansion
+                                    for ci in cand.tolist():
+                                        if int(ci) == int(rep):
+                                            continue
+                                        frag = m[int(ci)]
+                                        frag_sz = float(frag.sum().item())
+                                        if frag_sz <= 0 or rep_sz <= 0:
+                                            continue
+                                        if frag_sz > rep_sz * cu_small_ratio_max:
+                                            continue
+                                        inter_sz = float((frag & merged_mask).sum().item())
+                                        cov = inter_sz / max(frag_sz, 1.0)
+                                        if cov < cu_cov_thr:
+                                            continue
+                                        new_sz = rep_sz + frag_sz - inter_sz
+                                        exp_ratio = new_sz / max(rep_sz, 1.0)
+                                        if exp_ratio > cu_expansion_ratio_max:
+                                            continue
+                                        u_mins = torch.minimum(rep_mins, mins[int(ci)])
+                                        u_maxs = torch.maximum(rep_maxs, maxs[int(ci)])
+                                        u = (u_maxs - u_mins).clamp_min(0.0)
+                                        u_vol = float((u[0] * u[1] * u[2]).item())
+                                        bbox_ratio = u_vol / max(rep_vol, 1e-6)
+                                        if bbox_ratio > cu_bbox_expand_ratio_max:
+                                            continue
+                                        # accept absorption
+                                        merged_mask = merged_mask | frag
+                                        rep_sz = float(merged_mask.sum().item())
+                                        rep_mins = u_mins
+                                        rep_maxs = u_maxs
+                                        rep_vol = max(rep_vol, u_vol)
+
+                                if merged_mask is None:
+                                    merged_mask = m[rep]
+
+                                if stats_enable and cand.numel() > 1:
+                                    num_merge_events_total += 1
+
+                                # Step0 union expansion evidence (does not affect outputs).
+                                if stats_enable and stats_record_union and cand.numel() > 1 and (
+                                    stats_max_events == 0 or len(expansion_ratios) < stats_max_events
+                                ):
+                                    try:
+                                        base_sz = float(torch.max(areas[cand]).item()) if cand.numel() else 0.0
+                                        union_sz = float(merged_mask.sum().item())
+                                        if base_sz > 0:
+                                            expansion_ratios.append(float(union_sz / base_sz))
+                                        base_vol = float(torch.max(vol[cand]).item()) if cand.numel() else 0.0
+                                        union_mins = torch.amin(mins[cand], dim=0)
+                                        union_maxs = torch.amax(maxs[cand], dim=0)
+                                        u = (union_maxs - union_mins).clamp_min(0.0)
+                                        union_vol2 = float((u[0] * u[1] * u[2]).item())
+                                        if base_vol > 0:
+                                            bbox_expand_ratios.append(float(union_vol2 / max(base_vol, 1e-6)))
+                                    except Exception:
+                                        pass
+
+                                # GT-aware merge quality delta (best IoU before/after union).
+                                if stats_enable and stats_record_gt_delta and gt_ctx is not None and cand.numel() > 1 and (
+                                    stats_max_events == 0 or len(delta_best_iou) < stats_max_events
+                                ):
+                                    try:
+                                        best_iou_fn, m_cpu = gt_ctx
+                                        before = 0.0
+                                        for ci in cand.detach().cpu().numpy().tolist():
+                                            before = max(before, float(best_iou_fn(m_cpu[int(ci)])))
+                                        after = float(best_iou_fn(merged_mask.detach().cpu().numpy()))
+                                        d = float(after - before)
+                                        delta_best_iou.append(d)
+                                        delta_best_iou_neg.append(int(d < 0))
+                                        delta_best_iou_lt005.append(int(d < -0.05))
+                                    except Exception:
+                                        pass
+
+                                # Optional: semantic/query consistency evidence (for later gates).
+                                if stats_enable and stats_record_sem and cand.numel() > 1 and (
+                                    stats_max_events == 0 or len(sem_same_rate) < stats_max_events
+                                ):
+                                    try:
+                                        if sem_label is not None and sem_conf is not None and sem_label.numel() == m.shape[0]:
+                                            lbl = sem_label[cand]
+                                            cf = sem_conf[cand]
+                                            sem_same_rate.append(float((lbl == lbl[0]).float().mean().item()))
+                                            sem_conf_min.append(float(cf.min().item()))
+                                        if q_norm is not None and q_norm.shape[0] == m.shape[0]:
+                                            qc = (q_norm[cand] @ q_norm[idx].unsqueeze(1)).squeeze(1)
+                                            query_cos_mean.append(float(qc.mean().item()))
+                                    except Exception:
+                                        pass
+                                out_masks.append(merged_mask)
+                                out_labels.append(labels[rep])
+                                out_queries.append(queries[rep])
+                                out_mapping.append(mapping[rep])
+                                out_select_scores.append(select_scores[rep])
+                                out_scores.append(torch.max(scores[cand]))
+                                out_rank_scores.append(torch.max(rank_scores[cand]))
+
+                            # Post selection: after building all clusters, apply max_num by cluster rank.
+                            num_clusters_total = int(len(out_masks))
+                            cap_drop = 0
+                            if num_clusters_total > int(max_num):
+                                rs = torch.stack(out_rank_scores, dim=0)
+                                _, keep = torch.topk(rs, k=int(max_num), largest=True, sorted=False)
+                                keep = keep.detach().cpu().numpy().tolist()
+                                keep_set = set(int(i) for i in keep)
+                                keep = [i for i in range(num_clusters_total) if i in keep_set]
+                                cap_drop = int(num_clusters_total - len(keep))
+                                out_masks = [out_masks[i] for i in keep]
+                                out_scores = [out_scores[i] for i in keep]
+                                out_labels = [out_labels[i] for i in keep]
+                                out_queries = [out_queries[i] for i in keep]
+                                out_mapping = [out_mapping[i] for i in keep]
+                                out_select_scores = [out_select_scores[i] for i in keep]
+                                out_rank_scores = [out_rank_scores[i] for i in keep]
+
+                            if len(out_masks) > 0:
+                                mask_pred = torch.stack(out_masks, dim=0)
+                                labels = torch.stack(out_labels, dim=0)
+                                queries = torch.stack(out_queries, dim=0)
+                                mapping = torch.stack(out_mapping, dim=0)
+                                select_scores = torch.stack(out_select_scores, dim=0)
+                                scores = torch.stack(out_scores, dim=0)
+                            n_after_geom_merge = int(scores.shape[0])
+                            geom_pool_masks = mask_pred
+
+                            def _pct(vals: list[float]) -> dict:
+                                if not vals:
+                                    return {"n": 0, "p50": 0.0, "p90": 0.0, "p95": 0.0}
+                                a = np.asarray(vals, dtype=np.float32)
+                                return {
+                                    "n": int(a.size),
+                                    "p50": float(np.percentile(a, 50)),
+                                    "p90": float(np.percentile(a, 90)),
+                                    "p95": float(np.percentile(a, 95)),
+                                }
+
+                            def _rate(vals: list[float], thr: float) -> float:
+                                if not vals:
+                                    return 0.0
+                                a = np.asarray(vals, dtype=np.float32)
+                                return float(np.mean(a > float(thr)))
+
+                            geom_stats = {
+                                "merge_drop": int(merge_drop),
+                                "cap_drop": int(cap_drop),
+                                "num_clusters_total": int(num_clusters_total),
+                                "max_num_cfg": int(max_num),
+                                "num_out_before_cap": int(num_clusters_total),
+                                "num_out_after_cap": int(n_after_geom_merge),
+                                "cap_active": bool(num_clusters_total > int(max_num)),
+                                "num_out": int(n_after_geom_merge),
+                                "num_in": int(K),
+                                "mode": str(merge_mode),
+                                "cluster_size_p50": float(np.percentile(np.asarray(cluster_sizes, dtype=np.float32), 50)) if cluster_sizes else 0.0,
+                                "cluster_size_p90": float(np.percentile(np.asarray(cluster_sizes, dtype=np.float32), 90)) if cluster_sizes else 0.0,
+                                "clusters_ge2_ratio": float(np.mean(np.asarray(cluster_sizes) >= 2)) if cluster_sizes else 0.0,
+                            }
+                            if stats_enable and isinstance(geom_stats, dict):
+                                geom_stats["stats"] = {
+                                    "enable": True,
+                                    "record_union_metrics": bool(stats_record_union),
+                                    "record_gt_delta_iou": bool(stats_record_gt_delta),
+                                    "record_semantic": bool(stats_record_sem),
+                                    "max_events_per_frame": int(stats_max_events),
+                                }
+                                geom_stats["merge_event"] = {
+                                    "num_events_total": int(num_merge_events_total),
+                                    "num_events_recorded": int(len(expansion_ratios)) if stats_record_union else int(len(delta_best_iou)),
+                                    "expansion_ratio": _pct(expansion_ratios),
+                                    "expansion_ratio_gt_1p2_rate": _rate(expansion_ratios, 1.2),
+                                    "expansion_ratio_gt_1p5_rate": _rate(expansion_ratios, 1.5),
+                                    "bbox_expand_ratio": _pct(bbox_expand_ratios),
+                                    "bbox_expand_ratio_gt_1p5_rate": _rate(bbox_expand_ratios, 1.5),
+                                    "bbox_expand_ratio_gt_2p0_rate": _rate(bbox_expand_ratios, 2.0),
+                                    "delta_best_iou": {
+                                        **_pct(delta_best_iou),
+                                        "neg_rate": float(np.mean(np.asarray(delta_best_iou_neg, dtype=np.float32))) if delta_best_iou_neg else 0.0,
+                                        "lt_-0p05_rate": float(np.mean(np.asarray(delta_best_iou_lt005, dtype=np.float32))) if delta_best_iou_lt005 else 0.0,
+                                    },
+                                    "sem_same_rate": _pct(sem_same_rate),
+                                    "sem_conf_min": _pct(sem_conf_min),
+                                    "query_cos_mean": _pct(query_cos_mean),
+                                }
+            except Exception as e:
+                _geom_warn_once(f"geom_merge failed: {repr(e)}; skip.")
+                geom_enable = False
+
+        if bs_enable and bs_pre_pool == 'after_geom_merge':
+            pre_pool_masks = geom_pool_masks if geom_pool_masks is not None else mask_pred
             pre_pool_scores = scores
             pre_pool_select_scores = select_scores
+
+        if bs_enable and bs_pre_pool == 'after_nms':
+            pre_pool_masks = mask_pred_after_nms if mask_pred_after_nms is not None else mask_pred
+            pre_pool_scores = scores_after_nms if scores_after_nms is not None else scores
+            pre_pool_select_scores = select_scores_after_nms if select_scores_after_nms is not None else select_scores
+
+        # Snapshot masks right before inst_score_thr (post geom_merge, pre inst_thr).
+        masks_before_inst_thr_bin = mask_pred
 
         # score_thr
         score_mask = scores > score_threshold
@@ -2807,22 +3352,31 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     "iou_thr": float(bs_iou_thr),
                     "iou_lo_thr": float(bs_iou_lo_thr),
                     "pre_pool": bs_pre_pool,
+                    "geom_merge": {
+                        k: v
+                        for k, v in (dict(geom_cfg).items() if isinstance(geom_cfg, dict) else [])
+                        if isinstance(v, (bool, int, float, str))
+                    } if bool(geom_cfg.get("enable", False)) else {"enable": False},
                 },
                 "counts": {
                     "after_topk": int(n_after_topk),
                     "after_obj_norm": int(n_after_obj_norm),
                     "after_nms": int(n_after_nms),
+                    "after_geom_merge": int(n_after_geom_merge),
                     "after_inst_thr": int(n_after_inst_thr),
                     "after_npoint_thr": int(n_after_npoint_thr),
                     "after_copy_suppress": int(n_after_copy_suppress),
                 },
                 "drops": {
                     "drop_nms": int(max(n_after_obj_norm - n_after_nms, 0)),
-                    "drop_inst_thr": int(max(n_after_nms - n_after_inst_thr, 0)),
+                    "drop_geom_merge": int(max(n_after_nms - n_after_geom_merge, 0)),
+                    "drop_inst_thr": int(max(n_after_geom_merge - n_after_inst_thr, 0)),
                     "drop_npoint_thr": int(max(n_after_inst_thr - n_after_npoint_thr, 0)),
                     "drop_copy_suppress": int(max(n_after_npoint_thr - n_after_copy_suppress, 0)),
                 },
             }
+            if isinstance(stage_stats, dict) and isinstance(geom_stats, dict):
+                stage_stats["geom_merge"] = geom_stats
 
         # GT-aware metrics.
         if bs_has_gt:
@@ -2858,6 +3412,17 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     # Normalize pred shape to (Npred, Npts).
                     if pred_masks_t.shape[1] != gt_ids_t.shape[0] and pred_masks_t.shape[0] == gt_ids_t.shape[0]:
                         pred_masks_t = pred_masks_t.T
+                    if pred_masks_t.shape[1] != gt_ids_t.shape[0]:
+                        # If masks are in superpoint space, expand to points via `superpoints`.
+                        try:
+                            if torch.is_tensor(superpoints):
+                                sp = superpoints.detach().cpu().numpy().astype(np.int64).reshape(-1)
+                                if sp.size == gt_ids_t.shape[0] and sp.size > 0:
+                                    n_sp = int(sp.max()) + 1
+                                    if pred_masks_t.shape[1] == n_sp:
+                                        pred_masks_t = pred_masks_t[:, sp]
+                        except Exception:
+                            pass
                     if pred_masks_t.shape[1] != gt_ids_t.shape[0]:
                         return {}
 
@@ -2986,10 +3551,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         tmp = _eval_pred_vs_gt(gt_np, masks_after_obj_norm_bin.detach().cpu().numpy())
                         pre_nms_arr = (tmp.get("pred_arrays", {}) or {}) if isinstance(tmp, dict) else {}
 
-                    after_nms_arr = {}
-                    if (ki is not None or kn is not None) and masks_after_nms_bin is not None:
-                        tmp = _eval_pred_vs_gt(gt_np, masks_after_nms_bin.detach().cpu().numpy())
-                        after_nms_arr = (tmp.get("pred_arrays", {}) or {}) if isinstance(tmp, dict) else {}
+                    before_inst_arr = {}
+                    if (ki is not None or kn is not None) and masks_before_inst_thr_bin is not None:
+                        tmp = _eval_pred_vs_gt(gt_np, masks_before_inst_thr_bin.detach().cpu().numpy())
+                        before_inst_arr = (tmp.get("pred_arrays", {}) or {}) if isinstance(tmp, dict) else {}
 
                     pre_cs_arr = {}
                     if kcs is not None and masks_after_npoint_bin is not None and np.any(kcs):
@@ -2997,8 +3562,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         pre_cs_arr = (tmp.get("pred_arrays", {}) or {}) if isinstance(tmp, dict) else {}
 
                     stage_stats["killed_by_nms"] = _killed_pack_from(pre_nms_arr, knms)
-                    stage_stats["killed_by_inst_thr"] = _killed_pack_from(after_nms_arr, ki)
-                    stage_stats["killed_by_npoint_thr"] = _killed_pack_from(after_nms_arr, kn)
+                    stage_stats["killed_by_inst_thr"] = _killed_pack_from(before_inst_arr, ki)
+                    stage_stats["killed_by_npoint_thr"] = _killed_pack_from(before_inst_arr, kn)
                     stage_stats["killed_by_copy_suppress"] = _killed_pack_from(pre_cs_arr, kcs)
             except Exception:
                 # Keep stage counts/drops even if GT-aware diagnostics fail.

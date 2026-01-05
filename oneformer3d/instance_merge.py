@@ -188,6 +188,8 @@ class OnlineMerge():
         merge_type="count",
         tformer_cfg=None,
         iou_thr=0.1,
+        absorb_cfg=None,
+        support_cfg=None,
         monitor: bool = False,
     ):
         assert merge_type in ['count', 'frame']
@@ -197,6 +199,8 @@ class OnlineMerge():
         self.iou_thr = iou_thr  # IoU预剪枝阈值
         self.monitor = bool(monitor)
         self.last_stats = None
+        self.absorb_cfg = absorb_cfg if isinstance(absorb_cfg, dict) else {}
+        self.support_cfg = support_cfg if isinstance(support_cfg, dict) else {}
         if self.use_bbox:
             self.iou_calculator = AxisAlignedBboxOverlaps3D()
         # 初始化跨帧 Transformer
@@ -233,6 +237,12 @@ class OnlineMerge():
         prev_mem_size = int(self.cur_scores.shape[0]) if self.cur_scores is not None else 0
         matched_cnt = 0
         birth_cnt = det_to_merge
+        absorbed_cnt = 0
+        supporters_cnt = 0
+        absorbed_det_idx = []
+        absorbed_mem_idx = []
+        supporters_det_idx = []
+        supporters_mem_idx = []
         matched_mem_idx = []
         matched_det_idx = []
 
@@ -404,11 +414,192 @@ class OnlineMerge():
             temp = temp.unsqueeze(1)
             temp_masks = torch.zeros((self.cur_masks.shape[0], points_per_mask)).bool().to(self.cur_masks.device)
             temp_masks[row_ind] = next_masks[col_ind]
+            no_merge_masks = torch.ones(next_masks.shape[0]).bool().to(next_masks.device)
+            no_merge_masks[col_ind] = False
+
+            # Optional: many-to-one absorb (stage-2) to reduce fragmentation without birthing new tracks.
+            absorb_enable = bool(self.absorb_cfg.get('enable', False))
+            if absorb_enable and no_merge_masks.any():
+                try:
+                    # thresholds
+                    only_to_matched = bool(self.absorb_cfg.get('only_to_matched', True))
+                    max_absorb = int(self.absorb_cfg.get('max_absorb_per_frame', 0))
+                    iou_thr_absorb = float(self.absorb_cfg.get('iou_thr', 0.5))
+                    score_thr_absorb = float(self.absorb_cfg.get('score_thr', 0.0))
+                    min_pts = int(self.absorb_cfg.get('min_mask_points', 20))
+                    max_pts = int(self.absorb_cfg.get('max_mask_points', 500))
+                    update_score = str(self.absorb_cfg.get('update_score', 'max'))
+                    if update_score not in ('max', 'none'):
+                        update_score = 'max'
+
+                    Nm, Nc = int(mix_scores.shape[0]), int(mix_scores.shape[1])
+                    if Nm > 0 and Nc > 0:
+                        cand_det = torch.nonzero(no_merge_masks, as_tuple=False).reshape(-1)
+                        if cand_det.numel() > 0:
+                            if only_to_matched and row_ind.numel() > 0:
+                                allow_mem = torch.zeros((Nm,), device=mix_scores.device, dtype=torch.bool)
+                                allow_mem[row_ind] = True
+                            else:
+                                allow_mem = torch.ones((Nm,), device=mix_scores.device, dtype=torch.bool)
+                            # absorb at most max_absorb (0 means no limit)
+                            absorbed_this = 0
+                            for dj in cand_det.tolist():
+                                if max_absorb > 0 and absorbed_this >= max_absorb:
+                                    break
+                                pm = next_masks[int(dj)]
+                                pts = int(pm.sum().item())
+                                if pts < min_pts or pts > max_pts:
+                                    continue
+                                col = mix_scores[:, int(dj)]
+                                col = torch.where(allow_mem, col, torch.zeros_like(col))
+                                best_i = int(torch.argmax(col).item())
+                                best_s = float(col[best_i].item())
+                                if best_s <= score_thr_absorb:
+                                    continue
+                                geo = float(xyz_scores[best_i, int(dj)].item())
+                                if geo < iou_thr_absorb:
+                                    continue
+                                # absorb into temp_masks (current frame segment)
+                                temp_masks[best_i] = temp_masks[best_i] | pm
+                                no_merge_masks[int(dj)] = False
+                                absorbed_cnt += 1
+                                absorbed_this += 1
+                                absorbed_det_idx.append(int(dj))
+                                absorbed_mem_idx.append(int(best_i))
+                                if update_score == 'max':
+                                    try:
+                                        self.cur_scores[best_i] = torch.maximum(self.cur_scores[best_i], next_scores[int(dj)])
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
+
+            # Optional: one-to-many supporters association (stage-2, suppress-birth only).
+            # This is a *principle-check* mechanism: a track may accept multiple supporters
+            # within the same frame, while each det can be assigned to at most one track.
+            # Unlike `absorb_cfg`, it does NOT union masks or update track features/scores.
+            support_enable = bool(self.support_cfg.get('enable', False))
+            if support_enable and no_merge_masks.any():
+                try:
+                    mode = str(self.support_cfg.get('mode', 'mask_overlap')).lower()
+                    only_to_matched = bool(self.support_cfg.get('only_to_matched', True))
+                    max_support = int(self.support_cfg.get('max_support_per_frame', 0))
+                    # NOTE: in bbox-containment mode, `cov_thr` is interpreted as det-bbox containment ratio.
+                    cov_thr = float(self.support_cfg.get('cov_thr', 0.8))
+                    small_ratio_max = float(self.support_cfg.get('small_ratio_max', 0.3))
+                    score_thr = float(self.support_cfg.get('score_thr', 0.0))
+                    min_pts = int(self.support_cfg.get('min_mask_points', 20))
+                    max_pts = int(self.support_cfg.get('max_mask_points', 500))
+
+                    # Optional geometry safety valves.
+                    center_norm_thr = float(self.support_cfg.get('center_norm_thr', -1.0))
+                    require_positive_overlap = bool(self.support_cfg.get('require_positive_overlap', True))
+
+                    Nm = int(mix_scores.shape[0])
+                    if Nm > 0 and next_masks.numel() > 0:
+                        cand_det = torch.nonzero(no_merge_masks, as_tuple=False).reshape(-1)
+                        if cand_det.numel() > 0:
+                            if only_to_matched and row_ind.numel() > 0:
+                                allow_mem = torch.zeros((Nm,), device=mix_scores.device, dtype=torch.bool)
+                                allow_mem[row_ind] = True
+                            else:
+                                allow_mem = torch.ones((Nm,), device=mix_scores.device, dtype=torch.bool)
+
+                    def _center_and_diag(bb6: torch.Tensor):
+                        c = (bb6[:, 0:3] + bb6[:, 3:6]) * 0.5
+                        d = torch.linalg.norm((bb6[:, 3:6] - bb6[:, 0:3]).clamp_min(0), dim=1)
+                        return c, d
+
+                    # Precompute bbox centers/diags if available (used as safety valve).
+                    if center_norm_thr > 0 and self.use_bbox and self.cur_xyz is not None and next_xyz is not None \
+                            and self.cur_xyz.numel() > 0 and next_xyz.numel() > 0 \
+                            and int(self.cur_xyz.shape[-1]) == 6 and int(next_xyz.shape[-1]) == 6:
+                        mem_center, mem_diag = _center_and_diag(self.cur_xyz)  # (Nm,3),(Nm,)
+                        det_center, _ = _center_and_diag(next_xyz)  # (Nc,3)
+                    else:
+                        mem_center = mem_diag = det_center = None
+
+                    supported_this = 0
+                    for dj in cand_det.tolist():
+                        if max_support > 0 and supported_this >= max_support:
+                            break
+                        pm = next_masks[int(dj)]
+                        pts_det = int(pm.sum().item())
+                        if pts_det < min_pts or pts_det > max_pts:
+                            continue
+                        if float(next_scores[int(dj)].item()) < score_thr:
+                            continue
+
+                        if mode == 'bbox_contain' and self.use_bbox and self.cur_xyz is not None and next_xyz is not None \
+                                and int(self.cur_xyz.shape[-1]) == 6 and int(next_xyz.shape[-1]) == 6:
+                            # BBox containment-based supporters (calibration-friendly).
+                            det_bb = next_xyz[int(dj)]  # (6,)
+                            mem_bb = self.cur_xyz  # (Nm,6)
+
+                            # Intersection bbox (Nm,6): [max(mins), min(maxs)]
+                            inter_min = torch.maximum(mem_bb[:, 0:3], det_bb[0:3].unsqueeze(0))
+                            inter_max = torch.minimum(mem_bb[:, 3:6], det_bb[3:6].unsqueeze(0))
+                            inter_sz = (inter_max - inter_min).clamp_min(0)
+                            inter_vol = inter_sz[:, 0] * inter_sz[:, 1] * inter_sz[:, 2]  # (Nm,)
+
+                            det_sz = (det_bb[3:6] - det_bb[0:3]).clamp_min(0)
+                            det_vol = float((det_sz[0] * det_sz[1] * det_sz[2]).item())
+                            if det_vol <= 0:
+                                continue
+
+                            mem_sz = (mem_bb[:, 3:6] - mem_bb[:, 0:3]).clamp_min(0)
+                            mem_vol = mem_sz[:, 0] * mem_sz[:, 1] * mem_sz[:, 2] + 1e-6  # (Nm,)
+
+                            contain_det = inter_vol / (det_vol + 1e-6)  # (Nm,)
+                            vol_ratio = float(det_vol) / mem_vol  # (Nm,)
+
+                            valid = allow_mem & (contain_det >= cov_thr) & (vol_ratio <= small_ratio_max)
+                            if require_positive_overlap:
+                                valid = valid & (inter_vol > 0)
+
+                            # Optional center-distance normalized by track bbox diag (safety valve).
+                            if center_norm_thr > 0 and mem_center is not None and mem_diag is not None and det_center is not None:
+                                dc = torch.linalg.norm(mem_center - det_center[int(dj)].unsqueeze(0), dim=1)  # (Nm,)
+                                dn = dc / (mem_diag + 1e-6)
+                                valid = valid & (dn <= center_norm_thr)
+
+                            if not bool(valid.any().item()):
+                                continue
+                            # Choose best by containment (tie-break by smaller vol_ratio).
+                            score_sel = torch.where(valid, contain_det, torch.zeros_like(contain_det))
+                            best_i = int(torch.argmax(score_sel).item())
+                        else:
+                            # Fallback: mask-overlap coverage against current-frame track segment (may miss complementary fragments).
+                            track_masks = temp_masks  # (Nm, P) bool
+                            track_pts = track_masks.sum(dim=1).to(torch.float32)  # (Nm,)
+                            ov = (track_masks & pm.unsqueeze(0)).sum(dim=1).to(torch.float32)  # (Nm,)
+                            if require_positive_overlap:
+                                ov = torch.where(ov > 0, ov, torch.zeros_like(ov))
+                            cov = ov / max(float(pts_det), 1.0)  # (Nm,)
+                            ratio = float(pts_det) / (track_pts + 1e-6)  # (Nm,)
+                            valid = allow_mem & (track_pts > 0) & (ratio <= small_ratio_max) & (cov >= cov_thr)
+                            if center_norm_thr > 0 and mem_center is not None and mem_diag is not None and det_center is not None:
+                                dc = torch.linalg.norm(mem_center - det_center[int(dj)].unsqueeze(0), dim=1)  # (Nm,)
+                                dn = dc / (mem_diag + 1e-6)
+                                valid = valid & (dn <= center_norm_thr)
+                            if not bool(valid.any().item()):
+                                continue
+                            score_cov = torch.where(valid, cov, torch.zeros_like(cov))
+                            best_i = int(torch.argmax(score_cov).item())
+
+                        # Suppress birth: do not create a new track for this det.
+                        no_merge_masks[int(dj)] = False
+                        supporters_cnt += 1
+                        supported_this += 1
+                        supporters_det_idx.append(int(dj))
+                        supporters_mem_idx.append(int(best_i))
+                except Exception:
+                    pass
+
             next_masks_ = torch.where(temp, temp_masks,
                                      torch.zeros((self.cur_masks.shape[0],points_per_mask)).bool().to(next_masks.device))
             self.cur_masks = torch.cat((self.cur_masks, next_masks_), dim=1)
-            no_merge_masks = torch.ones(next_masks.shape[0]).bool().to(next_masks.device)
-            no_merge_masks[col_ind] = False
+
             birth_cnt = int(no_merge_masks.sum().item()) if no_merge_masks.numel() else 0
             former_padding = torch.zeros((no_merge_masks.nonzero().shape[0], points_per_mask * self.fi)).bool().to(next_masks.device)
             new_masks = torch.cat((former_padding, next_masks[no_merge_masks]), dim=1)
@@ -456,12 +647,18 @@ class OnlineMerge():
                 "det_to_merge": int(det_to_merge),
                 "matched": int(matched_cnt),
                 "birth": int(birth_cnt),
+                "absorbed": int(absorbed_cnt),
+                "supporters": int(supporters_cnt),
                 "mem_size_prev": int(prev_mem_size),
                 "mem_size_full": int(mem_full),
                 "mem_size_kept": int(mem_kept),
                 "topk_drop": int(max(mem_full - mem_kept, 0)),
                 "matched_mem_idx": matched_mem_idx,
                 "matched_det_idx": matched_det_idx,
+                "absorbed_mem_idx": absorbed_mem_idx,
+                "absorbed_det_idx": absorbed_det_idx,
+                "supporters_mem_idx": supporters_mem_idx,
+                "supporters_det_idx": supporters_det_idx,
             }
         return cur_masks, cur_labels, cur_scores, cur_queries, cur_bboxes
     

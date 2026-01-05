@@ -1,0 +1,64 @@
+== Inputs ==
+online_workdir: work_dirs/ESAM_online_scannet200_CA_mv_fast_ab/E1_control_topk100_thr0p30_sp0p40
+
+== Supply Gates (per-frame) ==
+after_topk: mean=65.185  p95=100.000
+after_nms: mean=65.185  p95=100.000
+after_geom_merge: mean=65.185  p95=100.000
+after_inst_thr: mean=10.639  p95=22.000
+after_npoint_thr: mean=9.125  p95=18.000
+after_copy_suppress: mean=9.125  p95=18.000
+drop_inst_thr: mean=54.546  p95=85.000
+drop_npoint_thr: mean=1.514  p95=5.000
+drop_nms: mean=0.000  p95=0.000
+drop_geom_merge: mean=0.000  p95=0.000
+drop_copy_suppress: mean=0.000  p95=0.000
+
+== Killed Useful (IoU/Cov >= 0.5 among killed) ==
+inst_thr: killed_useful_any05.mean=0.406  killed_useful_iou05.mean=0.363
+npoint_thr: killed_useful_any05.mean=0.014
+
+== Dup/Miss (GT view) ==
+pre_pool hit0@0.5 mean=0.0463 ; det_to_merge hit0@0.5 mean=0.1187
+pre_pool hit_ge2@0.5 mean=0.8256 ; det_to_merge hit_ge2@0.5 mean=0.0314
+pre_pool hit_ge2@0.1 mean=0.9623 ; det_to_merge hit_ge2@0.1 mean=0.2413
+
+== Scene-level Dup/Miss (final map vs GT) ==
+scene hit0@0.5 mean=0.1799  p95=0.3839
+scene hit_ge2@0.5 mean=0.0097  p95=0.0582
+scene hit_ge2@0.1 mean=0.2482  p95=0.4413  (fragmentation/ambiguous overlap flag)
+
+== Online Dynamics ==
+det_to_merge: mean=9.125  p95=18.000
+matched: mean=7.383  p95=16.000
+birth: mean=1.742  p95=7.000
+mem_size_full: mean=61.853  p95=147.000
+mem_size_kept: mean=55.478  p95=100.000
+topk_drop: mean=6.375  p95=47.000
+inflation=mem_full/gt_mem: mean=2.787  p95=4.889
+
+== Correlations to scene miss hit0@0.5 (Spearman) ==
+corr(hit0_scene, topk_drop_p95) = 0.290
+corr(hit0_scene, inflation_p95) = 0.104
+corr(hit0_scene, n_gt_scene) = 0.396
+corr(hit0_scene, det_to_merge_hit0@0.5_mean) = 0.707
+
+== Worst 10 scenes by scene hit0@0.5 ==
+scene0334_00: hit0@0.5=0.571 n_gt=7 topk_drop_p95=0 infl_p95=4.83 det_hit0@0.5_mean=0.224
+scene0334_01: hit0@0.5=0.571 n_gt=7 topk_drop_p95=0 infl_p95=3.83 det_hit0@0.5_mean=0.247
+scene0064_00: hit0@0.5=0.537 n_gt=54 topk_drop_p95=1 infl_p95=2.25 det_hit0@0.5_mean=0.322
+scene0019_00: hit0@0.5=0.533 n_gt=15 topk_drop_p95=0 infl_p95=2.33 det_hit0@0.5_mean=0.198
+scene0019_01: hit0@0.5=0.529 n_gt=17 topk_drop_p95=0 infl_p95=1.82 det_hit0@0.5_mean=0.343
+scene0064_01: hit0@0.5=0.516 n_gt=62 topk_drop_p95=0 infl_p95=1.66 det_hit0@0.5_mean=0.279
+scene0257_00: hit0@0.5=0.433 n_gt=30 topk_drop_p95=0 infl_p95=3.07 det_hit0@0.5_mean=0.175
+scene0518_00: hit0@0.5=0.412 n_gt=17 topk_drop_p95=0 infl_p95=3.94 det_hit0@0.5_mean=0.188
+scene0353_01: hit0@0.5=0.395 n_gt=43 topk_drop_p95=73 infl_p95=4.02 det_hit0@0.5_mean=0.240
+scene0203_00: hit0@0.5=0.395 n_gt=38 topk_drop_p95=26 infl_p95=3.50 det_hit0@0.5_mean=0.189
+
+== Single-frame diagnostics (reference) ==
+single-frame gt_best_iou<0.5_rate_ge100 = 0.0813
+single-frame hit0@0.1_rate_ge100 = 0.0048
+single-frame gt_hit_ge2_rate (dup@0.5) = 0.6585
+note: online scene hit0@0.5 is higher and dup@0.5 is far lower => online is not failing because of strict-IoU duplicates; it is losing recall/IoU quality across time.
+
+Wrote per-scene table: test/ap_gap/E1_control_scene_table.csv
