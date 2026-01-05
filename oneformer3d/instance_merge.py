@@ -201,6 +201,10 @@ class OnlineMerge():
         self.last_stats = None
         self.absorb_cfg = absorb_cfg if isinstance(absorb_cfg, dict) else {}
         self.support_cfg = support_cfg if isinstance(support_cfg, dict) else {}
+        # Avoid bloating per-frame JSON by default.
+        self.record_kept_track_ids = bool(self.support_cfg.get("record_kept_track_ids", False)) or bool(
+            self.absorb_cfg.get("record_kept_track_ids", False)
+        )
         if self.use_bbox:
             self.iou_calculator = AxisAlignedBboxOverlaps3D()
         # 初始化跨帧 Transformer
@@ -218,6 +222,11 @@ class OnlineMerge():
         self.cur_bboxes = None
         self.fi = 0
         self.merge_counts = None
+        # Stable track ids for online analysis (per-scene, monotonic).
+        self.cur_track_ids = None
+        self._next_track_id = 0
+        # Kept (top-K) track ids corresponding to the last returned outputs.
+        self.output_track_ids = None
     
     def clean(self):
         self.cur_masks = None
@@ -230,6 +239,9 @@ class OnlineMerge():
         self.cur_bboxes = None
         self.merge_counts = None
         self.last_stats = None
+        self.cur_track_ids = None
+        self.output_track_ids = None
+        self._next_track_id = 0
     
     def merge(self, masks, labels, scores, queries, query_feats, sem_preds, xyz_list, bboxes):
         # Online behavior stats (optional; written to self.last_stats).
@@ -245,6 +257,9 @@ class OnlineMerge():
         supporters_mem_idx = []
         matched_mem_idx = []
         matched_det_idx = []
+        matched_track_ids = []
+        birth_det_idx = []
+        birth_track_ids = []
 
         points_per_mask = masks.shape[1]
         # masks, labels, scores, queries, query_feats, sem_preds, xyz_list = \
@@ -260,12 +275,20 @@ class OnlineMerge():
             if self.use_bbox:
                 self.cur_bboxes = bboxes
             self.merge_counts = torch.zeros_like(scores).long()
+            # Initialize track ids for first-frame detections.
+            device = scores.device if torch.is_tensor(scores) else masks.device
+            init_n = int(scores.shape[0]) if torch.is_tensor(scores) else int(masks.shape[0])
+            self.cur_track_ids = torch.arange(
+                self._next_track_id, self._next_track_id + init_n, device=device, dtype=torch.long
+            )
+            self._next_track_id += init_n
         else:
             # Static typing：确保前一帧已经初始化完毕
             assert self.cur_labels is not None and self.cur_query_feats is not None and \
                    self.cur_sem_preds is not None and self.cur_xyz is not None and \
                    self.merge_counts is not None and self.cur_queries is not None and \
                    self.cur_masks is not None and self.cur_scores is not None
+            assert self.cur_track_ids is not None
             self.fi += 1
             next_masks, next_labels, next_scores, next_queries, next_query_feats, next_sem_preds, next_xyz = \
                 masks, labels, scores, queries, query_feats, sem_preds, \
@@ -408,6 +431,10 @@ class OnlineMerge():
             matched_cnt = int(row_ind.numel())
             matched_mem_idx = row_ind.detach().cpu().tolist()
             matched_det_idx = col_ind.detach().cpu().tolist()
+            try:
+                matched_track_ids = self.cur_track_ids[row_ind].detach().cpu().tolist()
+            except Exception:
+                matched_track_ids = []
 
             temp = torch.zeros(self.cur_masks.shape[0]).bool().to(self.cur_masks.device)
             temp[row_ind] = True
@@ -601,6 +628,10 @@ class OnlineMerge():
             self.cur_masks = torch.cat((self.cur_masks, next_masks_), dim=1)
 
             birth_cnt = int(no_merge_masks.sum().item()) if no_merge_masks.numel() else 0
+            try:
+                birth_det_idx = torch.nonzero(no_merge_masks, as_tuple=False).reshape(-1).detach().cpu().tolist()
+            except Exception:
+                birth_det_idx = []
             former_padding = torch.zeros((no_merge_masks.nonzero().shape[0], points_per_mask * self.fi)).bool().to(next_masks.device)
             new_masks = torch.cat((former_padding, next_masks[no_merge_masks]), dim=1)
             self.cur_masks = torch.cat((self.cur_masks, new_masks), dim=0)
@@ -609,6 +640,14 @@ class OnlineMerge():
             if len(no_merge_masks) > 0:
                 self.merge_counts = torch.cat((self.merge_counts,
                      torch.zeros(no_merge_masks.shape[0], dtype=torch.long, device=self.merge_counts.device)), dim=0)
+                # Append track ids for newly birthed tracks.
+                new_n = int(no_merge_masks.nonzero().shape[0])
+                new_ids = torch.arange(
+                    self._next_track_id, self._next_track_id + new_n, device=self.cur_scores.device, dtype=torch.long
+                )
+                self._next_track_id += new_n
+                self.cur_track_ids = torch.cat((self.cur_track_ids, new_ids), dim=0)
+                birth_track_ids = new_ids.detach().cpu().tolist()
             
             if self.merge_type == 'count':
                 count = self.merge_counts[row_ind]
@@ -636,6 +675,11 @@ class OnlineMerge():
         cur_labels = self.cur_labels[kept_ins]
         cur_queries = self.cur_queries[kept_ins]
         cur_bboxes = self.cur_xyz[kept_ins] if self.use_bbox else None
+        try:
+            assert self.cur_track_ids is not None
+            self.output_track_ids = self.cur_track_ids[kept_ins].detach().cpu().tolist()
+        except Exception:
+            self.output_track_ids = None
 
         # cur_labels = torch.zeros_like(self.cur_scores).long()
 
@@ -655,11 +699,17 @@ class OnlineMerge():
                 "topk_drop": int(max(mem_full - mem_kept, 0)),
                 "matched_mem_idx": matched_mem_idx,
                 "matched_det_idx": matched_det_idx,
+                "matched_track_ids": matched_track_ids,
+                "birth_det_idx": birth_det_idx,
+                "birth_track_ids": birth_track_ids,
                 "absorbed_mem_idx": absorbed_mem_idx,
                 "absorbed_det_idx": absorbed_det_idx,
                 "supporters_mem_idx": supporters_mem_idx,
                 "supporters_det_idx": supporters_det_idx,
             }
+            if isinstance(self.output_track_ids, list):
+                if self.record_kept_track_ids:
+                    self.last_stats["kept_track_ids"] = list(self.output_track_ids)
         return cur_masks, cur_labels, cur_scores, cur_queries, cur_bboxes
     
     @staticmethod

@@ -1998,6 +1998,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         num_frames = batch_inputs_dict['points'][0].shape[0]
         if hasattr(self, 'memory'):
             self.memory.reset()
+        mv_track_ids = None
         for frame_i in range(num_frames):
             ## Backbone
             x, point_features, all_xyz_w, sp_xyz = self.extract_feat(batch_inputs_dict, batch_data_samples, frame_i)
@@ -2269,6 +2270,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         sem_preds_list.pop(-1)[0],
                         sp_xyz_list.pop(-1)[0],
                         bboxes_list.pop(-1)[0] if self.use_bbox else None)
+                    mv_track_ids = getattr(online_merger, "output_track_ids", None)
 
                     # Attach online merge stats to baseline stats (same frame).
                     if bs_enable and baseline_stats is not None and baseline_stats.get("frames") and isinstance(getattr(online_merger, "last_stats", None), dict):
@@ -2389,6 +2391,11 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 pts_instance_mask=[mv_mask.cpu().numpy()],
                 instance_labels=mv_labels.cpu().numpy(),
                 instance_scores=mv_scores.cpu().numpy())
+            if isinstance(mv_track_ids, list):
+                try:
+                    merged_result.instance_track_ids = np.asarray(mv_track_ids, dtype=np.int64)
+                except Exception:
+                    merged_result.instance_track_ids = mv_track_ids
             if online_monitor_enable and online_monitor is not None:
                 merged_result.online_monitor = online_monitor
             if bs_enable and baseline_stats is not None:
@@ -2412,6 +2419,11 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             pts_instance_mask=[mv_mask[:, indices].cpu().numpy()],
             instance_labels=mv_labels.cpu().numpy(),
             instance_scores=mv_scores.cpu().numpy())
+        if isinstance(mv_track_ids, list):
+            try:
+                merged_result.instance_track_ids = np.asarray(mv_track_ids, dtype=np.int64)
+            except Exception:
+                merged_result.instance_track_ids = mv_track_ids
         if online_monitor_enable and online_monitor is not None:
             merged_result.online_monitor = online_monitor
         if bs_enable and baseline_stats is not None:
@@ -2574,6 +2586,9 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         bs_pre_pool = str(bs_cfg.get('pre_pool', 'after_nms'))
         bs_record_quality = bool(bs_cfg.get('record_killed_quality', True))
         bs_record_dup = bool(bs_cfg.get('record_dup', True))
+        bs_store_det_to_gt = bool(bs_cfg.get('store_det_to_gt', False))
+        bs_store_gt_vis_ids = bool(bs_cfg.get('store_gt_vis_ids', False))
+        bs_store_killed_useful_gt_hist = bool(bs_cfg.get('store_killed_useful_gt_hist', False))
         stage_stats: Optional[dict] = None
 
         sel_cfg = self.test_cfg.get('selection', None) or {}
@@ -3453,6 +3468,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     pred_best_cov = np.zeros((pred_masks_t.shape[0],), dtype=np.float32)
                     pred_best_pur = np.zeros((pred_masks_t.shape[0],), dtype=np.float32)
                     pred_size_arr = np.zeros((pred_masks_t.shape[0],), dtype=np.int64)
+                    pred_best_gt_id = np.full((pred_masks_t.shape[0],), -1, dtype=np.int64)
 
                     for pi in range(pred_masks_t.shape[0]):
                         pm = pred_masks_t[pi] & valid
@@ -3473,12 +3489,19 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         pred_best_iou[pi] = float(iou[best_g])
                         pred_best_pur[pi] = float(inter[best_g] / max(pred_size, 1))
                         pred_best_cov[pi] = float(inter[best_g] / max(int(gt_sizes[best_g]), 1))
+                        try:
+                            pred_best_gt_id[pi] = int(vis_ids[best_g])
+                        except Exception:
+                            pred_best_gt_id[pi] = -1
 
                         gt_hit_cnt += (iou >= float(bs_iou_thr)).astype(np.int64)
                         gt_hit_cnt_lo += (iou >= float(bs_iou_lo_thr)).astype(np.int64)
 
+                    gt_pack = {"n_gt_vis": int(G)}
+                    if bs_store_gt_vis_ids:
+                        gt_pack["gt_vis_ids"] = vis_ids.astype(np.int64).tolist()
                     return {
-                        "gt": {"n_gt_vis": int(G)},
+                        "gt": gt_pack,
                         "dup_iou": {
                             f"thr_{bs_iou_thr:.2f}": _pack_dup(gt_hit_cnt),
                             f"thr_{bs_iou_lo_thr:.2f}": _pack_dup(gt_hit_cnt_lo),
@@ -3488,6 +3511,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                             "best_cov": pred_best_cov,
                             "best_pur": pred_best_pur,
                             "pred_size": pred_size_arr,
+                            "best_gt_id": pred_best_gt_id,
                         },
                     }
 
@@ -3513,6 +3537,17 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                             "best_pur": _np_percentiles(post_arr.get("best_pur", np.zeros((0,), dtype=np.float32))),
                             "pred_size": _np_percentiles(post_arr.get("pred_size", np.zeros((0,), dtype=np.float32))),
                         }
+                        if bs_store_det_to_gt:
+                            try:
+                                post["pred_match"] = {
+                                    "best_gt_id": np.asarray(post_arr.get("best_gt_id", np.full((0,), -1, dtype=np.int64)), dtype=np.int64).tolist(),
+                                    "best_iou": np.asarray(post_arr.get("best_iou", np.zeros((0,), dtype=np.float32)), dtype=np.float32).tolist(),
+                                    "best_cov": np.asarray(post_arr.get("best_cov", np.zeros((0,), dtype=np.float32)), dtype=np.float32).tolist(),
+                                    "best_pur": np.asarray(post_arr.get("best_pur", np.zeros((0,), dtype=np.float32)), dtype=np.float32).tolist(),
+                                    "pred_size": np.asarray(post_arr.get("pred_size", np.zeros((0,), dtype=np.int64)), dtype=np.int64).tolist(),
+                                }
+                            except Exception:
+                                pass
                     stage_stats["det_to_merge"] = post
 
                 if bs_record_quality:
@@ -3565,6 +3600,24 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     stage_stats["killed_by_inst_thr"] = _killed_pack_from(before_inst_arr, ki)
                     stage_stats["killed_by_npoint_thr"] = _killed_pack_from(before_inst_arr, kn)
                     stage_stats["killed_by_copy_suppress"] = _killed_pack_from(pre_cs_arr, kcs)
+                    if bs_store_killed_useful_gt_hist and isinstance(stage_stats.get("killed_by_inst_thr", None), dict):
+                        try:
+                            bi = np.asarray(before_inst_arr.get("best_iou", []), dtype=np.float32)
+                            bc = np.asarray(before_inst_arr.get("best_cov", []), dtype=np.float32)
+                            bg = np.asarray(before_inst_arr.get("best_gt_id", []), dtype=np.int64)
+                            if ki is not None and bi.size == ki.size and bc.size == ki.size and bg.size == ki.size:
+                                sel = np.asarray(ki, dtype=bool)
+                                useful = ((bi >= 0.5) | (bc >= 0.5)) & sel & (bg >= 0)
+                                g = bg[useful]
+                                if g.size:
+                                    uniq_g, cnt_g = np.unique(g, return_counts=True)
+                                    stage_stats["killed_by_inst_thr"]["useful_gt_hist"] = {
+                                        str(int(k)): int(v) for k, v in zip(uniq_g.tolist(), cnt_g.tolist())
+                                    }
+                                else:
+                                    stage_stats["killed_by_inst_thr"]["useful_gt_hist"] = {}
+                        except Exception:
+                            pass
             except Exception:
                 # Keep stage counts/drops even if GT-aware diagnostics fail.
                 if isinstance(stage_stats, dict):

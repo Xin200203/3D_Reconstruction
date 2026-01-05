@@ -948,6 +948,7 @@ class UnifiedSegMetric(SegMetric):
         pred_instance_labels = []
         pred_instance_scores = []
         pred_instance_select_scores = []
+        pred_instance_track_ids = []
         online_monitor_results = []
         baseline_stats_results = []
 
@@ -990,6 +991,17 @@ class UnifiedSegMetric(SegMetric):
             else:
                 pred_instance_select_scores.append(
                     torch.tensor(single_pred_results['instance_scores']))
+            if 'instance_track_ids' in single_pred_results:
+                try:
+                    tids = single_pred_results['instance_track_ids']
+                    if torch.is_tensor(tids):
+                        tids = tids.detach().cpu().numpy()
+                    tids = np.asarray(tids, dtype=np.int64).reshape(-1)
+                    pred_instance_track_ids.append(tids)
+                except Exception:
+                    pred_instance_track_ids.append(None)
+            else:
+                pred_instance_track_ids.append(None)
             if 'online_monitor' in single_pred_results:
                 online_monitor_results.append(single_pred_results['online_monitor'])
             if 'baseline_stats' in single_pred_results:
@@ -1124,27 +1136,28 @@ class UnifiedSegMetric(SegMetric):
                         mean_mult = float(np.mean(hit)) if hit.size else 0.0
                         return {"n_gt": int(gt_hit_cnt.size), "hit0": hit0, "hit_ge2": hit_ge2, "mean_mult_hit": mean_mult}
 
-                    def _scene_dup(gt_ids, pred_masks, thr):
+                    def _scene_dup_multi(gt_ids, pred_masks, pred_track_ids=None, thrs=(0.5, 0.1)):
                         gt_ids = np.asarray(gt_ids, dtype=np.int64).reshape(-1)
                         pred_masks = self._to_numpy_bool(pred_masks)
+                        thrs = tuple(float(t) for t in thrs)
                         if pred_masks.ndim != 2:
-                            return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+                            return None
                         # Normalize pred shape to (Npred, Npts).
                         if pred_masks.shape[1] != gt_ids.shape[0] and pred_masks.shape[0] == gt_ids.shape[0]:
                             pred_masks = pred_masks.T
                         if pred_masks.shape[1] != gt_ids.shape[0]:
-                            return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+                            return None
 
                         valid = gt_ids >= 0
                         ids = gt_ids[valid]
                         if ids.size == 0:
-                            return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+                            return None
                         uniq, cnt = np.unique(ids, return_counts=True)
                         vis = cnt >= int(gt_vis_npoint)
                         vis_ids = np.sort(uniq[vis])
                         G = int(vis_ids.size)
                         if G == 0:
-                            return {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}
+                            return None
 
                         mapped = np.full_like(gt_ids, -1, dtype=np.int64)
                         idx_valid = np.where(valid)[0]
@@ -1155,8 +1168,9 @@ class UnifiedSegMetric(SegMetric):
                         mapped[idx_valid] = mapped_valid
 
                         gt_sizes = np.bincount(mapped[mapped >= 0], minlength=G).astype(np.int64)
-                        gt_hit_cnt = np.zeros((G,), dtype=np.int64)
-                        thr = float(thr)
+                        gt_hit_cnt = {t: np.zeros((G,), dtype=np.int64) for t in thrs}
+                        gt_best_iou = np.zeros((G,), dtype=np.float32)
+                        gt_best_pred = np.full((G,), -1, dtype=np.int64)
                         for pi in range(pred_masks.shape[0]):
                             pm = pred_masks[pi] & valid
                             pred_size = int(pm.sum())
@@ -1170,15 +1184,59 @@ class UnifiedSegMetric(SegMetric):
                             union = (pred_size + gt_sizes - inter).astype(np.float32)
                             union = np.maximum(union, 1.0)
                             iou = inter.astype(np.float32) / union
-                            gt_hit_cnt += (iou >= thr).astype(np.int64)
-                        return _pack_dup(gt_hit_cnt)
+                            for t in thrs:
+                                gt_hit_cnt[t] += (iou >= float(t)).astype(np.int64)
+                            better = iou > gt_best_iou
+                            if np.any(better):
+                                gt_best_iou[better] = iou[better]
+                                gt_best_pred[better] = int(pi)
+
+                        best_track_ids = None
+                        if pred_track_ids is not None:
+                            try:
+                                pred_track_ids = np.asarray(pred_track_ids, dtype=np.int64).reshape(-1)
+                                if pred_track_ids.size == pred_masks.shape[0]:
+                                    best_track_ids = np.full((G,), -1, dtype=np.int64)
+                                    valid_idx = gt_best_pred >= 0
+                                    best_track_ids[valid_idx] = pred_track_ids[gt_best_pred[valid_idx]]
+                            except Exception:
+                                best_track_ids = None
+
+                        return {
+                            "gt_vis_ids": vis_ids.astype(np.int64).tolist(),
+                            "best_iou_per_gt": gt_best_iou.astype(np.float32).tolist(),
+                            "best_pred_idx_per_gt": gt_best_pred.astype(np.int64).tolist(),
+                            "best_track_id_per_gt": best_track_ids.tolist() if best_track_ids is not None else None,
+                            "dup": {f"thr_{t:.2f}": _pack_dup(gt_hit_cnt[t]) for t in thrs},
+                            "hit_cnt_per_gt": {f"thr_{t:.2f}": gt_hit_cnt[t].astype(np.int64).tolist() for t in thrs},
+                        }
 
                     # Align by index: baseline_stats_results are appended in the same order as `results`.
                     for i in range(min(len(baseline_stats_results), len(gt_instance_masks_inst_task), len(pred_instance_masks_inst_task))):
+                        multi = _scene_dup_multi(
+                            gt_instance_masks_inst_task[i],
+                            pred_instance_masks_inst_task[i],
+                            pred_track_ids=pred_instance_track_ids[i] if i < len(pred_instance_track_ids) else None,
+                            thrs=(iou_thr, iou_lo_thr),
+                        )
+                        if not isinstance(multi, dict):
+                            baseline_stats_results[i]["scene_level_dup"] = {
+                                "cfg": {"gt_vis_npoint": int(gt_vis_npoint)},
+                                f"thr_{iou_thr:.2f}": {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0},
+                                f"thr_{iou_lo_thr:.2f}": {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0},
+                            }
+                            continue
+                        dup = multi.get("dup", {})
+                        hit_cnt_per_gt = multi.get("hit_cnt_per_gt", {}) if isinstance(multi.get("hit_cnt_per_gt", {}), dict) else {}
                         baseline_stats_results[i]["scene_level_dup"] = {
                             "cfg": {"gt_vis_npoint": int(gt_vis_npoint)},
-                            f"thr_{iou_thr:.2f}": _scene_dup(gt_instance_masks_inst_task[i], pred_instance_masks_inst_task[i], iou_thr),
-                            f"thr_{iou_lo_thr:.2f}": _scene_dup(gt_instance_masks_inst_task[i], pred_instance_masks_inst_task[i], iou_lo_thr),
+                            "gt_vis_ids": multi.get("gt_vis_ids", []),
+                            "best_iou_per_gt": multi.get("best_iou_per_gt", []),
+                            "best_pred_idx_per_gt": multi.get("best_pred_idx_per_gt", []),
+                            "best_track_id_per_gt": multi.get("best_track_id_per_gt", None),
+                            "hit_cnt_per_gt": hit_cnt_per_gt,
+                            f"thr_{iou_thr:.2f}": dup.get(f"thr_{iou_thr:.2f}", {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}),
+                            f"thr_{iou_lo_thr:.2f}": dup.get(f"thr_{iou_lo_thr:.2f}", {"n_gt": 0, "hit0": 0.0, "hit_ge2": 0.0, "mean_mult_hit": 0.0}),
                         }
                 except Exception:
                     pass
