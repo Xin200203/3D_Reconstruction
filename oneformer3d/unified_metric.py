@@ -120,6 +120,22 @@ class UnifiedSegMetric(SegMetric):
                             vals.append(float(v))
             return np.asarray(vals, dtype=np.float32)
 
+        def _collect_stat(obj_key: str, stat_key: str) -> np.ndarray:
+            vals = []
+            for s in monitors:
+                frames = s.get("frames", [])
+                if not isinstance(frames, list):
+                    continue
+                for fr in frames:
+                    if not isinstance(fr, dict):
+                        continue
+                    v = fr.get(obj_key)
+                    if isinstance(v, dict) and stat_key in v:
+                        vv = v.get(stat_key)
+                        if isinstance(vv, (int, float, np.number)):
+                            vals.append(float(vv))
+            return np.asarray(vals, dtype=np.float32)
+
         def _pack(x: np.ndarray) -> dict:
             if x.size == 0:
                 return {"n": 0, "mean": 0.0, "median": 0.0, "p90": 0.0, "p95": 0.0}
@@ -136,9 +152,58 @@ class UnifiedSegMetric(SegMetric):
         birth = _collect("birth")
         absorbed = _collect("absorbed")
         supporters = _collect("supporters")
+        rescued = _collect("rescued")
+        rescued_from_l = _collect("rescued_from_l")
+        rescued_from_uh = _collect("rescued_from_uh")
+        rescue_amb = _collect("rescue_ambiguous")
         mem_full = _collect("mem_size_full")
         mem_kept = _collect("mem_size_kept")
         topk_drop = _collect("topk_drop")
+
+        n_scenes = int(len(monitors))
+        n_frames = int(det.size) if det.size else int(
+            sum(len(s.get("frames", [])) for s in monitors if isinstance(s.get("frames", None), list))
+        )
+
+        # Nested rescue stats (per-frame dicts with mean/p50/p90).
+        rescue_delta_mask_mean = _collect_stat("rescue_delta_mask_pts", "mean")
+        rescue_new_vox_ratio_mean = _collect_stat("rescue_new_vox_ratio", "mean")
+        rescue_gate_contain_mean = _collect_stat("rescue_gate_contain", "mean")
+        rescue_gate_dino_mean = _collect_stat("rescue_gate_dino", "mean")
+        rescue_gate_feat3d_mean = _collect_stat("rescue_gate_feat3d", "mean")
+        rescue_det_purity_mean = _collect_stat("rescue_det_purity", "mean")
+        rescue_det_cov_mean = _collect_stat("rescue_det_cov", "mean")
+        rescue_det_iou_mean = _collect_stat("rescue_det_iou", "mean")
+
+        # L-pool portrait (pre-gate).
+        l_pool_n = _collect("l_pool_n")
+        l_pool_npoints_mean = _collect_stat("l_pool_npoints", "mean")
+        l_pool_det_iou_mean = _collect_stat("l_pool_det_iou", "mean")
+        l_pool_det_cov_mean = _collect_stat("l_pool_det_cov", "mean")
+        l_pool_useful_any05 = _collect("l_pool_useful_any05_rate")
+
+        # Optional: dedup stats (nested dict under key "dedup").
+        dedup_pairs_checked = _collect_stat("dedup", "pairs_checked")
+        dedup_pairs_merged = _collect_stat("dedup", "pairs_merged")
+        dedup_reject_no_feat = _collect_stat("dedup", "reject_no_feat")
+        dedup_reject_no_vox = _collect_stat("dedup", "reject_no_vox")
+        dedup_reject_geom = _collect_stat("dedup", "reject_geom")
+        dedup_frames_present = int(dedup_pairs_checked.size)
+        dedup_present_rate = float(dedup_frames_present / max(n_frames, 1))
+        dedup_nonzero_mask = dedup_pairs_checked > 0
+        dedup_nonzero_rate = float(np.mean(dedup_nonzero_mask)) if dedup_pairs_checked.size else 0.0
+        dedup_pairs_checked_nonzero = dedup_pairs_checked[dedup_nonzero_mask]
+        dedup_pairs_merged_nonzero = (
+            dedup_pairs_merged[dedup_nonzero_mask] if dedup_pairs_merged.size else np.asarray([], dtype=np.float32)
+        )
+        dedup_merge_ratio = (
+            float(np.sum(dedup_pairs_merged) / max(np.sum(dedup_pairs_checked), 1.0)) if dedup_pairs_checked.size else 0.0
+        )
+        dedup_merge_ratio_nonzero = (
+            float(np.sum(dedup_pairs_merged_nonzero) / max(np.sum(dedup_pairs_checked_nonzero), 1.0))
+            if dedup_pairs_checked_nonzero.size
+            else 0.0
+        )
 
         # Derived rates (frame-level).
         if det.size and matched.size and matched.size == det.size:
@@ -150,9 +215,6 @@ class UnifiedSegMetric(SegMetric):
         else:
             birth_rate = np.asarray([], dtype=np.float32)
 
-        n_scenes = int(len(monitors))
-        n_frames = int(det.size) if det.size else int(sum(len(s.get("frames", [])) for s in monitors if isinstance(s.get("frames", None), list)))
-
         return {
             "counts": {
                 "scenes": n_scenes,
@@ -163,11 +225,45 @@ class UnifiedSegMetric(SegMetric):
             "birth": _pack(birth),
             "absorbed": _pack(absorbed),
             "supporters": _pack(supporters),
+            "rescued": _pack(rescued),
+            "rescued_from_l": _pack(rescued_from_l),
+            "rescued_from_uh": _pack(rescued_from_uh),
+            "rescue_ambiguous": _pack(rescue_amb),
             "match_rate": _pack(match_rate),
             "birth_rate": _pack(birth_rate),
             "mem_size_full": _pack(mem_full),
             "mem_size_kept": _pack(mem_kept),
             "topk_drop": _pack(topk_drop),
+            "rescue_stats": {
+                "delta_mask_pts_mean": _pack(rescue_delta_mask_mean),
+                "new_vox_ratio_mean": _pack(rescue_new_vox_ratio_mean),
+                "gate_contain_mean": _pack(rescue_gate_contain_mean),
+                "gate_dino_mean": _pack(rescue_gate_dino_mean),
+                "gate_feat3d_mean": _pack(rescue_gate_feat3d_mean),
+                "det_purity_mean": _pack(rescue_det_purity_mean),
+                "det_cov_mean": _pack(rescue_det_cov_mean),
+                "det_iou_mean": _pack(rescue_det_iou_mean),
+            },
+            "l_pool_stats": {
+                "n": _pack(l_pool_n),
+                "npoints_mean": _pack(l_pool_npoints_mean),
+                "det_cov_mean": _pack(l_pool_det_cov_mean),
+                "det_iou_mean": _pack(l_pool_det_iou_mean),
+                "useful_any05_rate": _pack(l_pool_useful_any05),
+            },
+            "dedup_stats": {
+                "pairs_checked": _pack(dedup_pairs_checked),
+                "pairs_merged": _pack(dedup_pairs_merged),
+                "reject_no_feat": _pack(dedup_reject_no_feat),
+                "reject_no_vox": _pack(dedup_reject_no_vox),
+                "reject_geom": _pack(dedup_reject_geom),
+                "present_rate": dedup_present_rate,
+                "nonzero_rate": dedup_nonzero_rate,
+                "pairs_checked_nonzero": _pack(dedup_pairs_checked_nonzero),
+                "pairs_merged_nonzero": _pack(dedup_pairs_merged_nonzero),
+                "merge_ratio": dedup_merge_ratio,
+                "merge_ratio_nonzero": dedup_merge_ratio_nonzero,
+            },
         }
 
     @staticmethod

@@ -142,10 +142,15 @@ class NormalizeCamInfo(BaseTransform):
         if isinstance(cam_info, list):
             if len(cam_info) == 1 and isinstance(cam_info[0], dict):
                 cam_info = cam_info[0]
-            elif self.strict:
-                raise RuntimeError(f"[NormalizeCamInfo] unexpected cam_info list len={len(cam_info)}")
             else:
-                cam_info = [self._normalize_single(m) for m in cam_info if isinstance(m, dict)]
+                if not all(isinstance(m, dict) for m in cam_info):
+                    if self.strict:
+                        raise RuntimeError(
+                            f"[NormalizeCamInfo] unexpected cam_info list element types: "
+                            f"{[type(m) for m in cam_info[:3]]}"
+                        )
+                    cam_info = [m for m in cam_info if isinstance(m, dict)]
+                cam_info = [self._normalize_single(m) for m in cam_info]
                 results['cam_info'] = cam_info
                 return results
 
@@ -1134,7 +1139,11 @@ class BGR2RGBImg(BaseTransform):
 
     def transform(self, results: dict) -> dict:
         if 'img' in results:
-            results['img'] = self._swap3(results['img'])
+            img = results['img']
+            if isinstance(img, list):
+                results['img'] = [self._swap3(x) for x in img]
+            else:
+                results['img'] = self._swap3(img)
         if self.apply_to_imgs and 'imgs' in results and isinstance(results['imgs'], list):
             swapped = []
             for t in results['imgs']:
@@ -1169,49 +1178,54 @@ class ColorJitterImg(BaseTransform):
 
         img = results['img']
 
-        # Convert to torch tensor (C,H,W), float32.
-        if isinstance(img, torch.Tensor):
-            tensor = img
-            if tensor.dim() == 3 and tensor.shape[0] not in (1, 3) and tensor.shape[-1] in (1, 3):
-                tensor = tensor.permute(2, 0, 1).contiguous()
-            elif tensor.dim() != 3:
-                tensor = tensor.view(3, *tensor.shape[-2:])
-            tensor = tensor.float()
-        else:
-            import numpy as np
-            if isinstance(img, np.ndarray):
-                if not img.flags['C_CONTIGUOUS']:
-                    img = np.ascontiguousarray(img)
-                if img.ndim == 3 and img.shape[-1] in (1, 3):
-                    tensor = torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
-                elif img.ndim == 3 and img.shape[0] in (1, 3):
-                    tensor = torch.from_numpy(img).contiguous().float()
-                else:
-                    tensor = torch.from_numpy(np.asarray(img)).float()
-                    if tensor.dim() == 3 and tensor.shape[0] not in (1, 3) and tensor.shape[-1] in (1, 3):
-                        tensor = tensor.permute(2, 0, 1).contiguous()
-            else:
-                tensor = torch.tensor(img).float()
+        def _to_tensor(im):
+            if isinstance(im, torch.Tensor):
+                tensor = im
                 if tensor.dim() == 3 and tensor.shape[0] not in (1, 3) and tensor.shape[-1] in (1, 3):
                     tensor = tensor.permute(2, 0, 1).contiguous()
+                elif tensor.dim() != 3:
+                    tensor = tensor.view(3, *tensor.shape[-2:])
+                tensor = tensor.float()
+            else:
+                import numpy as np
+                if isinstance(im, np.ndarray):
+                    if not im.flags['C_CONTIGUOUS']:
+                        im = np.ascontiguousarray(im)
+                    if im.ndim == 3 and im.shape[-1] in (1, 3):
+                        tensor = torch.from_numpy(im).permute(2, 0, 1).contiguous().float()
+                    elif im.ndim == 3 and im.shape[0] in (1, 3):
+                        tensor = torch.from_numpy(im).contiguous().float()
+                    else:
+                        tensor = torch.from_numpy(np.asarray(im)).float()
+                        if tensor.dim() == 3 and tensor.shape[0] not in (1, 3) and tensor.shape[-1] in (1, 3):
+                            tensor = tensor.permute(2, 0, 1).contiguous()
+                else:
+                    tensor = torch.tensor(im).float()
+                    if tensor.dim() == 3 and tensor.shape[0] not in (1, 3) and tensor.shape[-1] in (1, 3):
+                        tensor = tensor.permute(2, 0, 1).contiguous()
+            return tensor
 
-        # IMPORTANT: Use fixed 0..1 normalization, NOT per-image min/max rescaling.
-        # DINOv2 expects standard RGB statistics; per-image stretching changes appearance semantics too much.
-        # We keep the tensor in 0..255 (float) after jitter to match downstream expectations.
-        assume_255 = False
-        if tensor.dtype.is_floating_point:
-            maxv = float(tensor.max().item()) if tensor.numel() > 0 else 0.0
-            assume_255 = maxv > 1.5
+        def _jitter_tensor(tensor):
+            assume_255 = False
+            if tensor.dtype.is_floating_point:
+                maxv = float(tensor.max().item()) if tensor.numel() > 0 else 0.0
+                assume_255 = maxv > 1.5
+            else:
+                assume_255 = True
+            x01 = (tensor / 255.0) if assume_255 else tensor
+            x01 = x01.clamp(0.0, 1.0)
+            x01 = self.jitter(x01)
+            x01 = x01.clamp(0.0, 1.0)
+            return x01 * 255.0 if assume_255 else x01
+
+        if isinstance(img, list):
+            out_list = []
+            for im in img:
+                out_list.append(_jitter_tensor(_to_tensor(im)))
+            results['img'] = out_list
         else:
-            assume_255 = True
-
-        x01 = (tensor / 255.0) if assume_255 else tensor
-        x01 = x01.clamp(0.0, 1.0)
-        x01 = self.jitter(x01)
-        x01 = x01.clamp(0.0, 1.0)
-        out = x01 * 255.0 if assume_255 else x01
-
-        results['img'] = out
+            tensor = _to_tensor(img)
+            results['img'] = _jitter_tensor(tensor)
         return results
 
 
@@ -1233,122 +1247,213 @@ class ResizeForDINO(BaseTransform):
         if 'img' not in results:
             return results
 
-        img = results['img']
+        def _resize_one(img_in, cam_meta):
+            img = img_in
 
-        # Expect img in (C,H,W) tensor; also support numpy (H,W,C) from mmcv.
-        if isinstance(img, torch.Tensor):
-            if img.dim() == 3:
-                # Prefer CHW; if HWC-like, convert.
-                if img.shape[0] in (1, 3, 4):
-                    _, H0, W0 = img.shape
-                elif img.shape[-1] in (1, 3, 4):
-                    # HWC -> CHW
-                    H0, W0 = int(img.shape[0]), int(img.shape[1])
-                    img = img.permute(2, 0, 1).contiguous()
+            # Expect img in (C,H,W) tensor; also support numpy (H,W,C) from mmcv.
+            if isinstance(img, torch.Tensor):
+                if img.dim() == 3:
+                    # Prefer CHW; if HWC-like, convert.
+                    if img.shape[0] in (1, 3, 4):
+                        _, H0, W0 = img.shape
+                    elif img.shape[-1] in (1, 3, 4):
+                        # HWC -> CHW
+                        H0, W0 = int(img.shape[0]), int(img.shape[1])
+                        img = img.permute(2, 0, 1).contiguous()
+                    else:
+                        # Fallback: treat as CHW
+                        _, H0, W0 = img.shape
                 else:
-                    # Fallback: treat as CHW
-                    _, H0, W0 = img.shape
+                    H0, W0 = int(img.shape[-2]), int(img.shape[-1])
             else:
-                H0, W0 = int(img.shape[-2]), int(img.shape[-1])
+                # numpy or other array-like
+                import numpy as np
+                if isinstance(img, np.ndarray):
+                    # 处理由于翻转等操作导致的负 stride，先转为连续内存
+                    if not img.flags['C_CONTIGUOUS']:
+                        img = np.ascontiguousarray(img)
+                    # Robustly infer original H,W from numpy layout.
+                    if img.ndim == 2:
+                        H0, W0 = int(img.shape[0]), int(img.shape[1])
+                        img = torch.from_numpy(img).unsqueeze(0).float()  # (1,H,W)
+                    elif img.ndim == 3:
+                        # Most common: HWC (H,W,C)
+                        if img.shape[-1] in (1, 3, 4):
+                            H0, W0 = int(img.shape[0]), int(img.shape[1])
+                            img = torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
+                        # Possible: CHW (C,H,W)
+                        elif img.shape[0] in (1, 3, 4):
+                            H0, W0 = int(img.shape[1]), int(img.shape[2])
+                            img = torch.from_numpy(img).contiguous().float()
+                        else:
+                            # Unknown layout; fall back to (H,W,?) assumption for safety.
+                            H0, W0 = int(img.shape[0]), int(img.shape[1])
+                            img = torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
+                            if not hasattr(self, '_resize_layout_warned'):
+                                print(f"[ResizeForDINO][warn] unknown numpy img layout {img.shape}; assuming HWC.")
+                                self._resize_layout_warned = True
+                    else:
+                        # Fallback for unusual dims: use last two dims as H,W.
+                        H0, W0 = int(img.shape[-2]), int(img.shape[-1])
+                        img = torch.from_numpy(img).float()
+                else:
+                    tensor = torch.tensor(img).float()
+                    if tensor.dim() == 3 and tensor.shape[0] not in (1, 3):
+                        tensor = tensor.permute(2, 0, 1).contiguous()
+                    img = tensor
+                    H0, W0 = img.shape[-2], img.shape[-1]
+
+            H1, W1 = self.target_h, self.target_w
+            scale_h = H1 / float(H0)
+            scale_w = W1 / float(W0)
+
+            # 保持近似等比例缩放，避免改变长宽比。
+            if abs(scale_h - scale_w) > 1e-3:
+                # 记录一个警告，但仍然继续使用各自的尺度，防止训练中断。
+                print(f"[ResizeForDINO] non-uniform scale detected: "
+                      f"H0={H0},W0={W0},H1={H1},W1={W1}, "
+                      f"scale_h={scale_h:.4f}, scale_w={scale_w:.4f}")
+
+            # 使用双线性插值缩放到目标大小。
+            img_resized = torch.nn.functional.interpolate(
+                img.unsqueeze(0), size=(H1, W1), mode='bilinear', align_corners=False
+            ).squeeze(0)
+
+            # 同步更新 cam_info 中的 intrinsics / img_size_dino（若存在）。
+            if isinstance(cam_meta, dict):
+                intr = cam_meta.get('intrinsics', None)
+                if intr is not None:
+                    # intrinsics 允许 list[float] 或 tensor(4,)
+                    if torch.is_tensor(intr):
+                        if intr.numel() == 4:
+                            fx, fy, cx, cy = [float(x) for x in intr.reshape(-1)]
+                            fx_new = fx * scale_w
+                            fy_new = fy * scale_h
+                            cx_new = cx * scale_w
+                            cy_new = cy * scale_h
+                            cam_meta['intrinsics'] = intr.new_tensor([fx_new, fy_new, cx_new, cy_new]).to(torch.float32)
+                    elif isinstance(intr, (list, tuple)) and len(intr) == 4:
+                        fx, fy, cx, cy = intr
+                        fx_new = fx * scale_w
+                        fy_new = fy * scale_h
+                        cx_new = cx * scale_w
+                        cy_new = cy * scale_h
+                        # IMPORTANT: always keep cam_info as tensor to avoid ambiguous default_collate outputs
+                        cam_meta['intrinsics'] = torch.tensor(
+                            [float(fx_new), float(fy_new), float(cx_new), float(cy_new)],
+                            dtype=torch.float32)
+                    cam_meta['img_size_dino'] = torch.tensor([int(H1), int(W1)], dtype=torch.int64)
+                # Guardrail: warn once if intrinsics look suspicious (often caused by wrong H/W inference).
+                if intr is not None and (not hasattr(self, '_intrinsics_scale_warned')):
+                    try:
+                        if torch.is_tensor(cam_meta.get('intrinsics')) and cam_meta['intrinsics'].numel() == 4:
+                            fx_new, fy_new, cx_new, cy_new = [float(x) for x in cam_meta['intrinsics'].reshape(-1)]
+                            if (fx_new > 5000 or fy_new > 5000 or cx_new > 2 * float(W1) or cy_new > 2 * float(H1)):
+                                print(
+                                    "[ResizeForDINO][warn] suspicious intrinsics after resize: "
+                                    f"(H0,W0)=({H0},{W0})->(H1,W1)=({H1},{W1}), "
+                                    f"scale_h={scale_h:.4f}, scale_w={scale_w:.4f}, "
+                                    f"intr_new={[float(fx_new), float(fy_new), float(cx_new), float(cy_new)]}"
+                                )
+                                self._intrinsics_scale_warned = True
+                    except Exception:
+                        pass
+
+            return img_resized
+
+        img = results['img']
+        cam_info = results.get('cam_info', None)
+        if isinstance(img, list):
+            cam_list = cam_info if isinstance(cam_info, list) else [cam_info] * len(img)
+            out_list = []
+            for i, im in enumerate(img):
+                cam_meta = cam_list[i] if i < len(cam_list) else None
+                out_list.append(_resize_one(im, cam_meta))
+            results['img'] = out_list
+            if isinstance(cam_info, dict):
+                results['cam_info'] = cam_list
         else:
-            # numpy or other array-like
+            results['img'] = _resize_one(img, cam_info if isinstance(cam_info, dict) else None)
+
+        return results
+
+
+@TRANSFORMS.register_module()
+class BuildCamInfoFromPoses(BaseTransform):
+    """Build cam_info list for MV data using poses + fixed intrinsics."""
+
+    def __init__(self, dataset_type: str = 'scannet200') -> None:
+        super().__init__()
+        self.dataset_type = dataset_type
+
+    def _get_intrinsics(self):
+        if self.dataset_type in ['scannet', 'scannet200']:
+            return [577.870605, 577.870605, 319.5, 239.5]
+        if self.dataset_type == 'scenenn':
+            return [544.47329, 544.47329, 320.0, 240.0]
+        return [577.870605, 577.870605, 319.5, 239.5]
+
+    def _get_hw(self, img):
+        if img is None:
+            return 480, 640
+        if torch.is_tensor(img):
+            if img.dim() == 3:
+                if img.shape[0] in (1, 3, 4):
+                    return int(img.shape[1]), int(img.shape[2])
+                return int(img.shape[0]), int(img.shape[1])
+            if img.dim() == 2:
+                return int(img.shape[0]), int(img.shape[1])
+            return int(img.shape[-2]), int(img.shape[-1])
+        try:
             import numpy as np
             if isinstance(img, np.ndarray):
-                # 处理由于翻转等操作导致的负 stride，先转为连续内存
-                if not img.flags['C_CONTIGUOUS']:
-                    img = np.ascontiguousarray(img)
-                # Robustly infer original H,W from numpy layout.
-                if img.ndim == 2:
-                    H0, W0 = int(img.shape[0]), int(img.shape[1])
-                    img = torch.from_numpy(img).unsqueeze(0).float()  # (1,H,W)
-                elif img.ndim == 3:
-                    # Most common: HWC (H,W,C)
+                if img.ndim == 3:
                     if img.shape[-1] in (1, 3, 4):
-                        H0, W0 = int(img.shape[0]), int(img.shape[1])
-                        img = torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
-                    # Possible: CHW (C,H,W)
-                    elif img.shape[0] in (1, 3, 4):
-                        H0, W0 = int(img.shape[1]), int(img.shape[2])
-                        img = torch.from_numpy(img).contiguous().float()
-                    else:
-                        # Unknown layout; fall back to (H,W,?) assumption for safety.
-                        H0, W0 = int(img.shape[0]), int(img.shape[1])
-                        img = torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
-                        if not hasattr(self, '_resize_layout_warned'):
-                            print(f"[ResizeForDINO][warn] unknown numpy img layout {img.shape}; assuming HWC.")
-                            self._resize_layout_warned = True
-                else:
-                    # Fallback for unusual dims: use last two dims as H,W.
-                    H0, W0 = int(img.shape[-2]), int(img.shape[-1])
-                    img = torch.from_numpy(img).float()
-            else:
-                tensor = torch.tensor(img).float()
-                if tensor.dim() == 3 and tensor.shape[0] not in (1, 3):
-                    tensor = tensor.permute(2, 0, 1).contiguous()
-                img = tensor
-                H0, W0 = img.shape[-2], img.shape[-1]
+                        return int(img.shape[0]), int(img.shape[1])
+                    if img.shape[0] in (1, 3, 4):
+                        return int(img.shape[1]), int(img.shape[2])
+                if img.ndim == 2:
+                    return int(img.shape[0]), int(img.shape[1])
+        except Exception:
+            pass
+        return 480, 640
 
-        H1, W1 = self.target_h, self.target_w
-        scale_h = H1 / float(H0)
-        scale_w = W1 / float(W0)
+    def transform(self, results: dict) -> dict:
+        if results.get('cam_info', None) is not None:
+            return results
+        poses = results.get('poses', None)
+        if poses is None:
+            return results
+        poses_list = poses if isinstance(poses, list) else [poses]
+        imgs = results.get('img', None)
+        if isinstance(imgs, list):
+            imgs_list = imgs
+        elif imgs is None:
+            imgs_list = [None] * len(poses_list)
+        else:
+            imgs_list = [imgs] * len(poses_list)
+        if len(imgs_list) < len(poses_list):
+            imgs_list = imgs_list + [imgs_list[-1]] * (len(poses_list) - len(imgs_list))
 
-        # 保持近似等比例缩放，避免改变长宽比。
-        if abs(scale_h - scale_w) > 1e-3:
-            # 记录一个警告，但仍然继续使用各自的尺度，防止训练中断。
-            print(f"[ResizeForDINO] non-uniform scale detected: "
-                  f"H0={H0},W0={W0},H1={H1},W1={W1}, "
-                  f"scale_h={scale_h:.4f}, scale_w={scale_w:.4f}")
-
-        # 使用双线性插值缩放到目标大小。
-        img_resized = torch.nn.functional.interpolate(
-            img.unsqueeze(0), size=(H1, W1), mode='bilinear', align_corners=False
-        ).squeeze(0)
-        results['img'] = img_resized
-
-        # 同步更新 cam_info 中的 intrinsics / img_size_dino（若存在）。
-        cam_info = results.get('cam_info', None)
-        if cam_info is not None:
-            # 支持 cam_info 是 list[dict] 或 dict
-            metas = cam_info if isinstance(cam_info, list) else [cam_info]
-            for meta in metas:
-                intr = meta.get('intrinsics', None)
-                if intr is None:
-                    continue
-                # intrinsics 允许 list[float] 或 tensor(4,)
-                if torch.is_tensor(intr):
-                    if intr.numel() != 4:
-                        continue
-                    fx, fy, cx, cy = [float(x) for x in intr.reshape(-1)]
-                    fx_new = fx * scale_w
-                    fy_new = fy * scale_h
-                    cx_new = cx * scale_w
-                    cy_new = cy * scale_h
-                    meta['intrinsics'] = intr.new_tensor([fx_new, fy_new, cx_new, cy_new]).to(torch.float32)
-                    meta['img_size_dino'] = torch.tensor([int(H1), int(W1)], dtype=torch.int64)
-                else:
-                    if not (isinstance(intr, (list, tuple)) and len(intr) == 4):
-                        continue
-                    fx, fy, cx, cy = intr
-                    fx_new = fx * scale_w
-                    fy_new = fy * scale_h
-                    cx_new = cx * scale_w
-                    cy_new = cy * scale_h
-                    # IMPORTANT: always keep cam_info as tensor to avoid ambiguous default_collate outputs
-                    meta['intrinsics'] = torch.tensor(
-                        [float(fx_new), float(fy_new), float(cx_new), float(cy_new)],
-                        dtype=torch.float32)
-                    meta['img_size_dino'] = torch.tensor([int(H1), int(W1)], dtype=torch.int64)
-                # Guardrail: warn once if intrinsics look suspicious (often caused by wrong H/W inference).
-                if (not hasattr(self, '_intrinsics_scale_warned') and
-                        (float(fx_new) > 5000 or float(fy_new) > 5000 or
-                         float(cx_new) > 2 * float(W1) or float(cy_new) > 2 * float(H1))):
-                    print(
-                        "[ResizeForDINO][warn] suspicious intrinsics after resize: "
-                        f"(H0,W0)=({H0},{W0})->(H1,W1)=({H1},{W1}), "
-                        f"scale_h={scale_h:.4f}, scale_w={scale_w:.4f}, "
-                        f"intr_old={[float(fx), float(fy), float(cx), float(cy)]}, "
-                        f"intr_new={[float(fx_new), float(fy_new), float(cx_new), float(cy_new)]}"
-                    )
-                    self._intrinsics_scale_warned = True
-
+        intr = self._get_intrinsics()
+        cam_info = []
+        for idx, pose in enumerate(poses_list):
+            cam = {}
+            cam['intrinsics'] = torch.tensor(intr, dtype=torch.float32)
+            H, W = self._get_hw(imgs_list[idx] if idx < len(imgs_list) else None)
+            cam['img_size_dino'] = torch.tensor([int(H), int(W)], dtype=torch.int64)
+            if pose is not None:
+                pose_t = torch.as_tensor(pose, dtype=torch.float32)
+                cam['pose'] = pose_t
+                cam['extrinsics'] = pose_t
+            annos = results.get('annos', None)
+            if isinstance(annos, dict) and annos.get('axis_align_matrix', None) is not None:
+                cam['axis_align_matrix'] = torch.as_tensor(
+                    annos['axis_align_matrix'], dtype=torch.float32)
+            elif results.get('axis_align_matrix', None) is not None:
+                cam['axis_align_matrix'] = torch.as_tensor(
+                    results['axis_align_matrix'], dtype=torch.float32)
+            cam['img_valid'] = imgs_list[idx] is not None if idx < len(imgs_list) else False
+            cam_info.append(cam)
+        results['cam_info'] = cam_info
         return results

@@ -39,11 +39,16 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
             data = dict(data)
             data['inputs'] = inputs
         
-        if 'img' in data['inputs']:
-            batch_pad_shape = self._get_pad_shape(data)
+        # NOTE: `_get_pad_shape` expects batched tensor/list inputs.
+        # For online DINO pipeline, `data` may still be a raw dict (e.g. img as tuple),
+        # so defer padding shape computation until after `collate_data`.
 
-        data = self.collate_data(data)
-        inputs, data_samples = data['inputs'], data['data_samples']
+        if isinstance(data, dict) and 'inputs' in data and 'data_samples' in data:
+            data = self.cast_data(data)
+            inputs, data_samples = data['inputs'], data['data_samples']
+        else:
+            data = self.collate_data(data)
+            inputs, data_samples = data['inputs'], data['data_samples']
         batch_inputs = dict()
 
         # 调试：观察经过 collate 后的 inputs 键，便于确认 cam_info 是否存在
@@ -151,11 +156,32 @@ class Det3DDataPreprocessor_(Det3DDataPreprocessor):
                     print(f"[Det3DDataPreprocessor_] batch imgs={len(tensor_imgs)}")
 
         if 'img' in inputs:
-            # 原来的 img 处理逻辑
-            batch_pad_shape = self._get_pad_shape(data)
+            # 原来的 img 处理逻辑（先保证类型可被 _get_pad_shape 识别）
             imgs = inputs['img']
+            if isinstance(imgs, tuple):
+                imgs = list(imgs)
+            if isinstance(imgs, list) and len(imgs) > 0 and not torch.is_tensor(imgs[0]):
+                proc_imgs = []
+                for i, im in enumerate(imgs):
+                    proc = self._process_single_image(im, i)
+                    if proc is not None:
+                        proc_imgs.append(proc)
+                if len(proc_imgs) > 0:
+                    imgs = proc_imgs
+            pad_ready = torch.is_tensor(imgs) or (isinstance(imgs, list) and len(imgs) > 0 and torch.is_tensor(imgs[0]))
+            if pad_ready:
+                try:
+                    batch_pad_shape = self._get_pad_shape({'inputs': {'img': imgs}})
+                except Exception as e:
+                    batch_pad_shape = None
+                    if os.environ.get('DEBUG_CAMINFO_INPUTS') == '1':
+                        print(f"[Det3DDataPreprocessor_] pad_shape failed: {e} (img type={type(imgs)})")
+            else:
+                batch_pad_shape = None
+                if os.environ.get('DEBUG_CAMINFO_INPUTS') == '1':
+                    print(f"[Det3DDataPreprocessor_] skip pad_shape for img type={type(imgs)}")
 
-            if data_samples is not None:
+            if data_samples is not None and batch_pad_shape is not None:
                 # NOTE the batched image size information may be useful, e.g.
                 # in DETR, this is needed for the construction of masks, which
                 # is then used for the transformer_head.

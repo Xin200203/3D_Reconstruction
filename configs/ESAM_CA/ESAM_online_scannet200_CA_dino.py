@@ -11,10 +11,11 @@ use_bbox = True
 
 model = dict(
     type='ScanNet200MixFormer3D_Online',
-    # 纯 3D baseline（多帧在线融合）：默认不启用 DINO 注入。
-    # 若要启用 DINO 注入，需要：
-    # - `model.backbone.dino_dim` 配置为 DINO 通道数（例如 1024），使 backbone.use_dino=True；
-    # - 并在 pipeline 中提供 `dino_fpn`/`dino_feats`/`dino_point_feats` 或 `clip_pix+cam_info`（见 oneformer3d/mixformer3d.py）。
+    # 在线 DINO：与 SV 版本保持一致，走在线 2D 特征 + 3D 对齐链路。
+    # - dino_require=True：确保 DINO 链路必定生效（便于排错）
+    # - dino_online_only=True：禁止使用离线 dino_fpn/dino_feats/clip_pix 兜底
+    dino_require=True,
+    dino_online_only=True,
     data_preprocessor=dict(type='Det3DDataPreprocessor_'),
     voxel_size=0.02,
     num_classes=num_instance_classes_eval,
@@ -26,7 +27,17 @@ model = dict(
         config=dict(
             dilations=[1, 1, 1, 1],
             conv1_kernel_size=5,
-            bn_momentum=0.02)),
+            bn_momentum=0.02,
+            # DINO 注入严格检查：对齐错误时直接报错（与 SV 配置一致）
+            dino_strict=True,
+            dino_min_hit_ratio=0.95,
+            dino_residual=True),
+        # 启用 DINO 注入，通道数与 DINO 输出一致（ViT-L/14）
+        dino_dim=1024),
+    dino_cfg=dict(
+        type='DINOv2Backbone',
+        arch='dinov2_vitl14_reg',
+        checkpoint='/home/nebula/xxy/dataset/models/dinov2_vitl14_reg4_pretrain.pth'),
     memory=dict(type='MultilevelMemory', in_channels=[32, 64, 128, 256], queue=-1, vmp_layer=(0,1,2,3)),
     pool=dict(type='GeoAwarePooling', channel_proj=96),
     decoder=dict(
@@ -92,19 +103,6 @@ model = dict(
         nms=True,
         matrix_nms_kernel='linear',
         stuff_classes=[0, 1],
-        # Online matching may benefit from keeping more fragment candidates for association,
-        # while being stricter when deciding to *birth* a new track.
-        # - `assoc_filter` controls which detections enter the association/matching stage.
-        # - `birth_filter` controls which *unmatched* detections are allowed to spawn new tracks.
-        # Defaults are conservative: keep more for association but keep birth the same as baseline.
-        assoc_filter=dict(
-            score_thr=0.05,
-            npoint_thr=20,
-        ),
-        birth_filter=dict(
-            score_thr=0.25,
-            npoint_thr=100,
-        ),
         # E1: optional single-frame geometric merge (duplicate merge; runs before inst_score_thr).
         # Default is disabled for backward compatibility.
         geom_merge=dict(
@@ -206,11 +204,14 @@ train_pipeline = [
         with_rec=use_bbox, cat_rec=use_bbox,
         rec_data_root=rec_data_root,
         dataset_type='scannet200'),
+    dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
     dict(type='SwapChairAndFloorWithRec' if use_bbox else 'SwapChairAndFloor'),
     dict(type='PointSegClassMappingWithRec' if use_bbox else 'PointSegClassMapping'),
+    dict(type='BGR2RGBImg'),
     dict(
-        type='RandomFlip3D',
-        sync_2d=False,
+        # 与 SV-DINO 保持一致：水平翻转同步 2D，保留 BEV 垂直翻转
+        type='RandomFlip3D_Sync2DWithVF',
+        sync_2d=True,
         flip_ratio_bev_horizontal=0.5,
         flip_ratio_bev_vertical=0.5),
     dict(
@@ -223,6 +224,14 @@ train_pipeline = [
         type='NormalizePointsColor_',
         color_mean=color_mean,
         color_std=color_std),
+    dict(
+        type='ColorJitterImg',
+        brightness=0.4,
+        contrast=0.4,
+        saturation=0.4,
+        hue=0.1),
+    dict(type='ResizeForDINO', target_size=(420, 560)),
+    dict(type='NormalizeCamInfo', strict=True),
     dict(
         type='AddSuperPointAnnotations_Online',
         num_classes=num_semantic_classes,
@@ -241,7 +250,7 @@ train_pipeline = [
         type='Pack3DDetInputs_Online',
         keys=[
             'points', 'gt_labels_3d', 'pts_semantic_mask', 'pts_instance_mask',
-            'sp_pts_mask', 'gt_sp_masks', 'elastic_coords'
+            'sp_pts_mask', 'gt_sp_masks', 'elastic_coords', 'img', 'cam_info'
         ] + ['gt_bboxes_3d'] if use_bbox else [])
 ]
 test_pipeline = [
@@ -263,8 +272,10 @@ test_pipeline = [
         with_rec=True,
         rec_data_root=rec_data_root,
         dataset_type='scannet200'),
+    dict(type='BuildCamInfoFromPoses', dataset_type='scannet200'),
     dict(type='SwapChairAndFloorWithRec'),
     dict(type='PointSegClassMappingWithRec'),
+    dict(type='BGR2RGBImg'),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -275,6 +286,9 @@ test_pipeline = [
                 type='NormalizePointsColor_',
                 color_mean=color_mean,
                 color_std=color_std),
+            # 保证 val/test 的 DINO 输入也在 420×560（30×40 patch grid）上运行
+            dict(type='ResizeForDINO', target_size=(420, 560)),
+            dict(type='NormalizeCamInfo', strict=True),
             dict(
                 type='AddSuperPointAnnotations_Online',
                 num_classes=num_semantic_classes,
@@ -287,7 +301,7 @@ test_pipeline = [
     # dataset/pipeline.
     dict(
         type='Pack3DDetInputs_Online',
-        keys=['points', 'sp_pts_mask', 'pts_instance_mask', 'pts_semantic_mask'])
+        keys=['points', 'sp_pts_mask', 'pts_instance_mask', 'pts_semantic_mask', 'img', 'cam_info'])
 ]
 
 train_dataloader = dict(
@@ -346,10 +360,6 @@ val_evaluator = dict(
     thing_class_inds=list(range(2, num_semantic_classes)),
     min_num_points=1, 
     id_offset=2**16,
-    online_monitor=dict(
-        enable=True,
-        out_dir='online_monitorcd',
-    ),
     sem_mapping=sem_mapping,
     inst_mapping=inst_mapping,
     metric_meta=metric_meta)
@@ -363,7 +373,10 @@ optim_wrapper = dict(
 # learning rate
 param_scheduler = dict(type='PolyLR', begin=0, end=128, power=0.9)
 
-custom_hooks = [dict(type='EmptyCacheHook', after_iter=True)]
+custom_hooks = [
+    dict(type='EmptyCacheHook', after_iter=True),
+    dict(type='DINOAlignmentSanityHook', log_interval_epochs=1),
+]
 default_hooks = dict(
     checkpoint=dict(
         interval=1,

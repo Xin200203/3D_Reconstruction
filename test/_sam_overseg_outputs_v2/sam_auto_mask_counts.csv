@@ -1,0 +1,13 @@
+image,sam_auto_mask_count,sam_auto_area_mean,sam_auto_area_median
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0028_00/color/40.jpg,144,3947.2083333333335,934.0
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0012_00/color/2840.jpg,80,6350.9,1433.5
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0531_00/color/460.jpg,129,4142.341085271318,762.0
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0613_00/color/4920.jpg,133,4767.887218045113,1435.0
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0105_02/color/520.jpg,36,11697.972222222223,2250.0
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0534_00/color/380.jpg,132,4694.613636363636,589.5
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0529_00/color/1980.jpg,63,8167.492063492064,1060.0
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0614_00/color/560.jpg,144,3674.5763888888887,882.0
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0469_00/color/860.jpg,38,16006.71052631579,4096.0
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0517_02/color/1640.jpg,87,6092.770114942528,720.0
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0578_02/color/440.jpg,28,16474.678571428572,757.5
+/home/nebula/xxy/dataset/data/scannet200-mv_fast/2D/scene0261_01/color/160.jpg,54,9620.37037037037,828.5

@@ -186,6 +186,26 @@ def _rewrite_baseline_stats_out_dir(cfg):
                 _rewrite_one(e)
 
 
+def _rewrite_track_geom_diag_out_dir(cfg):
+    """Resolve `model.test_cfg.track_geom_diag.out_dir` under runner work_dir."""
+    try:
+        model = cfg.get('model', None)
+        if not isinstance(model, dict):
+            return
+        test_cfg = model.get('test_cfg', None)
+        if not isinstance(test_cfg, dict):
+            return
+        diag = test_cfg.get('track_geom_diag', None)
+        if not isinstance(diag, dict):
+            return
+        out_dir = diag.get('out_dir', 'track_geom_diag')
+        out_dir = str(out_dir)
+        if not osp.isabs(out_dir):
+            diag['out_dir'] = osp.abspath(osp.join(cfg.work_dir, out_dir))
+    except Exception:
+        return
+
+
 def _warn_checkpoint_cfg_mismatch(cfg, checkpoint_path: str) -> None:
     """Warn when checkpoint meta['cfg'] disagrees with current config.
 
@@ -286,6 +306,8 @@ def main():
     _rewrite_online_monitor_out_dir(cfg)
     # Ensure baseline stats output does not overwrite across experiments.
     _rewrite_baseline_stats_out_dir(cfg)
+    # Ensure track geometry diagnostics output is scoped to this run.
+    _rewrite_track_geom_diag_out_dir(cfg)
 
     # Guardrail: warn about common silent config/ckpt mismatches.
     _warn_checkpoint_cfg_mismatch(cfg, args.checkpoint)

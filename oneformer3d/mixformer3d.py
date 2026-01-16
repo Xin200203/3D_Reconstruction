@@ -647,6 +647,7 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         cam_metas: List[Dict],
         batch_data_samples: List[Any],
         elastic_coords: Optional[List[Any]] = None,
+        frame_i: Optional[int] = None,
     ) -> Optional[List[ME.SparseTensor]]:
         """从在线 DINOv2 特征 (feat_maps) 构建稀疏 FPN。
 
@@ -703,35 +704,6 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             except Exception:
                 # 若反解失败，则退回使用训练坐标系（至少保证不中断训练）
                 xyz_world = xyz_train
-
-            # 1.5) world -> camera：使用 cam_info 中的 cam2world 外参（或 pose），
-            #      与 vis_demo/dino_rgb_vis_3d.ipynb 中的可视化逻辑保持一致。
-            pose = cam_meta.get('pose', None)
-            if pose is None:
-                pose = cam_meta.get('extrinsics', None)
-
-            if pose is not None:
-                try:
-                    T_c2w = torch.as_tensor(pose, device=xyz_world.device, dtype=xyz_world.dtype)
-                    if T_c2w.shape == (4, 4):
-                        # world -> cam: w2c = (cam2world)^-1
-                        try:
-                            T_w2c = torch.linalg.inv(T_c2w)
-                        except Exception:
-                            T_w2c = T_c2w.inverse()
-                        ones = torch.ones((xyz_world.shape[0], 1),
-                                          device=xyz_world.device,
-                                          dtype=xyz_world.dtype)
-                        xyz_h = torch.cat([xyz_world, ones], dim=1)  # (N,4)
-                        xyz_cam = (xyz_h @ T_w2c.t())[:, :3]
-                    else:
-                        # 形状异常时退回 world 坐标（至少不中断）
-                        xyz_cam = xyz_world
-                except Exception:
-                    xyz_cam = xyz_world
-            else:
-                # 若未提供外参，则近似认为 world≈camera 坐标
-                xyz_cam = xyz_world
 
             # 2) 使用更新后的 intrinsics + DINO 特征图尺寸投影到 patch 网格
             intr = cam_meta.get('intrinsics', None)
@@ -798,13 +770,118 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             cx_feat = (cx_img + 0.5) * scale_w - 0.5
             cy_feat = (cy_img + 0.5) * scale_h - 0.5
 
-            try:
-                uv, valid = project_points_to_uv(
-                    xyz_cam,
+            # 2.5) world -> camera：根据 pose_mode 选择最可信的投影（默认 auto）。
+            pose = cam_meta.get('pose', None)
+            if pose is None:
+                pose = cam_meta.get('extrinsics', None)
+            axis_align = cam_meta.get('axis_align_matrix', None)
+
+            def _select_pose(pose_in, frame_idx):
+                if pose_in is None:
+                    return None
+                if isinstance(pose_in, (list, tuple)):
+                    if len(pose_in) == 0:
+                        return None
+                    if frame_idx is not None and frame_idx < len(pose_in):
+                        pose_in = pose_in[frame_idx]
+                    else:
+                        pose_in = pose_in[0]
+                if torch.is_tensor(pose_in):
+                    pose_t = pose_in
+                    if pose_t.ndim == 3 and pose_t.shape[0] > 0:
+                        idx = frame_idx if frame_idx is not None and frame_idx < pose_t.shape[0] else 0
+                        pose_t = pose_t[idx]
+                    if pose_t.shape != (4, 4):
+                        return None
+                    return pose_t.to(device=xyz_world.device, dtype=xyz_world.dtype)
+                if isinstance(pose_in, np.ndarray):
+                    pose_arr = pose_in
+                    if pose_arr.ndim == 3 and pose_arr.shape[0] > 0:
+                        idx = frame_idx if frame_idx is not None and frame_idx < pose_arr.shape[0] else 0
+                        pose_arr = pose_arr[idx]
+                    if pose_arr.shape != (4, 4):
+                        return None
+                    return torch.as_tensor(pose_arr, device=xyz_world.device, dtype=xyz_world.dtype)
+                try:
+                    pose_t = torch.as_tensor(pose_in, device=xyz_world.device, dtype=xyz_world.dtype)
+                    if pose_t.ndim == 3 and pose_t.shape[0] > 0:
+                        idx = frame_idx if frame_idx is not None and frame_idx < pose_t.shape[0] else 0
+                        pose_t = pose_t[idx]
+                    if pose_t.shape != (4, 4):
+                        return None
+                    return pose_t
+                except Exception:
+                    return None
+
+            def _xyz_cam_from_pose(pose_t, mode: str):
+                if mode == 'identity' or pose_t is None:
+                    return xyz_world
+                if mode in ('inv', 'axis_align_inv'):
+                    try:
+                        T_w2c = torch.linalg.inv(pose_t)
+                    except Exception:
+                        T_w2c = pose_t.inverse()
+                elif mode == 'direct':
+                    T_w2c = pose_t
+                else:
+                    T_w2c = None
+                if T_w2c is None or T_w2c.shape != (4, 4):
+                    return xyz_world
+                ones = torch.ones((xyz_world.shape[0], 1),
+                                  device=xyz_world.device,
+                                  dtype=xyz_world.dtype)
+                xyz_h = torch.cat([xyz_world, ones], dim=1)
+                return (xyz_h @ T_w2c.t())[:, :3]
+
+            def _project_with_xyz(xyz_cam_in):
+                uv_out, valid_out = project_points_to_uv(
+                    xyz_cam_in,
                     feat_hw=(H_feat, W_feat),
                     max_depth=cam_meta.get('max_depth', 20.0),
                     standard_intrinsics=(fx_feat, fy_feat, cx_feat, cy_feat),
                     already_scaled=True)
+                if isinstance(valid_out, torch.Tensor) and valid_out.numel() > 0:
+                    ratio = float(valid_out.float().mean().item())
+                else:
+                    ratio = 0.0
+                return uv_out, valid_out, ratio
+
+            pose_mode = str(self.dino_pose_mode).lower() if getattr(self, 'dino_pose_mode', None) is not None else 'auto'
+            chosen_mode = 'inv'
+            try:
+                pose_t = _select_pose(pose, frame_i)
+                if pose_mode == 'auto':
+                    cand = []
+                    if pose_t is not None:
+                        cand.append(('inv', pose_t))
+                        cand.append(('direct', pose_t))
+                        if self.dino_pose_try_axis_align and axis_align is not None:
+                            try:
+                                A = _select_pose(axis_align, None)
+                                if A.shape == (4, 4):
+                                    cand.append(('axis_align_inv', A @ pose_t))
+                            except Exception:
+                                pass
+                    cand.append(('identity', None))
+
+                    best = None
+                    for mode, pose_in in cand:
+                        xyz_cam = _xyz_cam_from_pose(pose_in, mode)
+                        uv_tmp, valid_tmp, ratio = _project_with_xyz(xyz_cam)
+                        if best is None or ratio > best[3]:
+                            best = (mode, uv_tmp, valid_tmp, ratio)
+                    if best is None:
+                        raise RuntimeError("auto pose pick failed")
+                    chosen_mode, uv, valid, best_ratio = best
+                else:
+                    xyz_cam = _xyz_cam_from_pose(pose_t, pose_mode)
+                    uv, valid, best_ratio = _project_with_xyz(xyz_cam)
+                    chosen_mode = pose_mode
+                if chosen_mode in self._dino_pose_pick_stats:
+                    self._dino_pose_pick_stats[chosen_mode] += 1
+                if self._dino_debug and self._dino_debug_count < 5:
+                    print(f"[DINO][pose_pick] sample={b_idx} mode={chosen_mode} valid_ratio={best_ratio:.4f}")
+                    self._dino_debug_count += 1
             except Exception:
                 if getattr(self, 'dino_require', False):
                     s = batch_data_samples[b_idx]
@@ -836,6 +913,13 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
 
             # 3) 在 DINO 特征图上采样点级特征
             feats_2d = sample_img_feat(feat_map, uv, valid, align_corners=False)
+            if self._capture_point_dino and frame_i is not None:
+                try:
+                    feats_dev = feats_2d.to(device=xyz_train.device)
+                    valid_dev = valid.to(device=xyz_train.device) if torch.is_tensor(valid) else valid
+                    self._point_dino_cache[(int(frame_i), int(b_idx))] = (feats_dev, valid_dev)
+                except Exception:
+                    pass
 
             # 4) 构造 Minkowski 稀疏坐标
             # 关键：当启用 elastic 时，backbone 的 sparse coords 来自 elastic_coords。
@@ -886,6 +970,19 @@ class ScanNet200MixFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             ]
             self._last_dino_valid_rate = valid_rate  # type: ignore[attr-defined]
             self._last_dino_valid_rate_per_sample = per_sample_rates  # type: ignore[attr-defined]
+            if getattr(self, "_dino_debug", False):
+                if not hasattr(self, "_dino_valid_log_count"):
+                    self._dino_valid_log_count = 0
+                if self._dino_valid_log_count < 5:
+                    try:
+                        frame_tag = f" frame={frame_i}" if frame_i is not None else ""
+                        print(
+                            f"[DINO][valid_rate]{frame_tag} rate={valid_rate:.4f} "
+                            f"per_sample={per_sample_rates}"
+                        )
+                    except Exception:
+                        pass
+                    self._dino_valid_log_count += 1
         else:
             self._last_dino_valid_rate = None  # type: ignore[attr-defined]
             self._last_dino_valid_rate_per_sample = []  # type: ignore[attr-defined]
@@ -1627,15 +1724,22 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                  criterion=None,
                  train_cfg=None,
                  test_cfg=None,
+                 dino_cfg=None,
                  dino_enable: Optional[bool] = None,
                  dino_require: bool = False,
+                 dino_online_only: bool = False,
                  dino_debug: bool = False,
+                 dino_pose_mode: str = 'auto',
+                 dino_pose_min_valid_ratio: float = 0.05,
+                 dino_pose_try_axis_align: bool = True,
                  data_preprocessor=None,
                  init_cfg=None):
         super(Base3DDetector, self).__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
         self.backbone = MODELS.build(_cfg(backbone, 'backbone'))
+        # Optional: online DINOv2 backbone (same as SV pipeline).
+        self.dino = MODELS.build(_cfg(dino_cfg, 'dino')) if dino_cfg is not None else None
         if memory is not None:
             self.memory = MODELS.build(_cfg(memory, 'memory'))
         self.neck = MODELS.build(_cfg(neck, 'neck')) if neck is not None else None
@@ -1662,9 +1766,19 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         # - dino_enable=True: 强制使用注入链路（若 dino_require=True 且无法构建，则直接报错）。
         self.dino_enable = dino_enable
         self.dino_require = bool(dino_require)
+        self.dino_online_only = bool(dino_online_only)
         self.dino_debug = bool(dino_debug)
+        self.dino_pose_mode = str(dino_pose_mode)
+        self.dino_pose_min_valid_ratio = float(dino_pose_min_valid_ratio)
+        self.dino_pose_try_axis_align = bool(dino_pose_try_axis_align)
+        self._dino_pose_pick_stats = {'inv': 0, 'direct': 0, 'identity': 0, 'axis_align_inv': 0}
         self._dino_debug_count = 0
         self._dino_debug = os.environ.get('DINO_DEBUG', '') == '1'
+        # Optional: per-point DINO bypass cache (for instance-level pooling).
+        # Keyed by (frame_i, b_idx) -> (point_feats, valid_mask) on the same device as points.
+        self._point_dino_cache = {}
+        self._capture_point_dino = False
+        self._dino_inst_pool = None
         self.init_weights()
     
     def init_weights(self):
@@ -1683,13 +1797,38 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         """
         batch_size = len(batch_data_samples)
 
+        # Whether downstream (online merge) requests per-point DINO features for instance-level pooling.
+        track_features = self.test_cfg.get("track_features", None) or {}
+        dino_tf = track_features.get("dino", {}) if isinstance(track_features, dict) else {}
+        dino_tf_enable = bool(dino_tf.get("enable", False)) if isinstance(dino_tf, dict) else False
+        # Capture only when enabled to avoid extra memory/compute.
+        self._capture_point_dino = bool(dino_tf_enable)
+        if self._capture_point_dino:
+            # Drop stale cache for this frame.
+            for b_idx in range(len(batch_inputs_dict.get('points', []))):
+                self._point_dino_cache.pop((int(frame_i), int(b_idx)), None)
+
         # === Online dinosaur 特征注入（可选，默认不影响纯 3D baseline）===
         provided_offline = any(k in batch_inputs_dict for k in ('dino_fpn', 'dino_feats', 'dino_point_feats'))
         has_clip_pix = batch_inputs_dict.get('clip_pix', None) is not None
         if self.dino_enable is None:
-            dino_enabled = bool(provided_offline or has_clip_pix)
+            dino_enabled = bool(provided_offline or has_clip_pix or (self.dino is not None))
         else:
             dino_enabled = bool(self.dino_enable)
+
+        # 在线-only 模式下不允许离线输入
+        if dino_enabled and self.dino_online_only:
+            unexpected = []
+            for k in ('dino_fpn', 'dino_feats', 'dino_point_feats'):
+                if k in batch_inputs_dict:
+                    unexpected.append(k)
+            if has_clip_pix:
+                unexpected.append('clip_pix')
+            if unexpected:
+                raise RuntimeError(
+                    f"DINO online-only: unexpected offline inputs present: {unexpected}. "
+                    "Remove related pipeline keys to ensure only online DINO is used."
+                )
 
         # 调试：仅在显式开启 dino_debug 时打印（避免 baseline 日志“被污染”）
         if dino_enabled and self.dino_debug and self._dino_debug_count < 3:
@@ -1742,6 +1881,13 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     for b_idx, pts in enumerate(batch_inputs_dict['points']):
                         xyz = pts[frame_i, :, :3]  # (N,3) 已包含 elastic 等增强
                         feats_2d = batch_inputs_dict['dino_point_feats'][b_idx][frame_i]  # (N,C_dino)
+                        if self._capture_point_dino:
+                            try:
+                                feats_dev = feats_2d.to(device=xyz.device)
+                                valid = torch.ones((xyz.shape[0],), dtype=torch.bool, device=xyz.device)
+                                self._point_dino_cache[(int(frame_i), int(b_idx))] = (feats_dev, valid)
+                            except Exception:
+                                pass
                         # voxel 坐标（向下取整），添加 batch 维
                         coords = torch.cat([
                             torch.full((xyz.shape[0], 1), b_idx, dtype=torch.int32, device=xyz.device),
@@ -1759,7 +1905,90 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         self._dino_debug_count += 1
                 except Exception:
                     dino_feats = None
-            # 3) 若仍为空且存在 clip_pix + cam_info，尝试在线投影得到点级 DINO
+            # 3) 若仍为空且存在在线 DINO backbone，则从 img + cam_info 构建 FPN
+            if dino_feats is None and self.dino is not None:
+                imgs = batch_inputs_dict.get('img', None)
+                cam_raw = batch_inputs_dict.get('cam_info', None)
+                if self.dino_require and (imgs is None or cam_raw is None):
+                    raise RuntimeError(
+                        "DINO required but missing inputs: "
+                        f"img_present={imgs is not None}, cam_info_present={cam_raw is not None}. "
+                        f"batch_inputs_keys={list(batch_inputs_dict.keys())}"
+                    )
+                if imgs is not None and cam_raw is not None:
+                    try:
+                        # Normalize img layout for the current frame.
+                        frame_imgs = []
+                        if isinstance(imgs, list):
+                            # imgs could be [T] (single batch) or [B][T]
+                            if len(imgs) > 0 and isinstance(imgs[0], (list, tuple)):
+                                for b_idx in range(len(batch_inputs_dict['points'])):
+                                    seq = imgs[b_idx] if b_idx < len(imgs) else imgs[0]
+                                    frame_imgs.append(seq[frame_i])
+                            else:
+                                # single-batch: list of frames
+                                frame_imgs.append(imgs[frame_i])
+                        else:
+                            frame_imgs.append(imgs)
+
+                        norm_imgs = []
+                        for it in frame_imgs:
+                            x = it
+                            if isinstance(x, tuple) and len(x) > 0:
+                                x = x[0]
+                            if not torch.is_tensor(x):
+                                x = torch.as_tensor(x)
+                            if x.dim() == 4 and x.shape[0] == 1:
+                                x = x[0]
+                            if x.dim() == 3 and x.shape[0] not in (1, 3) and x.shape[-1] in (1, 3):
+                                x = x.permute(2, 0, 1).contiguous()
+                            norm_imgs.append(x)
+                        imgs_t = torch.stack(norm_imgs, dim=0)
+
+                        cam_raw_frame = cam_raw
+                        if isinstance(cam_raw, list) and len(cam_raw) > 0:
+                            if isinstance(cam_raw[0], dict):
+                                if len(cam_raw) != len(frame_imgs) and len(frame_imgs) == 1:
+                                    if frame_i < len(cam_raw):
+                                        cam_raw_frame = [cam_raw[frame_i]]
+                                    else:
+                                        cam_raw_frame = [cam_raw[0]]
+                            elif isinstance(cam_raw[0], (list, tuple)):
+                                per_sample = []
+                                for item in cam_raw:
+                                    if isinstance(item, (list, tuple)) and len(item) > 0:
+                                        if frame_i < len(item):
+                                            per_sample.append(item[frame_i])
+                                        else:
+                                            per_sample.append(item[0])
+                                    else:
+                                        per_sample.append(item)
+                                cam_raw_frame = per_sample
+                        cam_metas = self._normalize_cam_info(cam_raw_frame, len(frame_imgs))
+                        feat_maps = self.dino(imgs_t)  # type: ignore[operator]
+                        # Build DINO sparse FPN from online features (per-frame points).
+                        pts_frame_list = [pts[frame_i, :, :3] for pts in batch_inputs_dict['points']]
+                        elastic = batch_inputs_dict.get('elastic_coords', None)
+                        elastic_frame = None
+                        if elastic is not None:
+                            elastic_frame = [e[frame_i] for e in elastic]
+                        dino_feats = self._build_dino_fpn_online(
+                            pts_frame_list, feat_maps, cam_metas, batch_data_samples,
+                            elastic_coords=elastic_frame, frame_i=int(frame_i))
+                        if self.dino_debug and dino_feats is not None and self._dino_debug_count < 3:
+                            shapes = [x.shape for x in dino_feats]
+                            strides = [x.tensor_stride for x in dino_feats]
+                            print(f"[DINO] build from online DINO backbone frame={frame_i}, shapes={shapes}, strides={strides}")
+                            self._dino_debug_count += 1
+                    except Exception as e:
+                        if self.dino_require:
+                            raise RuntimeError(f"DINO required but online build failed: {repr(e)}")
+                        if self.dino_debug and self._dino_debug_count < 3:
+                            print(f"[DINO][error] build from online DINO failed: {e}")
+                            self._dino_debug_count += 1
+                        dino_feats = None
+
+            # 4) 若仍为空且存在 clip_pix + cam_info，尝试在线投影得到点级 DINO
             if dino_feats is None and has_clip_pix and 'cam_info' in batch_inputs_dict:
                 try:
                     dino_feats = self._build_dino_fpn_from_clip(batch_inputs_dict, frame_i)
@@ -1770,7 +1999,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         self._dino_debug_count += 1
                 except Exception:
                     dino_feats = None
-            # 4) 若最终仍未构建，打印一次提示
+            # 5) 若最终仍未构建，打印一次提示
             if dino_feats is None:
                 if self.dino_require:
                     raise RuntimeError(
@@ -1828,6 +2057,41 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             features.append(x[begin: end])
             sp_xyz_list.append(sp_xyz[begin: end])
         return features, point_features, all_xyz_w, sp_xyz_list
+
+    def _get_point_dino_feats(
+        self,
+        batch_inputs_dict: Dict[str, Any],
+        frame_i: int,
+        b_idx: int,
+        device: torch.device,
+    ):
+        """Get per-point DINO features for a specific frame/sample (bypass output).
+
+        Priority:
+          1) cached from extract_feat (dino_point_feats or clip_pix lifting)
+          2) direct from batch_inputs_dict['dino_point_feats'] if present
+        """
+        key = (int(frame_i), int(b_idx))
+        cached = self._point_dino_cache.get(key, None)
+        if isinstance(cached, tuple) and len(cached) == 2:
+            feats, valid = cached
+            if torch.is_tensor(feats) and torch.is_tensor(valid):
+                return feats.to(device=device), valid.to(device=device)
+
+        # Direct (no cache) fallback: dino_point_feats provided by pipeline.
+        try:
+            dpf = batch_inputs_dict.get("dino_point_feats", None)
+            pts = batch_inputs_dict["points"][b_idx]
+            if dpf is None:
+                return None, None
+            feats = dpf[b_idx][frame_i]
+            if not torch.is_tensor(feats):
+                feats = torch.as_tensor(feats)
+            feats = feats.to(device=device)
+            valid = torch.ones((int(pts.shape[1]),), dtype=torch.bool, device=device)
+            return feats, valid
+        except Exception:
+            return None, None
 
     def _build_dino_fpn_from_clip(self, batch_inputs_dict: Dict[str, Any], frame_i: int):
         """从 clip_pix + cam_info 在线投影获取点级 DINO，并构建稀疏 FPN。
@@ -1939,6 +2203,11 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             # 采样特征 (N, C)
             sampled = sample_img_feat(clip.unsqueeze(0), uv_feat, valid, align_corners=True)
             sampled = sampled.to(pts.device)
+            if self._capture_point_dino:
+                try:
+                    self._point_dino_cache[(int(frame_i), int(b_idx))] = (sampled, valid.to(device=pts.device))
+                except Exception:
+                    pass
 
             # 构造稀疏坐标（同当前点的 voxel 量化方式）
             coords = torch.cat([
@@ -1958,6 +2227,431 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             print(f"[DINO] proj+fpn frame={frame_i}, shapes={shapes}, strides={strides}")
             self._dino_debug_count += 1
         return fpn
+
+    def _normalize_cam_info(self, cam_raw: Any, num_samples: int) -> List[Dict]:
+        """Normalize various cam_info formats to a per-sample list[dict]."""
+        import os
+        import numpy as np
+
+        def _summarize_value(v: Any) -> str:
+            try:
+                if torch.is_tensor(v):
+                    return f"Tensor(shape={tuple(v.shape)}, dtype={v.dtype}, device={v.device})"
+                if isinstance(v, np.ndarray):
+                    return f"ndarray(shape={v.shape}, dtype={v.dtype})"
+                if isinstance(v, (list, tuple)):
+                    head = v[0] if len(v) > 0 else None
+                    return f"{type(v).__name__}(len={len(v)}, head={_summarize_value(head) if head is not None else 'None'})"
+                return f"{type(v).__name__}({str(v)[:80]})"
+            except Exception:
+                return f"{type(v).__name__}"
+
+        debug = os.environ.get('DEBUG_CAMINFO_NORM', '') == '1'
+        if debug and not hasattr(self, '_caminfo_debug_count'):
+            self._caminfo_debug_count = 0  # type: ignore[attr-defined]
+        if debug and self._caminfo_debug_count < 3:  # type: ignore[attr-defined]
+            print(f"[CamInfo][raw] num_samples={num_samples}, type={type(cam_raw)}")
+            if isinstance(cam_raw, dict):
+                for k, v in cam_raw.items():
+                    print(f"  - {k}: {_summarize_value(v)}")
+            elif isinstance(cam_raw, list):
+                print(f"  - list_len={len(cam_raw)} head={_summarize_value(cam_raw[0]) if len(cam_raw)>0 else 'None'}")
+            self._caminfo_debug_count += 1  # type: ignore[attr-defined]
+
+        cam_metas: List[Dict] = []
+        if isinstance(cam_raw, list):
+            for item in cam_raw:
+                if isinstance(item, list) and len(item) > 0 and isinstance(item[0], dict):
+                    cam_metas.append(item[0])
+                elif isinstance(item, dict):
+                    cam_metas.append(item)
+        elif isinstance(cam_raw, dict):
+            cam_metas = [cam_raw]
+
+        if len(cam_metas) == 1 and num_samples > 1 and isinstance(cam_metas[0], dict):
+            batched_meta = cam_metas[0]
+            split_metas: List[Dict] = []
+            for b in range(num_samples):
+                m: Dict[str, Any] = {}
+                for k, v in batched_meta.items():
+                    if torch.is_tensor(v):
+                        if v.ndim >= 1 and v.shape[0] == num_samples:
+                            m[k] = v[b]
+                        else:
+                            m[k] = v
+                    elif isinstance(v, np.ndarray):
+                        if v.ndim >= 1 and v.shape[0] == num_samples:
+                            m[k] = v[b]
+                        else:
+                            m[k] = v
+                    elif isinstance(v, (list, tuple)):
+                        if len(v) == num_samples and k in {'img_size_dino', 'pose', 'extrinsics'}:
+                            m[k] = v[b]
+                            continue
+                        if k == 'intrinsics' and len(v) == num_samples and len(v) > 0:
+                            is_component_wise = (
+                                len(v) == 4 and all(
+                                    (torch.is_tensor(elem) and elem.ndim >= 1 and elem.shape[0] == num_samples) or
+                                    (isinstance(elem, np.ndarray) and elem.ndim >= 1 and elem.shape[0] == num_samples)
+                                    for elem in v
+                                )
+                            )
+                            if not is_component_wise:
+                                sample_v = v[b]
+                                if isinstance(sample_v, (list, tuple)) and len(sample_v) == 4:
+                                    m[k] = sample_v
+                                    continue
+                                if torch.is_tensor(sample_v) and sample_v.numel() == 4:
+                                    m[k] = sample_v
+                                    continue
+                                if isinstance(sample_v, np.ndarray) and sample_v.size == 4:
+                                    m[k] = sample_v
+                                    continue
+                        if len(v) > 0 and (torch.is_tensor(v[0]) or isinstance(v[0], np.ndarray)):
+                            per_list = []
+                            for elem in v:
+                                if torch.is_tensor(elem) and elem.ndim >= 1 and elem.shape[0] == num_samples:
+                                    per_list.append(elem[b])
+                                elif isinstance(elem, np.ndarray) and elem.ndim >= 1 and elem.shape[0] == num_samples:
+                                    per_list.append(elem[b])
+                                else:
+                                    per_list.append(elem)
+                            m[k] = per_list
+                        else:
+                            m[k] = list(v)
+                    else:
+                        m[k] = v
+                split_metas.append(m)
+            cam_metas = split_metas
+
+        if len(cam_metas) != num_samples:
+            if len(cam_metas) == 1 and num_samples >= 1:
+                cam_metas = cam_metas * num_samples
+            else:
+                raise RuntimeError(
+                    f"_normalize_cam_info: got {len(cam_metas)} metas for {num_samples} samples")
+        return cam_metas
+
+    def _build_dino_fpn_online(
+        self,
+        points_list: List[torch.Tensor],
+        feat_maps: torch.Tensor,
+        cam_metas: List[Dict],
+        batch_data_samples: List[Any],
+        elastic_coords: Optional[List[Any]] = None,
+        frame_i: Optional[int] = None,
+    ) -> Optional[List[ME.SparseTensor]]:
+        """从在线 DINOv2 特征 (feat_maps) 构建稀疏 FPN。"""
+        if feat_maps is None or len(points_list) == 0:
+            return None
+
+        coords_list: List[torch.Tensor] = []
+        feats_list: List[torch.Tensor] = []
+        valid_counts: List[int] = []
+        total_counts: List[int] = []
+        coords_sources: List[str] = []
+        skip_reasons: List[str] = []
+        B = len(points_list)
+        assert feat_maps.size(0) == B, \
+            f"feat_maps batch size {feat_maps.size(0)} != points_list length {B}"
+
+        for b_idx in range(B):
+            skip_reason = "ok"
+            pts = points_list[b_idx]
+            if pts.numel() == 0:
+                skip_reason = "empty_points"
+                skip_reasons.append(skip_reason)
+                continue
+            feat_map = feat_maps[b_idx:b_idx + 1]
+            device = feat_map.device
+            pts = pts.to(device=device)
+            xyz_train = pts[:, :3]
+            sample = batch_data_samples[b_idx]
+            img_meta = getattr(sample, 'img_metas', None)
+            if not isinstance(img_meta, dict) or 'transformation_3d_flow' not in img_meta:
+                img_meta = sample.metainfo if hasattr(sample, 'metainfo') else {}
+            cam_meta = cam_metas[b_idx]
+
+            try:
+                xyz_world_np = apply_3d_transformation(
+                    xyz_train.clone(), coord_type='DEPTH', img_meta=img_meta, reverse=True)
+                xyz_world = torch.as_tensor(xyz_world_np, device=xyz_train.device, dtype=xyz_train.dtype)
+            except Exception:
+                xyz_world = xyz_train
+
+            intr = cam_meta.get('intrinsics', None)
+            if torch.is_tensor(intr) and intr.numel() == 4:
+                intr = [float(x) for x in intr.reshape(-1)]
+            elif isinstance(intr, (list, tuple)) and len(intr) == 1 and torch.is_tensor(intr[0]) and intr[0].numel() == 4:
+                intr = [float(x) for x in intr[0].reshape(-1)]
+            if intr is None or not (isinstance(intr, (list, tuple)) and len(intr) == 4):
+                if getattr(self, 'dino_require', False):
+                    raise RuntimeError(
+                        f"[DINO][strict] missing/invalid intrinsics at sample={b_idx}: intr={intr} "
+                        f"cam_keys={list(cam_meta.keys())}"
+                    )
+                skip_reason = "bad_intrinsics"
+                skip_reasons.append(skip_reason)
+                continue
+            fx_img, fy_img, cx_img, cy_img = intr
+            img_size = cam_meta.get('img_size_dino', None)
+
+            def _parse_hw(x):
+                if x is None:
+                    return None
+                if torch.is_tensor(x):
+                    if x.numel() == 2:
+                        flat = x.detach().reshape(-1)
+                        return int(flat[0].item()), int(flat[1].item())
+                    return None
+                if isinstance(x, (list, tuple)):
+                    if len(x) == 2:
+                        try:
+                            return int(x[0]), int(x[1])
+                        except Exception:
+                            return int(float(x[0])), int(float(x[1]))
+                    if len(x) == 1:
+                        return _parse_hw(x[0])
+                    return None
+                return None
+
+            hw = _parse_hw(img_size)
+            if hw is None:
+                if getattr(self, 'dino_require', False) and img_size is not None:
+                    s = batch_data_samples[b_idx]
+                    m = getattr(s, 'img_metas', None)
+                    if not isinstance(m, dict):
+                        m = {}
+                    raise RuntimeError(
+                        "[DINO][strict] invalid img_size_dino format "
+                        f"sample={b_idx}, img_size_dino={img_size}, "
+                        f"type={type(img_size)}, cam_keys={list(cam_meta.keys())}, "
+                        f"lidar_path={m.get('lidar_path')}, img_path={m.get('img_path')}"
+                    )
+                H_img, W_img = BASE_IMAGE_SIZE  # type: ignore[name-defined]
+            else:
+                H_img, W_img = hw
+
+            H_feat, W_feat = feat_map.shape[-2], feat_map.shape[-1]
+            scale_w = float(W_feat) / float(W_img)
+            scale_h = float(H_feat) / float(H_img)
+            fx_feat = fx_img * scale_w
+            fy_feat = fy_img * scale_h
+            cx_feat = (cx_img + 0.5) * scale_w - 0.5
+            cy_feat = (cy_img + 0.5) * scale_h - 0.5
+
+            # world -> camera：根据 pose_mode 选择最可信的投影（默认 auto）。
+            pose = cam_meta.get('pose', None)
+            if pose is None:
+                pose = cam_meta.get('extrinsics', None)
+            axis_align = cam_meta.get('axis_align_matrix', None)
+
+            def _select_pose(pose_in, frame_idx):
+                if pose_in is None:
+                    return None
+                if isinstance(pose_in, (list, tuple)):
+                    if len(pose_in) == 0:
+                        return None
+                    if frame_idx is not None and frame_idx < len(pose_in):
+                        pose_in = pose_in[frame_idx]
+                    else:
+                        pose_in = pose_in[0]
+                if torch.is_tensor(pose_in):
+                    pose_t = pose_in
+                    if pose_t.ndim == 3 and pose_t.shape[0] > 0:
+                        idx = frame_idx if frame_idx is not None and frame_idx < pose_t.shape[0] else 0
+                        pose_t = pose_t[idx]
+                    if pose_t.shape != (4, 4):
+                        return None
+                    return pose_t.to(device=xyz_world.device, dtype=xyz_world.dtype)
+                if isinstance(pose_in, np.ndarray):
+                    pose_arr = pose_in
+                    if pose_arr.ndim == 3 and pose_arr.shape[0] > 0:
+                        idx = frame_idx if frame_idx is not None and frame_idx < pose_arr.shape[0] else 0
+                        pose_arr = pose_arr[idx]
+                    if pose_arr.shape != (4, 4):
+                        return None
+                    return torch.as_tensor(pose_arr, device=xyz_world.device, dtype=xyz_world.dtype)
+                try:
+                    pose_t = torch.as_tensor(pose_in, device=xyz_world.device, dtype=xyz_world.dtype)
+                    if pose_t.ndim == 3 and pose_t.shape[0] > 0:
+                        idx = frame_idx if frame_idx is not None and frame_idx < pose_t.shape[0] else 0
+                        pose_t = pose_t[idx]
+                    if pose_t.shape != (4, 4):
+                        return None
+                    return pose_t
+                except Exception:
+                    return None
+
+            def _xyz_cam_from_pose(pose_t, mode: str):
+                if mode == 'identity' or pose_t is None:
+                    return xyz_world
+                if mode in ('inv', 'axis_align_inv'):
+                    try:
+                        T_w2c = torch.linalg.inv(pose_t)
+                    except Exception:
+                        T_w2c = pose_t.inverse()
+                elif mode == 'direct':
+                    T_w2c = pose_t
+                else:
+                    T_w2c = None
+                if T_w2c is None or T_w2c.shape != (4, 4):
+                    return xyz_world
+                ones = torch.ones((xyz_world.shape[0], 1),
+                                  device=xyz_world.device,
+                                  dtype=xyz_world.dtype)
+                xyz_h = torch.cat([xyz_world, ones], dim=1)
+                return (xyz_h @ T_w2c.t())[:, :3]
+
+            def _project_with_xyz(xyz_cam_in):
+                uv_out, valid_out = project_points_to_uv(
+                    xyz_cam_in,
+                    feat_hw=(H_feat, W_feat),
+                    max_depth=cam_meta.get('max_depth', 20.0),
+                    standard_intrinsics=(fx_feat, fy_feat, cx_feat, cy_feat),
+                    already_scaled=True)
+                if isinstance(valid_out, torch.Tensor) and valid_out.numel() > 0:
+                    ratio = float(valid_out.float().mean().item())
+                else:
+                    ratio = 0.0
+                return uv_out, valid_out, ratio
+
+            pose_mode = str(self.dino_pose_mode).lower() if getattr(self, 'dino_pose_mode', None) is not None else 'auto'
+            chosen_mode = 'inv'
+            try:
+                pose_t = _select_pose(pose, frame_i)
+                if pose_mode == 'auto':
+                    cand = []
+                    if pose_t is not None:
+                        cand.append(('inv', pose_t))
+                        cand.append(('direct', pose_t))
+                        if self.dino_pose_try_axis_align and axis_align is not None:
+                            try:
+                                A = _select_pose(axis_align, None)
+                                if A.shape == (4, 4):
+                                    cand.append(('axis_align_inv', A @ pose_t))
+                            except Exception:
+                                pass
+                    cand.append(('identity', None))
+
+                    best = None
+                    for mode, pose_in in cand:
+                        xyz_cam = _xyz_cam_from_pose(pose_in, mode)
+                        uv_tmp, valid_tmp, ratio = _project_with_xyz(xyz_cam)
+                        if best is None or ratio > best[3]:
+                            best = (mode, uv_tmp, valid_tmp, ratio)
+                    if best is None:
+                        raise RuntimeError("auto pose pick failed")
+                    chosen_mode, uv, valid, best_ratio = best
+                else:
+                    xyz_cam = _xyz_cam_from_pose(pose_t, pose_mode)
+                    uv, valid, best_ratio = _project_with_xyz(xyz_cam)
+                    chosen_mode = pose_mode
+                if chosen_mode in self._dino_pose_pick_stats:
+                    self._dino_pose_pick_stats[chosen_mode] += 1
+                if self._dino_debug and self._dino_debug_count < 5:
+                    print(f"[DINO][pose_pick] sample={b_idx} mode={chosen_mode} valid_ratio={best_ratio:.4f}")
+                    self._dino_debug_count += 1
+            except Exception:
+                if getattr(self, 'dino_require', False):
+                    s = batch_data_samples[b_idx]
+                    m = getattr(s, 'img_metas', None)
+                    if not isinstance(m, dict):
+                        m = {}
+                    raise RuntimeError(
+                        "[DINO][strict] project_points_to_uv failed "
+                        f"sample={b_idx}, lidar_path={m.get('lidar_path')}, img_path={m.get('img_path')}, "
+                        f"img_size_dino={(H_img, W_img)}, feat_hw={(H_feat, W_feat)}, intr={intr}"
+                    )
+                skip_reason = "proj_exception"
+                skip_reasons.append(skip_reason)
+                continue
+
+            if isinstance(valid, torch.Tensor):
+                v_cnt = int(valid.sum().item())
+                t_cnt = int(valid.numel())
+                valid_counts.append(v_cnt)
+                total_counts.append(t_cnt)
+
+            if img_meta.get('img_flip', False) or img_meta.get('flip', False):
+                u = uv[:, 0]
+                v = uv[:, 1]
+                u = float(W_feat - 1) - u
+                uv = torch.stack([u, v], dim=-1)
+
+            feats_2d = sample_img_feat(feat_map, uv, valid, align_corners=False)
+            if self._capture_point_dino and frame_i is not None:
+                try:
+                    feats_dev = feats_2d.to(device=xyz_train.device)
+                    valid_dev = valid.to(device=xyz_train.device) if torch.is_tensor(valid) else valid
+                    self._point_dino_cache[(int(frame_i), int(b_idx))] = (feats_dev, valid_dev)
+                except Exception:
+                    pass
+
+            coords: torch.Tensor
+            used_src = 'xyz_train'
+            if elastic_coords is not None and b_idx < len(elastic_coords) and elastic_coords[b_idx] is not None:
+                try:
+                    e = elastic_coords[b_idx]
+                    if torch.is_tensor(e):
+                        e_t = e.to(device=xyz_train.device, dtype=xyz_train.dtype)
+                    else:
+                        e_t = torch.as_tensor(e, device=xyz_train.device, dtype=xyz_train.dtype)
+                    coords = torch.floor(e_t).to(torch.int32)
+                    used_src = 'elastic'
+                except Exception:
+                    coords = (xyz_train / self.voxel_size).floor().to(torch.int32)
+            else:
+                coords = (xyz_train / self.voxel_size).floor().to(torch.int32)
+            batch_col = torch.full(
+                (coords.shape[0], 1), b_idx, dtype=torch.int32, device=coords.device)
+            coords_batched = torch.cat([batch_col, coords], dim=1)
+
+            coords_list.append(coords_batched)
+            feats_list.append(feats_2d.to(device=coords.device))
+            coords_sources.append(used_src)
+            skip_reasons.append(skip_reason)
+
+        if not coords_list:
+            self._last_dino_valid_rate = None  # type: ignore[attr-defined]
+            self._last_dino_valid_rate_per_sample = []  # type: ignore[attr-defined]
+            self._last_dino_coords_source = []  # type: ignore[attr-defined]
+            if getattr(self, 'dino_require', False):
+                raise RuntimeError(f"[DINO][strict] build_dino_fpn_online produced empty coords_list; reasons={skip_reasons}")
+            return None
+
+        if total_counts and sum(total_counts) > 0:
+            total_points = float(sum(total_counts))
+            total_valid = float(sum(valid_counts))
+            valid_rate = total_valid / total_points
+            per_sample_rates = [
+                (float(v) / float(t)) if t > 0 else 0.0
+                for v, t in zip(valid_counts, total_counts)
+            ]
+            self._last_dino_valid_rate = valid_rate  # type: ignore[attr-defined]
+            self._last_dino_valid_rate_per_sample = per_sample_rates  # type: ignore[attr-defined]
+            if getattr(self, "_dino_debug", False):
+                if not hasattr(self, "_dino_valid_log_count"):
+                    self._dino_valid_log_count = 0
+                if self._dino_valid_log_count < 5:
+                    try:
+                        frame_tag = f" frame={frame_i}" if frame_i is not None else ""
+                        print(
+                            f"[DINO][valid_rate]{frame_tag} rate={valid_rate:.4f} "
+                            f"per_sample={per_sample_rates}"
+                        )
+                    except Exception:
+                        pass
+                    self._dino_valid_log_count += 1
+        else:
+            self._last_dino_valid_rate = None  # type: ignore[attr-defined]
+            self._last_dino_valid_rate_per_sample = []  # type: ignore[attr-defined]
+
+        self._last_dino_coords_source = coords_sources  # type: ignore[attr-defined]
+
+        coords_batch = torch.cat(coords_list, dim=0)
+        feats_batch = torch.cat(feats_list, dim=0)
+        return build_sparse_fpn(coords_batch, feats_batch)
     
     def _select_queries(self, x: List[Any], gt_instances: List[Any], sp_xyz: Optional[List[Any]] = None, frame_i: int = 0) -> Tuple[List[Any], List[Any], List[Any]]:  # type: ignore[override]
         """Select queries for train pass.
@@ -2061,12 +2755,20 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         assert len(batch_data_samples) == 1
         results, query_feats_list, sem_preds_list, sp_xyz_list, bboxes_list, cls_preds_list = [], [], [], [], [], []
         num_frames = batch_inputs_dict['points'][0].shape[0]
+
+        # Per-scene caches/side outputs (robustness: avoid cross-scene leakage).
+        try:
+            if isinstance(getattr(self, "_point_dino_cache", None), dict):
+                self._point_dino_cache.clear()
+        except Exception:
+            pass
         
         # Initialize variables that may be used later
         mv_mask, mv_labels, mv_scores, mv_bboxes = None, None, None, None
         mv_mask2, mv_labels2, mv_scores2 = None, None, None
         mv_queries = None
         online_merger = None
+        mv_sem_labels = mv_sem_confs = mv_bg_confs = None
 
         # Optional: online behavior monitoring (per-frame matched/birth/memory stats).
         online_monitor_cfg = self.test_cfg.get('online_monitor', None) or {}
@@ -2116,6 +2818,29 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         baseline_stats = None
         gt_seen_ids = set()
         bs_gt_vis_npoint = int(bs_cfg.get('gt_vis_npoint', 100)) if bs_enable else 100
+        # Optional: track-geometry diagnostics (matrix outputs, GT-aware).
+        geom_cfg = self.test_cfg.get('track_geom_diag', None) or {}
+        geom_enable = bool(geom_cfg.get('enable', False))
+        geom_scene_allowlist = geom_cfg.get('scene_allowlist', None)
+        geom_scene_id = None
+        if geom_enable:
+            meta = getattr(batch_data_samples[0], 'img_metas', None)
+            if not isinstance(meta, dict):
+                try:
+                    meta = batch_data_samples[0].metainfo
+                except Exception:
+                    meta = {}
+            geom_scene_id = (
+                meta.get('scene_id', None)
+                or meta.get('scan_id', None)
+                or meta.get('lidar_idx', None)
+                or meta.get('sample_idx', None)
+                or meta.get('ann_file', None)
+                or meta.get('pts_filename', None)
+                or 'unknown'
+            )
+            if isinstance(geom_scene_allowlist, (list, tuple)) and geom_scene_id not in geom_scene_allowlist:
+                geom_enable = False
         if bs_enable:
             meta = getattr(batch_data_samples[0], 'img_metas', None)
             if not isinstance(meta, dict):
@@ -2156,12 +2881,28 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         for frame_i in range(num_frames):
             ## Backbone
             x, point_features, all_xyz_w, sp_xyz = self.extract_feat(batch_inputs_dict, batch_data_samples, frame_i)
+            # Cache superpoint features for optional per-instance 3D pooling (before decoder overwrites `x`).
+            sp_feats_frame = None
+            try:
+                if isinstance(x, (list, tuple)) and len(x) > 0 and torch.is_tensor(x[0]):
+                    sp_feats_frame = x[0]
+                elif torch.is_tensor(x):
+                    sp_feats_frame = x
+            except Exception:
+                sp_feats_frame = None
             ## Decoder
             super_points = ([bds.gt_pts_seg.sp_pts_mask[frame_i] for bds in batch_data_samples], all_xyz_w)
             x = self.decoder(x=x, queries=x, sp_feats=x, p_feats=point_features, super_points=super_points)
             ## Post-processing
             gt_inst_frame = None
-            if bs_enable:
+            need_gt_for_rescue = False
+            try:
+                rescue_cfg0 = self.test_cfg.get('many_to_one_rescue', None) or {}
+                if isinstance(rescue_cfg0, dict) and bool(rescue_cfg0.get("monitor_gt", False)):
+                    need_gt_for_rescue = True
+            except Exception:
+                need_gt_for_rescue = False
+            if bs_enable or geom_enable or need_gt_for_rescue:
                 try:
                     gt_inst_frame = batch_data_samples[0].gt_pts_seg.pts_instance_mask[frame_i]
                 except Exception:
@@ -2249,6 +2990,11 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         self.use_bbox,
                         absorb_cfg=(self.test_cfg.get('many_to_one_absorb', None) or {}),
                         support_cfg=(self.test_cfg.get('one_to_many_support', None) or {}),
+                        rescue_cfg=(self.test_cfg.get('many_to_one_rescue', None) or {}),
+                        birth_cfg=(self.test_cfg.get('birth_filter', None) or {}),
+                        dedup_cfg=(self.test_cfg.get('track_dedup', None) or {}),
+                        track_feat_cfg=(self.test_cfg.get('track_features', None) or {}),
+                        geom_diag_cfg=(self.test_cfg.get('track_geom_diag', None) or {}),
                         monitor=(online_monitor_enable or bs_record_online),
                     )
                 if online_merger is not None:
@@ -2261,6 +3007,496 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     except Exception:
                         inst_select_scores = inst_scores
 
+                    # Optional: pre-inst_thr pool for rescue (L pool comes from pre_pool_low_mask).
+                    rescue_cfg = self.test_cfg.get('many_to_one_rescue', None) or {}
+                    rescue_pool_masks = rescue_pool_scores = rescue_pool_select_scores = None
+                    rescue_pool_labels = rescue_pool_queries = None
+                    rescue_pool_npoints = None
+                    try:
+                        pre_pool_masks = results[-1].pop('rescue_pre_pool_masks')[0]
+                        pre_pool_scores = results[-1].pop('rescue_pre_pool_scores')[0]
+                        pre_pool_select_scores = results[-1].pop('rescue_pre_pool_select_scores')[0]
+                        pre_pool_labels = results[-1].pop('rescue_pre_pool_labels')[0]
+                        pre_pool_queries = results[-1].pop('rescue_pre_pool_queries')[0]
+                        pre_pool_low_mask = results[-1].pop('rescue_pre_pool_low_mask')[0]
+                        pre_pool_npoints = results[-1].pop('rescue_pre_pool_npoints')[0]
+                    except Exception:
+                        pre_pool_masks = pre_pool_scores = pre_pool_select_scores = None
+                        pre_pool_labels = pre_pool_queries = None
+                        pre_pool_low_mask = pre_pool_npoints = None
+
+                    try:
+                        use_pre_pool = bool(rescue_cfg.get("use_pre_pool", False))
+                    except Exception:
+                        use_pre_pool = False
+                    if use_pre_pool and torch.is_tensor(pre_pool_masks) and torch.is_tensor(pre_pool_low_mask):
+                        try:
+                            low_idx = torch.nonzero(pre_pool_low_mask, as_tuple=False).reshape(-1)
+                            # Optional safety lower bounds for L pool.
+                            l_min_score = float(rescue_cfg.get("pre_pool_min_score", -1.0))
+                            l_min_pts = int(rescue_cfg.get("pre_pool_min_points", 0))
+                            l_max_num = int(rescue_cfg.get("pre_pool_max_num", 0))
+                            l_sort_by = str(rescue_cfg.get("pre_pool_sort_by", "select_scores"))
+                            if l_sort_by not in ("scores", "select_scores"):
+                                l_sort_by = "select_scores"
+
+                            if low_idx.numel() > 0:
+                                # Apply optional bounds.
+                                if l_min_score >= 0 and torch.is_tensor(pre_pool_scores):
+                                    low_idx = low_idx[pre_pool_scores[low_idx] >= float(l_min_score)]
+                                if l_min_pts > 0 and torch.is_tensor(pre_pool_npoints):
+                                    low_idx = low_idx[pre_pool_npoints[low_idx] >= int(l_min_pts)]
+
+                            if low_idx.numel() > 0:
+                                # Sort and cap.
+                                if l_max_num > 0 and low_idx.numel() > l_max_num:
+                                    key = pre_pool_select_scores if (l_sort_by == "select_scores" and torch.is_tensor(pre_pool_select_scores)) else pre_pool_scores
+                                    if torch.is_tensor(key):
+                                        order = torch.argsort(key[low_idx], descending=True)
+                                        low_idx = low_idx[order[:l_max_num]]
+
+                                rescue_pool_masks = pre_pool_masks[low_idx]
+                                rescue_pool_scores = pre_pool_scores[low_idx] if torch.is_tensor(pre_pool_scores) else None
+                                rescue_pool_select_scores = pre_pool_select_scores[low_idx] if torch.is_tensor(pre_pool_select_scores) else None
+                                rescue_pool_labels = pre_pool_labels[low_idx] if torch.is_tensor(pre_pool_labels) else None
+                                rescue_pool_queries = pre_pool_queries[low_idx] if torch.is_tensor(pre_pool_queries) else None
+                                rescue_pool_npoints = pre_pool_npoints[low_idx] if torch.is_tensor(pre_pool_npoints) else None
+                        except Exception:
+                            rescue_pool_masks = rescue_pool_scores = rescue_pool_select_scores = None
+                            rescue_pool_labels = rescue_pool_queries = None
+                            rescue_pool_npoints = None
+
+                    # Optional: geometry diagnostics inputs (det_gt / det_voxels).
+                    det_gt = det_gt_conf = det_gt_inter = det_gt_size = det_gt_nvalid = det_voxels = None
+                    # det_voxels may be required by other online modules (e.g., rescue writes),
+                    # even when full geom diagnostics are disabled.
+                    dedup_cfg = self.test_cfg.get('track_dedup', None) or {}
+                    need_det_gt = False
+                    geom_active = bool(geom_enable)
+                    if geom_active:
+                        try:
+                            frame_allowlist = geom_cfg.get("frame_allowlist", None)
+                        except Exception:
+                            frame_allowlist = None
+                        try:
+                            frame_stride = int(geom_cfg.get("frame_stride", 1))
+                        except Exception:
+                            frame_stride = 1
+                        if isinstance(frame_allowlist, (list, tuple)) and frame_i not in frame_allowlist:
+                            geom_active = False
+                        if frame_stride > 1 and (frame_i % frame_stride) != 0:
+                            geom_active = False
+                        if gt_inst_frame is None:
+                            geom_active = False
+                    # Rescue-only GT monitoring (no full geom diag needed).
+                    try:
+                        if isinstance(rescue_cfg, dict) and bool(rescue_cfg.get("monitor_gt", False)):
+                            need_det_gt = True
+                    except Exception:
+                        need_det_gt = False
+                    need_det_gt = bool(geom_active) or bool(need_det_gt)
+                    rescue_gt = rescue_gt_conf = rescue_gt_inter = rescue_gt_size = rescue_gt_nvalid = None
+                    if geom_active:
+                        try:
+                            gt_inst = gt_inst_frame
+                            if not torch.is_tensor(gt_inst):
+                                gt_inst = torch.as_tensor(gt_inst)
+                            gt_inst = gt_inst.reshape(-1).to(device=inst_masks.device)
+                            # Per-GT sizes in this frame (for coverage/IoU estimates).
+                            gt_valid = gt_inst[gt_inst >= 0]
+                            gt_size_map = {}
+                            if gt_valid.numel() > 0:
+                                uniq_all, cnt_all = torch.unique(gt_valid, return_counts=True)
+                                for u, c in zip(uniq_all.detach().cpu().tolist(), cnt_all.detach().cpu().tolist()):
+                                    gt_size_map[int(u)] = int(c)
+                            det_gt_list = []
+                            det_conf_list = []
+                            det_inter_list = []
+                            det_size_list = []
+                            det_nvalid_list = []
+                            for di in range(int(inst_masks.shape[0])):
+                                m = inst_masks[di]
+                                ids = gt_inst[m]
+                                ids = ids[ids >= 0]
+                                if ids.numel() == 0:
+                                    det_gt_list.append(-1)
+                                    det_conf_list.append(0.0)
+                                    det_inter_list.append(0)
+                                    det_size_list.append(0)
+                                    det_nvalid_list.append(0)
+                                else:
+                                    uniq, cnt = torch.unique(ids, return_counts=True)
+                                    mi = int(torch.argmax(cnt).item())
+                                    gid = int(uniq[mi].item())
+                                    inter = int(cnt[mi].item())
+                                    nvalid = int(ids.numel())
+                                    det_gt_list.append(gid)
+                                    det_conf_list.append(float(inter) / float(nvalid + 1e-6))
+                                    det_inter_list.append(inter)
+                                    det_size_list.append(int(gt_size_map.get(gid, 0)))
+                                    det_nvalid_list.append(nvalid)
+                            det_gt = torch.as_tensor(det_gt_list, device=inst_masks.device, dtype=torch.long)
+                            det_gt_conf = torch.as_tensor(det_conf_list, device=inst_masks.device, dtype=torch.float32)
+                            det_gt_inter = torch.as_tensor(det_inter_list, device=inst_masks.device, dtype=torch.long)
+                            det_gt_size = torch.as_tensor(det_size_list, device=inst_masks.device, dtype=torch.long)
+                            det_gt_nvalid = torch.as_tensor(det_nvalid_list, device=inst_masks.device, dtype=torch.long)
+                        except Exception:
+                            det_gt = det_gt_conf = det_gt_inter = det_gt_size = det_gt_nvalid = None
+                        # Rescue pool GT portrait (optional).
+                        try:
+                            if torch.is_tensor(rescue_pool_masks) and rescue_pool_masks.numel() > 0:
+                                r_gt_list = []
+                                r_conf_list = []
+                                r_inter_list = []
+                                r_size_list = []
+                                r_nvalid_list = []
+                                for di in range(int(rescue_pool_masks.shape[0])):
+                                    m = rescue_pool_masks[di]
+                                    ids = gt_inst[m]
+                                    ids = ids[ids >= 0]
+                                    if ids.numel() == 0:
+                                        r_gt_list.append(-1)
+                                        r_conf_list.append(0.0)
+                                        r_inter_list.append(0)
+                                        r_size_list.append(0)
+                                        r_nvalid_list.append(0)
+                                    else:
+                                        uniq, cnt = torch.unique(ids, return_counts=True)
+                                        mi = int(torch.argmax(cnt).item())
+                                        gid = int(uniq[mi].item())
+                                        inter = int(cnt[mi].item())
+                                        nvalid = int(ids.numel())
+                                        r_gt_list.append(gid)
+                                        r_conf_list.append(float(inter) / float(nvalid + 1e-6))
+                                        r_inter_list.append(inter)
+                                        r_size_list.append(int(gt_size_map.get(gid, 0)))
+                                        r_nvalid_list.append(nvalid)
+                                rescue_gt = torch.as_tensor(r_gt_list, device=inst_masks.device, dtype=torch.long)
+                                rescue_gt_conf = torch.as_tensor(r_conf_list, device=inst_masks.device, dtype=torch.float32)
+                                rescue_gt_inter = torch.as_tensor(r_inter_list, device=inst_masks.device, dtype=torch.long)
+                                rescue_gt_size = torch.as_tensor(r_size_list, device=inst_masks.device, dtype=torch.long)
+                                rescue_gt_nvalid = torch.as_tensor(r_nvalid_list, device=inst_masks.device, dtype=torch.long)
+                        except Exception:
+                            rescue_gt = rescue_gt_conf = rescue_gt_inter = rescue_gt_size = rescue_gt_nvalid = None
+                    elif need_det_gt and gt_inst_frame is not None:
+                        try:
+                            gt_inst = gt_inst_frame
+                            if not torch.is_tensor(gt_inst):
+                                gt_inst = torch.as_tensor(gt_inst)
+                            gt_inst = gt_inst.reshape(-1).to(device=inst_masks.device)
+                            gt_valid = gt_inst[gt_inst >= 0]
+                            gt_size_map = {}
+                            if gt_valid.numel() > 0:
+                                uniq_all, cnt_all = torch.unique(gt_valid, return_counts=True)
+                                for u, c in zip(uniq_all.detach().cpu().tolist(), cnt_all.detach().cpu().tolist()):
+                                    gt_size_map[int(u)] = int(c)
+                            det_gt_list = []
+                            det_conf_list = []
+                            det_inter_list = []
+                            det_size_list = []
+                            det_nvalid_list = []
+                            for di in range(int(inst_masks.shape[0])):
+                                m = inst_masks[di]
+                                ids = gt_inst[m]
+                                ids = ids[ids >= 0]
+                                if ids.numel() == 0:
+                                    det_gt_list.append(-1)
+                                    det_conf_list.append(0.0)
+                                    det_inter_list.append(0)
+                                    det_size_list.append(0)
+                                    det_nvalid_list.append(0)
+                                else:
+                                    uniq, cnt = torch.unique(ids, return_counts=True)
+                                    mi = int(torch.argmax(cnt).item())
+                                    gid = int(uniq[mi].item())
+                                    inter = int(cnt[mi].item())
+                                    nvalid = int(ids.numel())
+                                    det_gt_list.append(gid)
+                                    det_conf_list.append(float(inter) / float(nvalid + 1e-6))
+                                    det_inter_list.append(inter)
+                                    det_size_list.append(int(gt_size_map.get(gid, 0)))
+                                    det_nvalid_list.append(nvalid)
+                            det_gt = torch.as_tensor(det_gt_list, device=inst_masks.device, dtype=torch.long)
+                            det_gt_conf = torch.as_tensor(det_conf_list, device=inst_masks.device, dtype=torch.float32)
+                            det_gt_inter = torch.as_tensor(det_inter_list, device=inst_masks.device, dtype=torch.long)
+                            det_gt_size = torch.as_tensor(det_size_list, device=inst_masks.device, dtype=torch.long)
+                            det_gt_nvalid = torch.as_tensor(det_nvalid_list, device=inst_masks.device, dtype=torch.long)
+                        except Exception:
+                            det_gt = det_gt_conf = det_gt_inter = det_gt_size = det_gt_nvalid = None
+                        try:
+                            if torch.is_tensor(rescue_pool_masks) and rescue_pool_masks.numel() > 0:
+                                r_gt_list = []
+                                r_conf_list = []
+                                r_inter_list = []
+                                r_size_list = []
+                                r_nvalid_list = []
+                                for di in range(int(rescue_pool_masks.shape[0])):
+                                    m = rescue_pool_masks[di]
+                                    ids = gt_inst[m]
+                                    ids = ids[ids >= 0]
+                                    if ids.numel() == 0:
+                                        r_gt_list.append(-1)
+                                        r_conf_list.append(0.0)
+                                        r_inter_list.append(0)
+                                        r_size_list.append(0)
+                                        r_nvalid_list.append(0)
+                                    else:
+                                        uniq, cnt = torch.unique(ids, return_counts=True)
+                                        mi = int(torch.argmax(cnt).item())
+                                        gid = int(uniq[mi].item())
+                                        inter = int(cnt[mi].item())
+                                        nvalid = int(ids.numel())
+                                        r_gt_list.append(gid)
+                                        r_conf_list.append(float(inter) / float(nvalid + 1e-6))
+                                        r_inter_list.append(inter)
+                                        r_size_list.append(int(gt_size_map.get(gid, 0)))
+                                        r_nvalid_list.append(nvalid)
+                                rescue_gt = torch.as_tensor(r_gt_list, device=inst_masks.device, dtype=torch.long)
+                                rescue_gt_conf = torch.as_tensor(r_conf_list, device=inst_masks.device, dtype=torch.float32)
+                                rescue_gt_inter = torch.as_tensor(r_inter_list, device=inst_masks.device, dtype=torch.long)
+                                rescue_gt_size = torch.as_tensor(r_size_list, device=inst_masks.device, dtype=torch.long)
+                                rescue_gt_nvalid = torch.as_tensor(r_nvalid_list, device=inst_masks.device, dtype=torch.long)
+                        except Exception:
+                            rescue_gt = rescue_gt_conf = rescue_gt_inter = rescue_gt_size = rescue_gt_nvalid = None
+                    # Build det_voxels (world coords) if any downstream module requests it.
+                    need_det_voxels = bool(geom_active) or (
+                        isinstance(rescue_cfg, dict) and bool(rescue_cfg.get("enable", False))
+                    ) or (isinstance(dedup_cfg, dict) and bool(dedup_cfg.get("enable", False)))
+                    rescue_voxels = None
+                    if need_det_voxels:
+                        try:
+                            pts_world = batch_inputs_dict["points"][0][frame_i, :, :3]
+                            if not torch.is_tensor(pts_world):
+                                pts_world = torch.as_tensor(pts_world)
+                            pts_world = pts_world.to(device=inst_masks.device)
+                            vox_size = float(
+                                (rescue_cfg.get("voxel_size", None) if isinstance(rescue_cfg, dict) else None)
+                                or (dedup_cfg.get("voxel_size", None) if isinstance(dedup_cfg, dict) else None)
+                                or geom_cfg.get("voxel_size", self.voxel_size)
+                            )
+                            vox = torch.floor(pts_world / float(vox_size)).to(torch.int64)
+                            base = int(geom_cfg.get("voxel_hash_base", 200000))
+                            offset = int(geom_cfg.get("voxel_hash_offset", 100000))
+                            h = (vox[:, 0] + offset) * (base * base) + (vox[:, 1] + offset) * base + (vox[:, 2] + offset)
+                            cap = int(
+                                (rescue_cfg.get("V_det_cap", None) if isinstance(rescue_cfg, dict) else None)
+                                or (dedup_cfg.get("V_det_cap", None) if isinstance(dedup_cfg, dict) else None)
+                                or geom_cfg.get("V_det_cap", 512)
+                            )
+                            det_voxels = []
+                            for di in range(int(inst_masks.shape[0])):
+                                m = inst_masks[di]
+                                v = h[m]
+                                if v.numel() == 0:
+                                    det_voxels.append(v)
+                                    continue
+                                v = torch.unique(v)
+                                if cap > 0 and v.numel() > cap:
+                                    v = v[:cap]
+                                det_voxels.append(v)
+                            if torch.is_tensor(rescue_pool_masks) and rescue_pool_masks.numel() > 0:
+                                rescue_voxels = []
+                                for di in range(int(rescue_pool_masks.shape[0])):
+                                    m = rescue_pool_masks[di]
+                                    v = h[m]
+                                    if v.numel() == 0:
+                                        rescue_voxels.append(v)
+                                        continue
+                                    v = torch.unique(v)
+                                    if cap > 0 and v.numel() > cap:
+                                        v = v[:cap]
+                                    rescue_voxels.append(v)
+                        except Exception:
+                            det_voxels = None
+                            rescue_voxels = None
+
+                    # Optional: per-detection 3D pooled features (instance-level pooling from superpoints).
+                    det_feat3d = None
+                    rescue_feat3d = None
+                    try:
+                        tf = self.test_cfg.get("track_features", None) or {}
+                        f3d_cfg = tf.get("feat3d", {}) if isinstance(tf, dict) else {}
+                        if isinstance(f3d_cfg, dict) and bool(f3d_cfg.get("enable", False)):
+                            if sp_feats_frame is not None and torch.is_tensor(inst_masks) and inst_masks.numel() > 0:
+                                sp_feats = sp_feats_frame.to(device=inst_masks.device)
+                                sp_idx = batch_data_samples[0].gt_pts_seg.sp_pts_mask[frame_i]
+                                if not torch.is_tensor(sp_idx):
+                                    sp_idx = torch.as_tensor(sp_idx)
+                                sp_idx = sp_idx.to(device=inst_masks.device)
+                                if sp_idx.dtype != torch.long:
+                                    sp_idx = sp_idx.long()
+                                sp_idx = sp_idx.clamp_min(0)
+                                min_valid_points = int(f3d_cfg.get("min_valid_points", 30))
+                                normalize = bool(f3d_cfg.get("normalize", True))
+                                det_list = []
+                                for mi in range(int(inst_masks.shape[0])):
+                                    sel = inst_masks[mi]
+                                    nsel = int(sel.sum().item()) if torch.is_tensor(sel) else 0
+                                    if nsel < min_valid_points:
+                                        det_list.append(torch.zeros((int(sp_feats.shape[1]),), device=sp_feats.device, dtype=sp_feats.dtype))
+                                        continue
+                                    sp_in = sp_idx[sel]
+                                    # Filter invalid indices (robustness).
+                                    sp_in = sp_in[(sp_in >= 0) & (sp_in < sp_feats.shape[0])]
+                                    if sp_in.numel() == 0:
+                                        det_list.append(torch.zeros((int(sp_feats.shape[1]),), device=sp_feats.device, dtype=sp_feats.dtype))
+                                        continue
+                                    uniq, cnt = torch.unique(sp_in, return_counts=True)
+                                    w = cnt.to(torch.float32).to(device=sp_feats.device).unsqueeze(1)
+                                    feat = (sp_feats[uniq] * w).sum(dim=0) / (w.sum() + 1e-6)
+                                    if normalize:
+                                        feat = torch.nn.functional.normalize(feat, dim=0, eps=1e-6)
+                                    det_list.append(feat)
+                                det_feat3d = torch.stack(det_list, dim=0) if det_list else None
+                                # Pool for rescue pre-pool candidates (if any).
+                                if torch.is_tensor(rescue_pool_masks) and rescue_pool_masks.numel() > 0:
+                                    det_list = []
+                                    for mi in range(int(rescue_pool_masks.shape[0])):
+                                        sel = rescue_pool_masks[mi]
+                                        nsel = int(sel.sum().item()) if torch.is_tensor(sel) else 0
+                                        if nsel < min_valid_points:
+                                            det_list.append(torch.zeros((int(sp_feats.shape[1]),), device=sp_feats.device, dtype=sp_feats.dtype))
+                                            continue
+                                        sp_in = sp_idx[sel]
+                                        sp_in = sp_in[(sp_in >= 0) & (sp_in < sp_feats.shape[0])]
+                                        if sp_in.numel() == 0:
+                                            det_list.append(torch.zeros((int(sp_feats.shape[1]),), device=sp_feats.device, dtype=sp_feats.dtype))
+                                            continue
+                                        uniq, cnt = torch.unique(sp_in, return_counts=True)
+                                        w = cnt.to(torch.float32).to(device=sp_feats.device).unsqueeze(1)
+                                        feat = (sp_feats[uniq] * w).sum(dim=0) / (w.sum() + 1e-6)
+                                        if normalize:
+                                            feat = torch.nn.functional.normalize(feat, dim=0, eps=1e-6)
+                                        det_list.append(feat)
+                                    rescue_feat3d = torch.stack(det_list, dim=0) if det_list else None
+                    except Exception:
+                        det_feat3d = None
+                        rescue_feat3d = None
+
+                    # Optional: per-detection DINO features (instance-level pooling from per-point DINO).
+                    det_dino_feats = None
+                    rescue_dino_feats = None
+                    try:
+                        tf = self.test_cfg.get("track_features", None) or {}
+                        dino_cfg = tf.get("dino", {}) if isinstance(tf, dict) else {}
+                        if isinstance(dino_cfg, dict) and bool(dino_cfg.get("enable", False)):
+                            pool_type = str(dino_cfg.get("pool", "geoaware_sp")).lower()
+                            out_dim = int(dino_cfg.get("out_dim", 256))
+                            use_valid = bool(dino_cfg.get("use_valid_mask", True))
+                            min_valid_points = int(dino_cfg.get("min_valid_points", 30))
+
+                            # Fetch per-point features for this frame/sample (bypass output).
+                            pts = batch_inputs_dict["points"][0]
+                            xyz = pts[frame_i, :, :3]
+                            if "elastic_coords" in batch_inputs_dict:
+                                try:
+                                    xyz = batch_inputs_dict["elastic_coords"][0][frame_i] * float(self.voxel_size)
+                                except Exception:
+                                    pass
+                            sp_ids = batch_data_samples[0].gt_pts_seg.sp_pts_mask[frame_i]
+
+                            pt_feats, pt_valid = self._get_point_dino_feats(
+                                batch_inputs_dict, frame_i=int(frame_i), b_idx=0, device=xyz.device
+                            )
+                            if pt_feats is not None and torch.is_tensor(inst_masks) and inst_masks.numel() > 0:
+                                # Initialize pool module lazily.
+                                if pool_type == "geoaware_sp":
+                                    if self._dino_inst_pool is None:
+                                        self._dino_inst_pool = MODELS.build(
+                                            dict(type="GeoAwarePooling", channel_proj=int(out_dim))
+                                        )
+                                    # Ensure module lives on the same device as point features.
+                                    try:
+                                        self._dino_inst_pool = self._dino_inst_pool.to(device=xyz.device)
+                                    except Exception:
+                                        pass
+
+                                    # Pool point feats -> superpoint feats.
+                                    sp_idx = sp_ids.to(device=xyz.device)
+                                    if sp_idx.dtype != torch.long:
+                                        sp_idx = sp_idx.long()
+                                    sp_idx = sp_idx.clamp_min(0)
+                                    if use_valid and pt_valid is not None:
+                                        # Keep invalid points but they carry no signal; this is safer than changing indices.
+                                        pt_feats_use = pt_feats
+                                        pt_valid_use = pt_valid.to(device=pt_feats.device)
+                                    else:
+                                        pt_feats_use = pt_feats
+                                        pt_valid_use = None
+
+                                    sp_feats, _ = self._dino_inst_pool(pt_feats_use, sp_idx, [xyz], with_xyz=False)
+                                    det_list = []
+                                    for mi in range(int(inst_masks.shape[0])):
+                                        sel = inst_masks[mi]
+                                        if use_valid and pt_valid_use is not None and pt_valid_use.numel() == sel.numel():
+                                            sel = sel & pt_valid_use
+                                        nsel = int(sel.sum().item()) if torch.is_tensor(sel) else 0
+                                        if nsel < min_valid_points:
+                                            det_list.append(torch.zeros((out_dim,), device=xyz.device, dtype=sp_feats.dtype))
+                                            continue
+                                        sp_in = sp_idx[sel]
+                                        uniq, cnt = torch.unique(sp_in, return_counts=True)
+                                        w = cnt.to(torch.float32).to(device=sp_feats.device).unsqueeze(1)
+                                        feat = (sp_feats[uniq] * w).sum(dim=0) / (w.sum() + 1e-6)
+                                        if bool(dino_cfg.get("normalize", True)):
+                                            feat = torch.nn.functional.normalize(feat, dim=0, eps=1e-6)
+                                        det_list.append(feat)
+                                    det_dino_feats = torch.stack(det_list, dim=0) if det_list else None
+                                    if torch.is_tensor(rescue_pool_masks) and rescue_pool_masks.numel() > 0:
+                                        det_list = []
+                                        for mi in range(int(rescue_pool_masks.shape[0])):
+                                            sel = rescue_pool_masks[mi]
+                                            if use_valid and pt_valid_use is not None and pt_valid_use.numel() == sel.numel():
+                                                sel = sel & pt_valid_use
+                                            nsel = int(sel.sum().item()) if torch.is_tensor(sel) else 0
+                                            if nsel < min_valid_points:
+                                                det_list.append(torch.zeros((out_dim,), device=xyz.device, dtype=sp_feats.dtype))
+                                                continue
+                                            sp_in = sp_idx[sel]
+                                            uniq, cnt = torch.unique(sp_in, return_counts=True)
+                                            w = cnt.to(torch.float32).to(device=sp_feats.device).unsqueeze(1)
+                                            feat = (sp_feats[uniq] * w).sum(dim=0) / (w.sum() + 1e-6)
+                                            if bool(dino_cfg.get("normalize", True)):
+                                                feat = torch.nn.functional.normalize(feat, dim=0, eps=1e-6)
+                                            det_list.append(feat)
+                                        rescue_dino_feats = torch.stack(det_list, dim=0) if det_list else None
+                                else:
+                                    # Minimal fallback: masked mean over point features.
+                                    det_list = []
+                                    valid_mask = pt_valid if (use_valid and pt_valid is not None) else None
+                                    for mi in range(int(inst_masks.shape[0])):
+                                        sel = inst_masks[mi]
+                                        if valid_mask is not None and valid_mask.numel() == sel.numel():
+                                            sel = sel & valid_mask
+                                        nsel = int(sel.sum().item())
+                                        if nsel < min_valid_points:
+                                            det_list.append(torch.zeros((int(pt_feats.shape[1]),), device=pt_feats.device, dtype=pt_feats.dtype))
+                                            continue
+                                        feat = pt_feats[sel].mean(dim=0)
+                                        if bool(dino_cfg.get("normalize", True)):
+                                            feat = torch.nn.functional.normalize(feat, dim=0, eps=1e-6)
+                                        det_list.append(feat)
+                                    det_dino_feats = torch.stack(det_list, dim=0) if det_list else None
+                                    if torch.is_tensor(rescue_pool_masks) and rescue_pool_masks.numel() > 0:
+                                        det_list = []
+                                        valid_mask = pt_valid if (use_valid and pt_valid is not None) else None
+                                        for mi in range(int(rescue_pool_masks.shape[0])):
+                                            sel = rescue_pool_masks[mi]
+                                            if valid_mask is not None and valid_mask.numel() == sel.numel():
+                                                sel = sel & valid_mask
+                                            nsel = int(sel.sum().item())
+                                            if nsel < min_valid_points:
+                                                det_list.append(torch.zeros((int(pt_feats.shape[1]),), device=pt_feats.device, dtype=pt_feats.dtype))
+                                                continue
+                                            feat = pt_feats[sel].mean(dim=0)
+                                            if bool(dino_cfg.get("normalize", True)):
+                                                feat = torch.nn.functional.normalize(feat, dim=0, eps=1e-6)
+                                            det_list.append(feat)
+                                        rescue_dino_feats = torch.stack(det_list, dim=0) if det_list else None
+                    except Exception:
+                        det_dino_feats = None
+                        rescue_dino_feats = None
+
                     mv_mask, mv_labels, mv_scores, mv_queries, mv_bboxes = online_merger.merge(
                         inst_masks,
                         inst_labels,
@@ -2269,8 +3505,31 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                         query_feats_list.pop(-1)[0],
                         sem_preds_list.pop(-1)[0],
                         sp_xyz_list.pop(-1)[0],
-                        bboxes_list.pop(-1)[0] if self.use_bbox else None)
+                        bboxes_list.pop(-1)[0] if self.use_bbox else None,
+                        det_dino_feats=det_dino_feats,
+                        det_feat3d=det_feat3d,
+                        det_gt=det_gt,
+                        det_gt_conf=det_gt_conf,
+                        det_gt_inter=det_gt_inter,
+                        det_gt_size=det_gt_size,
+                        det_gt_nvalid=det_gt_nvalid,
+                        det_voxels=det_voxels,
+                        rescue_masks=rescue_pool_masks,
+                        rescue_scores=rescue_pool_scores,
+                        rescue_dino_feats=rescue_dino_feats,
+                        rescue_feat3d=rescue_feat3d,
+                        rescue_gt=rescue_gt,
+                        rescue_gt_conf=rescue_gt_conf,
+                        rescue_gt_inter=rescue_gt_inter,
+                        rescue_gt_size=rescue_gt_size,
+                        rescue_gt_nvalid=rescue_gt_nvalid,
+                        rescue_voxels=rescue_voxels,
+                        frame_i=int(frame_i),
+                    )
                     mv_track_ids = getattr(online_merger, "output_track_ids", None)
+                    mv_sem_labels = getattr(online_merger, "output_sem_labels", None)
+                    mv_sem_confs = getattr(online_merger, "output_sem_confs", None)
+                    mv_bg_confs = getattr(online_merger, "output_bg_confs", None)
 
                     # Attach online merge stats to baseline stats (same frame).
                     if bs_enable and baseline_stats is not None and baseline_stats.get("frames") and isinstance(getattr(online_merger, "last_stats", None), dict):
@@ -2300,6 +3559,41 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     # Empty cache. Only offline merging requires the whole list.
                     torch.cuda.empty_cache()
                     if frame_i == num_frames - 1:
+                        # Save GT-aligned geometry diagnostics (det↔track / track↔track matrices).
+                        if geom_enable:
+                            try:
+                                rec = getattr(online_merger, "geom_diag_records", None)
+                                save_empty = bool(geom_cfg.get("save_empty", False))
+                                if isinstance(rec, list) and (rec or save_empty):
+                                    out_dir = str(geom_cfg.get("out_dir", "track_geom_diag"))
+                                    work_dir = str(self.test_cfg.get("work_dir", "work_dirs"))
+                                    save_dir = os.path.join(work_dir, out_dir)
+                                    os.makedirs(save_dir, exist_ok=True)
+                                    if geom_scene_id is None:
+                                        meta = getattr(batch_data_samples[0], 'img_metas', None)
+                                        if not isinstance(meta, dict):
+                                            try:
+                                                meta = batch_data_samples[0].metainfo
+                                            except Exception:
+                                                meta = {}
+                                        geom_scene_id = (
+                                            meta.get('scene_id', None)
+                                            or meta.get('scan_id', None)
+                                            or meta.get('lidar_idx', None)
+                                            or meta.get('sample_idx', None)
+                                            or meta.get('ann_file', None)
+                                            or meta.get('pts_filename', None)
+                                            or 'unknown'
+                                        )
+                                    out_path = os.path.join(save_dir, f"{str(geom_scene_id)}.npz")
+                                    meta_out = {
+                                        "scene_id": str(geom_scene_id),
+                                        "num_frames": int(num_frames),
+                                        "cfg": {k: v for k, v in (geom_cfg.items() if isinstance(geom_cfg, dict) else [])},
+                                    }
+                                    np.savez_compressed(out_path, records=np.array(rec, dtype=object), meta=meta_out)
+                            except Exception as e:
+                                print(f"[geom_diag][warn] save failed: {e}")
                         online_merger.clean() # Ignore panoptic segmentation
         
         ## Offline merging
@@ -2396,6 +3690,16 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     merged_result.instance_track_ids = np.asarray(mv_track_ids, dtype=np.int64)
                 except Exception:
                     merged_result.instance_track_ids = mv_track_ids
+            # Always save semantic top1+confidence (decoder semantic head), independent of CA mode.
+            try:
+                if mv_sem_labels is not None:
+                    merged_result.instance_sem_labels = np.asarray(mv_sem_labels, dtype=np.int64).reshape(-1)
+                if mv_sem_confs is not None:
+                    merged_result.instance_sem_confs = np.asarray(mv_sem_confs, dtype=np.float32).reshape(-1)
+                if mv_bg_confs is not None:
+                    merged_result.instance_bg_confs = np.asarray(mv_bg_confs, dtype=np.float32).reshape(-1)
+            except Exception:
+                pass
             if online_monitor_enable and online_monitor is not None:
                 merged_result.online_monitor = online_monitor
             if bs_enable and baseline_stats is not None:
@@ -2424,6 +3728,16 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                 merged_result.instance_track_ids = np.asarray(mv_track_ids, dtype=np.int64)
             except Exception:
                 merged_result.instance_track_ids = mv_track_ids
+        # Always save semantic top1+confidence (decoder semantic head), independent of CA mode.
+        try:
+            if mv_sem_labels is not None:
+                merged_result.instance_sem_labels = np.asarray(mv_sem_labels, dtype=np.int64).reshape(-1)
+            if mv_sem_confs is not None:
+                merged_result.instance_sem_confs = np.asarray(mv_sem_confs, dtype=np.float32).reshape(-1)
+            if mv_bg_confs is not None:
+                merged_result.instance_bg_confs = np.asarray(mv_bg_confs, dtype=np.float32).reshape(-1)
+        except Exception:
+            pass
         if online_monitor_enable and online_monitor is not None:
             merged_result.online_monitor = online_monitor
         if bs_enable and baseline_stats is not None:
@@ -2487,10 +3801,14 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             List[PointData]: of len 1 with `pts_semantic_mask`,
                 `pts_instance_mask`, `instance_labels`, `instance_scores`.
         """
+        assoc_cfg = self.test_cfg.get('assoc_filter', None) or {}
+        assoc_score_thr = float(assoc_cfg.get('score_thr', self.test_cfg.inst_score_thr))
+        assoc_npoint_thr = int(assoc_cfg.get('npoint_thr', self.test_cfg.npoint_thr))
         inst_res = self.predict_by_feat_instance(
             out,
             superpoints,
-            self.test_cfg.inst_score_thr,
+            assoc_score_thr,
+            npoint_thr=assoc_npoint_thr,
             gt_pts_instance=gt_pts_instance,
             pts_xyz=pts_xyz,
         )
@@ -2499,7 +3817,12 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         sem_map2 = self.predict_by_feat_semantic(
             out, superpoints, self.test_cfg.stuff_classes)
         inst_res2 = self.predict_by_feat_instance(
-            out, superpoints, self.test_cfg.pan_score_thr, pts_xyz=pts_xyz)
+            out,
+            superpoints,
+            self.test_cfg.pan_score_thr,
+            npoint_thr=int(self.test_cfg.npoint_thr),
+            pts_xyz=pts_xyz,
+        )
 
         pts_semantic_mask = [sem_res, sem_map2]
         pts_instance_mask = [inst_res[0].bool(), inst_res2[0].bool()]
@@ -2524,6 +3847,20 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
             pd_kwargs["instance_select_scores"] = instance_select_scores
         if isinstance(inst_res, (tuple, list)) and len(inst_res) > 6 and isinstance(inst_res[6], dict):
             pd_kwargs["instance_stage_stats"] = [inst_res[6]]
+        # Optional: expose pre-inst_thr pool for online rescue (non-serialized tensors).
+        try:
+            if isinstance(inst_res, (tuple, list)) and len(inst_res) > 7 and isinstance(inst_res[7], dict):
+                ex = inst_res[7]
+                if isinstance(ex.get("pre_pool_masks", None), torch.Tensor):
+                    pd_kwargs["rescue_pre_pool_masks"] = [ex.get("pre_pool_masks", None), None]
+                    pd_kwargs["rescue_pre_pool_scores"] = [ex.get("pre_pool_scores", None), None]
+                    pd_kwargs["rescue_pre_pool_select_scores"] = [ex.get("pre_pool_select_scores", None), None]
+                    pd_kwargs["rescue_pre_pool_labels"] = [ex.get("pre_pool_labels", None), None]
+                    pd_kwargs["rescue_pre_pool_queries"] = [ex.get("pre_pool_queries", None), None]
+                    pd_kwargs["rescue_pre_pool_low_mask"] = [ex.get("pre_pool_low_mask", None), None]
+                    pd_kwargs["rescue_pre_pool_npoints"] = [ex.get("pre_pool_npoints", None), None]
+        except Exception:
+            pass
 
         return [PointData(**pd_kwargs)], mapping
     
@@ -2533,9 +3870,10 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         superpoints: Any,
         score_threshold: float,
         *,
+        npoint_thr: Optional[int] = None,
         gt_pts_instance: Optional[torch.Tensor] = None,
         pts_xyz: Optional[torch.Tensor] = None,
-    ) -> Tuple[Any, torch.Tensor, torch.Tensor, Any, torch.Tensor, torch.Tensor, Optional[dict]]:  # type: ignore[override]
+    ) -> Tuple[Any, torch.Tensor, torch.Tensor, Any, torch.Tensor, torch.Tensor, Optional[dict], Optional[dict]]:  # type: ignore[override]
         """Predict instance masks for a single scene.
 
         Args:
@@ -3258,6 +4596,44 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
         # Snapshot masks right before inst_score_thr (post geom_merge, pre inst_thr).
         masks_before_inst_thr_bin = mask_pred
 
+        # Optional: expose pre-inst_thr pool for online rescue (H/L split).
+        rescue_extra = None
+        try:
+            rescue_cfg = self.test_cfg.get("many_to_one_rescue", None) or {}
+            rescue_enable = bool(rescue_cfg.get("enable", False))
+            use_pre_pool = bool(rescue_cfg.get("use_pre_pool", False))
+            apply_to = str(rescue_cfg.get("apply_to", "inst")).lower()
+            if apply_to not in ("inst", "pan", "both"):
+                apply_to = "inst"
+            if rescue_enable and use_pre_pool:
+                inst_thr = float(self.test_cfg.get("inst_score_thr", 0.0))
+                pan_thr = float(self.test_cfg.get("pan_score_thr", 0.0))
+                if apply_to != "both":
+                    if apply_to == "inst" and abs(float(score_threshold) - inst_thr) > 1e-6:
+                        rescue_enable = False
+                    if apply_to == "pan" and abs(float(score_threshold) - pan_thr) > 1e-6:
+                        rescue_enable = False
+                if rescue_enable:
+                    npt_thr_pre = int(self.test_cfg.npoint_thr) if npoint_thr is None else int(npoint_thr)
+                    mask_pointnum_pre = mask_pred.sum(1)
+                    score_mask_pre = scores > score_threshold
+                    npoint_mask_pre = mask_pointnum_pre > npt_thr_pre
+                    # L pool = candidates that would be filtered out by inst_thr or npoint_thr.
+                    pre_pool_low_mask = (~score_mask_pre) | (score_mask_pre & (~npoint_mask_pre))
+                    rescue_extra = {
+                        "pre_pool_masks": masks_before_inst_thr_bin,
+                        "pre_pool_scores": scores,
+                        "pre_pool_select_scores": select_scores,
+                        "pre_pool_labels": labels,
+                        "pre_pool_queries": queries,
+                        "pre_pool_low_mask": pre_pool_low_mask,
+                        "pre_pool_npoints": mask_pointnum_pre,
+                        "pre_pool_inst_thr": float(score_threshold),
+                        "pre_pool_npoint_thr": int(npt_thr_pre),
+                    }
+        except Exception:
+            rescue_extra = None
+
         # score_thr
         score_mask = scores > score_threshold
         if bs_enable:
@@ -3272,8 +4648,8 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
 
         # npoint_thr
         mask_pointnum = mask_pred.sum(1)
-        npoint_thr = int(self.test_cfg.npoint_thr)
-        npoint_mask = mask_pointnum > npoint_thr
+        npt_thr = int(self.test_cfg.npoint_thr) if npoint_thr is None else int(npoint_thr)
+        npoint_mask = mask_pointnum > npt_thr
         if bs_enable and killed_inst_mask_prepool is not None:
             # Expand killed-by-npoint to the original pre-pool indexing.
             killed_npoint_mask_prepool = torch.zeros_like(killed_inst_mask_prepool)
@@ -3625,7 +5001,7 @@ class ScanNet200MixFormer3D_Online(ScanNetOneFormer3DMixin, Base3DDetector):
                     if isinstance(stage_stats["warnings"], list):
                         stage_stats["warnings"].append("gt_diagnostics_failed")
 
-        return mask_pred, labels, scores, queries, mapping, select_scores, stage_stats
+        return mask_pred, labels, scores, queries, mapping, select_scores, stage_stats, rescue_extra
     
     def predict_by_feat_panoptic(self, sem_map: torch.Tensor, mask_pred: torch.Tensor, labels: torch.Tensor, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
         """Predict panoptic masks for a single scene.
@@ -4036,7 +5412,8 @@ class ScanNet200MixFormer3D_Stream(ScanNet200MixFormer3D_Online):
                 query_feats_list.pop(-1)[0],
                 sem_preds_list.pop(-1)[0],
                 sp_xyz_list.pop(-1)[0],
-                bboxes_list.pop(-1)[0] if self.use_bbox else None)
+                bboxes_list.pop(-1)[0] if self.use_bbox else None,
+                det_feat3d=None)
             if online_monitor_enable and online_monitor is not None and isinstance(getattr(self.online_merger, 'last_stats', None), dict):
                 st = dict(self.online_merger.last_stats)  # type: ignore[arg-type]
                 st["frame_i"] = int(st.get("fi", 0))
