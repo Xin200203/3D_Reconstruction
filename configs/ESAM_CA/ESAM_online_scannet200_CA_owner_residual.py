@@ -1,10 +1,10 @@
-# ──────────────────────────────────────────────────────
+# --------------------------------------------------------
 # Experiment: Owner-Residual Query Decomposition (ScanNet200)
-#   baseline  →  ESAM_online_scannet200_CA.py
-#   this      →  shared owner h + role-specific residuals
-#   matching  →  unchanged (OnlineMerge, MergeHead, losses)
-#   start     →  SV checkpoint, stage-2 sequence fine-tune
-# ──────────────────────────────────────────────────────
+#   baseline  -> ESAM_online_scannet200_CA.py
+#   design    -> shared owner h + role-specific residuals
+#   matching  -> unchanged (OnlineMerge, MergeHead, losses)
+#   start     -> SV checkpoint, stage-2 sequence fine-tune
+# --------------------------------------------------------
 
 _base_ = [
     'mmdet3d::_base_/default_runtime.py',
@@ -62,7 +62,7 @@ model = dict(
         fix_attention=True,
         objectness_flag=False,
         bbox_flag=use_bbox,
-        owner_residual=True),  # ← Owner-Residual Query Decomposition
+        owner_residual=True),  # Owner-Residual Query Decomposition
     merge_head=dict(type='MergeHead', in_channels=256, out_channels=256),
     merge_criterion=dict(type='ScanNetMergeCriterion_Fast', tmp=True, p2s=False),
     criterion=dict(
@@ -357,7 +357,7 @@ val_evaluator = dict(
     id_offset=2**16,
     online_monitor=dict(
         enable=True,
-        out_dir='online_monitorcd',
+        out_dir='online_monitorcd_owner_residual',
     ),
     sem_mapping=sem_mapping,
     inst_mapping=inst_mapping,
@@ -382,6 +382,7 @@ default_hooks = dict(
 
 # TODO: choose a best ESAM_sv
 load_from = '/home/nebula/xxy/3D_Reconstruction/work_dirs/ESAM_sv_scannet200_CA/best_all_ap_50%_epoch_128.pth'
+work_dir = 'work_dirs/ESAM_online_scannet200_CA_owner_residual/'
 
 # training schedule for 1x
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=128, val_interval=5)
