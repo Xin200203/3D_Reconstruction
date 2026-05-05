@@ -6,6 +6,17 @@ from mmdet3d.registry import MODELS
 from torch_scatter import scatter_mean, scatter_add
 
 
+def _zero_init_last_linear(sequential):
+    last_linear = None
+    for m in sequential.modules():
+        if isinstance(m, nn.Linear):
+            last_linear = m
+    if last_linear is not None:
+        nn.init.zeros_(last_linear.weight)
+        nn.init.zeros_(last_linear.bias)
+
+
+
 class CrossAttentionLayer(BaseModule):
     """Cross attention layer.
 
@@ -509,7 +520,8 @@ class ScanNetMixQueryDecoder(QueryDecoder):
     """
     def __init__(self, num_instance_classes, num_semantic_classes,
                  d_model, num_semantic_linears, in_channels, share_attn_mlp, share_mask_mlp,
-                 cross_attn_mode, mask_pred_mode, temporal_attn=False, bbox_flag=False, **kwargs):
+                 cross_attn_mode, mask_pred_mode, temporal_attn=False, bbox_flag=False,
+                 owner_residual=False, **kwargs):
         super().__init__(
             num_classes=num_instance_classes, d_model=d_model, in_channels=in_channels, **kwargs)
         assert num_semantic_linears in [1, 2]
@@ -547,6 +559,46 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         else:
             self.out_sem = nn.Linear(d_model, num_semantic_classes + 1)
 
+        # ── Owner-Residual Query Decomposition ──
+        self.owner_residual = owner_residual
+        if self.owner_residual:
+            self.owner_delta = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, d_model),
+            )
+            self.mask_delta = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
+            self.geo_delta = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
+            self.sem_delta = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
+            self.score_delta = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
+            self.id_delta = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
+            self._init_owner_residual()
+
+    def _init_owner_residual(self):
+        _zero_init_last_linear(self.owner_delta)
+        for delta in [self.mask_delta, self.geo_delta, self.sem_delta,
+                      self.score_delta, self.id_delta]:
+            _zero_init_last_linear(delta)
+
+    def _compute_role_queries(self, norm_query):
+        if not self.owner_residual:
+            return dict(
+                mask=norm_query, geo=norm_query, sem=norm_query,
+                score=norm_query, id=norm_query, owner=norm_query)
+        h = norm_query + self.owner_delta(norm_query)
+        q_mask = h + self.mask_delta(norm_query)
+        q_geo = h + self.geo_delta(norm_query)
+        q_sem = h + self.sem_delta(norm_query)
+        q_score = h + self.score_delta(norm_query)
+        q_id = h + self.id_delta(norm_query)
+        return dict(mask=q_mask, geo=q_geo, sem=q_sem, score=q_score, id=q_id, owner=h)
+
+
     def _forward_head(self, queries, mask_feats, mask_pts_feats, last_flag, layer):  # type: ignore[override]
         """Prediction head forward.
 
@@ -574,24 +626,42 @@ class ScanNetMixQueryDecoder(QueryDecoder):
         object_queries = []
         for i in range(len(queries)):
             norm_query = self.out_norm(queries[i])
-            object_queries.append(norm_query)
-            cls_preds.append(self.out_cls(norm_query))
+
+            # ── decompose into role queries ──
+            rq = self._compute_role_queries(norm_query)
+
+            # object (identity) query — used by MergeHead for cross-frame matching
+            object_queries.append(rq['id'])
+
+            # instance classification uses semantic query
+            cls_preds.append(self.out_cls(rq['sem']))
+
+            # semantic prediction (only computed at the final decoder layer)
             if last_flag:
-                sem_preds.append(self.out_sem(norm_query))
-            pred_score = self.out_score(norm_query) if self.objectness_flag else None
+                sem_preds.append(self.out_sem(rq['sem']))
+
+            # objectness / confidence score
+            pred_score = self.out_score(rq['score']) if self.objectness_flag else None
             pred_scores.append(pred_score)
+
+            # bounding box from geometry query
             if self.bbox_flag:
-                reg_final = self.out_reg(norm_query)
+                reg_final = self.out_reg(rq['geo'])
                 reg_distance = torch.exp(reg_final[:, 3:6])
                 pred_bbox = torch.cat([reg_final[:, :3], reg_distance], dim=1)
-            else: pred_bbox = None
+            else:
+                pred_bbox = None
             pred_bboxes.append(pred_bbox)
+
+            # mask from mask query (dot-product with point features)
             if self.mask_pred_mode[layer] == "SP":
-                pred_mask = torch.einsum('nd,md->nm', norm_query, mask_feats[i])
+                pred_mask = torch.einsum('nd,md->nm', rq['mask'], mask_feats[i])
             elif self.mask_pred_mode[layer] == "P":
-                pred_mask = torch.einsum('nd,md->nm', norm_query, mask_pts_feats[i])
+                pred_mask = torch.einsum('nd,md->nm', rq['mask'], mask_pts_feats[i])
             else:
                 raise NotImplementedError("Query decoder not implemented!")
+
+            # attention mask for next cross-attention (still derived from mask prediction)
             if self.attn_mask:
                 attn_mask = (pred_mask.sigmoid() < 0.5).bool()
                 attn_mask[torch.where(
@@ -599,6 +669,7 @@ class ScanNetMixQueryDecoder(QueryDecoder):
                 attn_mask = attn_mask.detach()
                 attn_masks.append(attn_mask)
             pred_masks.append(pred_mask)
+
         attn_masks = attn_masks if self.attn_mask else None
         sem_preds = sem_preds if last_flag else None
         return cls_preds, sem_preds, pred_scores, pred_masks, attn_masks, object_queries, pred_bboxes
